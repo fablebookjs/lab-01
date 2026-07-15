@@ -27,53 +27,48 @@ jobs:
          github.event.pull_request.head.ref == 'staged/v1.0' &&
          github.event.pull_request.base.repo.full_name == 'fablebookjs/lab-01' &&
          github.event.pull_request.base.ref == 'releases/v1.0'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       EXPECTED_REPOSITORY: fablebookjs/lab-01
     steps:
-      - name: Assert the read-only laboratory boundary
-        run: test "$GITHUB_REPOSITORY" = "$EXPECTED_REPOSITORY"
-
-      - name: Check out the exact staged intent with authenticated full history
-        uses: actions/checkout@v7
+      - name: Check out trusted release-line QA controller
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
-          fetch-tags: true
+          fetch-tags: false
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || 'staged/v1.0' }}
+          ref: releases/v1.0
+          path: trusted
 
-      - name: Install the snapshot-compatible Node toolchain
+      - name: Install pinned Node without package-manager cache
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24.18.0
           package-manager-cache: false
 
-      - name: Pin npm used for candidate tarball identities
-        run: |
-          npm install --global npm@11.18.0 --ignore-scripts --no-audit --no-fund
-          test "$(npm --version)" = "11.18.0"
+      - name: Bootstrap closed npm and trusted QA tooling outside the project
+        run: >-
+          node trusted/scripts/bootstrap-npm-cli.mjs
+          --repository-root "$GITHUB_WORKSPACE/trusted"
+          --path-file "$GITHUB_PATH"
+          --project-tools
 
-      - name: Bootstrap the pinned trusted QA tooling
-        run: |
-          test -z "$(find . -name .npmrc -print -quit)"
-          mkdir -p "$RUNNER_TEMP/qa-bootstrap-home" "$RUNNER_TEMP/qa-bootstrap-cache"
-          : > "$RUNNER_TEMP/qa-bootstrap-user.npmrc"
-          : > "$RUNNER_TEMP/qa-bootstrap-global.npmrc"
-          env -i \
-            PATH="$PATH" \
-            HOME="$RUNNER_TEMP/qa-bootstrap-home" \
-            CI=true \
-            NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/qa-bootstrap-user.npmrc" \
-            NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/qa-bootstrap-global.npmrc" \
-            NPM_CONFIG_CACHE="$RUNNER_TEMP/qa-bootstrap-cache" \
-            npm ci --include=dev --ignore-scripts --no-audit --no-fund \
-              --registry https://registry.npmjs.org/
+      - name: Check out exact staged candidate as data
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || 'staged/v1.0' }}
+          path: candidate
 
-      - name: Test the exact proposed packages through loopback Verdaccio
+      - name: Test exact candidate with trusted controller through loopback Verdaccio
+        working-directory: candidate
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          LAB_01_TRUSTED_TOOL_ROOT: ${{ github.workspace }}/trusted
         run: >-
-          node scripts/qa-ready-release.mjs
+          node ../trusted/scripts/qa-ready-release.mjs
           --authority github-current
           --repository "$EXPECTED_REPOSITORY"
           --event-name "$GITHUB_EVENT_NAME"
@@ -81,9 +76,10 @@ jobs:
           --evidence "$RUNNER_TEMP/ready-release-qa.json"
 
       - name: Retain sanitized exact-snapshot evidence
-        uses: actions/upload-artifact@v6
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ready-release-qa-${{ github.event.pull_request.head.sha || github.sha }}
           path: ${{ runner.temp }}/ready-release-qa.json
-          if-no-files-found: error
-          retention-days: 7
+          if-no-files-found: warn
+          retention-days: 30

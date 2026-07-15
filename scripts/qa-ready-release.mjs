@@ -19,6 +19,7 @@ import { isDeepStrictEqual, promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
 import { validateIntent } from './maintain-release-draft.mjs';
+import { assertSafeGitConfiguration, closedGitEnvironment } from './release-publication.mjs';
 
 export const REPOSITORY = 'fablebookjs/lab-01';
 export const RELEASE_VERSION = '1.0.1';
@@ -50,14 +51,20 @@ const fail = (message) => {
 const readJson = async (path) => JSON.parse(await readFile(path, 'utf8'));
 const writeJson = async (path, value) => writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
 
-const git = (cwd, ...args) =>
-  execFileSync('git', args, {
-    cwd,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  }).trim();
+const git = (cwd, ...args) => {
+  try {
+    return execFileSync('git', ['--no-replace-objects', ...args], {
+      cwd,
+      encoding: 'utf8',
+      env: closedGitEnvironment(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    fail('QA_GIT_OPERATION_FAILED');
+  }
+};
 
-async function command(commandName, args, options = {}) {
+export async function command(commandName, args, options = {}) {
   const started = process.hrtime.bigint();
   try {
     const result = await execFileAsync(commandName, args, {
@@ -71,14 +78,8 @@ async function command(commandName, args, options = {}) {
       stderr: result.stderr.trim(),
       durationMs: Number((process.hrtime.bigint() - started) / 1_000_000n),
     };
-  } catch (error) {
-    const stderr = error.stderr?.trim();
-    const stdout = error.stdout?.trim();
-    const detail = stderr || stdout;
-    throw new Error(
-      `${commandName} ${args.join(' ')} failed${detail ? `: ${detail.slice(-4000)}` : ''}`,
-      { cause: error },
-    );
+  } catch {
+    fail('QA_SUBPROCESS_FAILED');
   }
 }
 
@@ -771,7 +772,7 @@ async function reserveLoopbackPort() {
 async function waitForRegistry(origin, child, logs) {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) fail(`Verdaccio exited before readiness: ${logs.join('').slice(-2000)}`);
+    if (child.exitCode !== null) fail('QA_REGISTRY_EXITED_BEFORE_READY');
     try {
       const response = await fetch(new URL('/-/ping', origin));
       if (response.ok) return;
@@ -780,7 +781,7 @@ async function waitForRegistry(origin, child, logs) {
     }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
-  fail(`Verdaccio did not become ready: ${logs.join('').slice(-2000)}`);
+  fail('QA_REGISTRY_READY_TIMEOUT');
 }
 
 async function stopProcess(child) {
@@ -1003,6 +1004,7 @@ export async function runReadyReleaseQa({
   authority,
   testHooks = {},
 }) {
+  assertSafeGitConfiguration(repoRoot);
   validateRepository(repoRoot, repository);
   assertAuthorityContract(authority, stagedSha, sourceSha);
   const sourceTree = validateStagedIntent(repoRoot, stagedSha, sourceSha);
@@ -1053,7 +1055,8 @@ export async function runReadyReleaseQa({
     registryOrigin = `http://127.0.0.1:${port}/`;
     assertLoopbackRegistry(registryOrigin);
     const logs = [];
-    const verdaccioBinary = join(repoRoot, 'node_modules/.bin/verdaccio');
+    const trustedToolRoot = process.env.LAB_01_TRUSTED_TOOL_ROOT || repoRoot;
+    const verdaccioBinary = join(trustedToolRoot, 'node_modules/.bin/verdaccio');
     await access(verdaccioBinary);
     verdaccio = spawn(verdaccioBinary, ['--config', configPath, '--listen', `127.0.0.1:${port}`], {
       cwd: tempRoot,

@@ -72,16 +72,15 @@ matching current ready PR. Manual dispatch accepts no SHA inputs. The staged
 commit must be the structured one-parent empty intent for exact version
 `1.0.1`; PR title and body are never inputs.
 
-`actions/checkout@v7` materializes the exact PR head (or current staged branch
-for manual recovery) with full history and tags while it has checkout read
-authority, then removes persisted credentials. No anonymous post-checkout Git
-fetch is used. The authenticated checkout shape is statically tested, but an
-actual GitHub Actions run against the current public laboratory PR is still
-required before this workflow is treated as installed proof.
+The workflow pins checkout and artifact upload by reviewed full action SHAs. It
+first materializes trusted release-line controller code with no persisted
+credentials, closes the npm/Git environment, and then checks out the exact PR
+head (or current staged branch for manual recovery) with full history as
+candidate data. No anonymous post-checkout Git fetch is used.
 
-The workflow bootstraps the exactly locked Verdaccio development toolchain from
-public npm as a separate trusted-tooling step with scripts disabled and an
-empty environment/config. The runner then creates a detached temporary
+The workflow bootstraps exact npm and the locked Verdaccio development
+toolchain from public npm in a neutral directory with scripts disabled and an
+empty isolated environment/config. The runner then creates a detached temporary
 worktree at the exact source. Its only
 candidate changes are the root, core, and add-on manifest versions; the exact
 add-on-to-core dependency; and the corresponding lockfile fields. It installs,
@@ -154,28 +153,38 @@ from `1.0.0` to `1.0.1` together with the four allowlisted manifest/lock files.
 
 Snapshot preparation and npm publication are separate workflows:
 
-1. `.github/workflows/prepare-release-snapshot.yml` is manually dispatched on
-   `releases/v1.0` with an exact merged release-PR number and successful
-   ready-QA run ID. Those inputs are expectations, not authority. The script
-   re-reads the PR, run, artifact list, release line, and snapshot ref.
-2. The merged PR must be the same-repository `staged/v1.0` to
+1. `.github/workflows/prepare-release-snapshot.yml` is manually dispatched
+   from exact current default `main` with the expected latest merged release-PR
+   number. An optional ready-QA run ID is only an expectation. The trusted
+   controller re-reads all matching lifecycle PRs, successful ready-QA runs,
+   the release line, and snapshot ref. Older merged PRs and older equivalent
+   successful runs are rejected.
+2. The unique latest merged PR must be the same-repository `staged/v1.0` to
    `releases/v1.0` proposal. Its merge `M` has ordered parents `[S, I]`; `I` is
    the one-parent empty structured intent for `S`; and `M` has the sealed source
-   tree. Squash, rebase, wrong-parent, wrong-tree, stale-QA, duplicate artifact,
-   and ambiguous state fail closed.
-3. The specified QA artifact is untrusted input. Snapshot preparation
-   independently reproduces the exact four-file transform, Git tree, content
-   hash, package file lists, SHA-512 integrity, and SHA-1 shasum using Node
-   `24.18.0` and npm `11.18.0`. Every identity must equal the QA evidence.
+   tree. Squash, rebase, wrong-parent, wrong-tree, stale-QA, and ambiguous state
+   fail closed.
+3. The latest successful exact-`I` ready-QA run is retained pre-merge
+   authorization evidence, not recoverability authority. Preparation reruns the
+   full isolated candidate QA from verified `S` with trusted tooling and then
+   independently reconstructs the exact four-file transform from `M`. The Git
+   tree, content hash, exact inert package contents, SHA-512 integrity, and
+   SHA-1 shasum must agree. An expired or missing retained artifact is recorded
+   but does not prevent deterministic regeneration.
 4. `V` is a deterministic single-parent commit over `M`. Its structured
-   metadata binds line, version, `M`, QA run, staged/source SHAs, and both
-   package hashes. Only `refs/heads/release-snapshots/v1.0.1` may be created,
+   metadata binds line, version, `M`, staged/source SHAs, exact tree/content
+   identities, and both package hashes. A run ID is deliberately absent, so
+   equivalent current successful QA runs converge on the same commit. Only
+   `refs/heads/release-snapshots/v1.0.1` may be created,
    using an exact absent-ref lease. The exact existing `V` is reused; any other
    value stops. This ref is a durable locator for `V`, not a second release
-   line. `releases/v1.0` must be byte-for-byte unchanged across the run.
-5. Snapshot evidence schema 1 records the authority SHAs, run/artifact,
-   transform identities, `V`, both package file/hash identities, ref result,
-   and the unchanged release-line boundary. It contains no credential.
+   line. While npm publication is incomplete, `releases/v1.0` may remain at
+   `M` or advance to a verified descendant `H`; snapshot preparation itself
+   never moves it.
+5. Snapshot evidence schema 2 records the latest PR/run authorization,
+   retained-artifact availability, regenerated transform identities, `V`, both
+   package file/hash identities, ref result, and the observed release-line
+   boundary. It contains no credential.
 
 `.github/workflows/publish-npm.yml` is the single stable npm trusted-publisher
 identity for both packages. It has only a top-level manual dispatch with the
@@ -186,25 +195,45 @@ pinned by full v6 commit SHA. The job uses environment `npm-publish`, Node
 
 For this single-operator G1 laboratory, `npm-publish` is an exact OIDC subject
 and requires no second-person reviewer. It may have zero required reviewers;
-the explicit manual dispatch is the operator authorization. Do not infer that
-policy for production. The environment contains no npm secret. On npmjs.com,
+the explicit manual dispatch is the operator authorization. Its deployment
+branch rule must allow only the default `main` branch, never the release,
+staged, snapshot, tag, or PR refs. Do not infer that policy for production. The
+environment contains no npm secret. On npmjs.com,
 both packages must configure `fablebookjs` / `lab-01` / `publish-npm.yml` /
 `npm-publish` with **npm publish only**. Staged publishing is not part of G1.
 
-The publisher rejects `NPM_TOKEN` and `NODE_AUTH_TOKEN`, inherits neither, and
-creates closed temporary user/global npm configuration with only the exact
-public registry and provenance enabled. It revalidates `V`, `M`, `S`, `I`, the
-current release line, manifests, package file allowlists, and both packed
-hashes before reading npm. An existing package is reusable only when repository,
-integrity, shasum, and downloaded tarball bytes equal `V`; mismatch is a
-permanent stop. Add-on publication requires exact matching public core
-`1.0.1`. A lost publish response is accepted only after exact registry
-read-back.
+The token-bearing job runs only workflow and script code checked out at exact
+current default `main`. It binds `github.sha` and `github.workflow_sha` to the
+current remote main before publication. It never checks out or executes `V`,
+the release/staged refs, PR heads, package scripts, or candidate JavaScript.
+Git objects for `S`/`I`/`M`/`V` are fetched as inert data; the trusted publisher
+reconstructs the only permitted tree from `M`, rejects every extra file, mode,
+symlink, lifecycle script, or manifest field, writes only exact
+`package.json` + `src/index.js` package data into a temporary directory, and
+packs it with scripts disabled.
 
-Publisher evidence schema 1 binds the run choice, `S`/`I`/`M`/`V`, QA run,
-package file/hash identities, before/after npm state, downloaded registry
-identity, and unchanged release line. It explicitly records that no traditional
-token, reconciliation, tag, or GitHub Release mutation occurred.
+Before any npm command, every release workflow rejects project `.npmrc` files
+and ambient registry, credential, proxy, TLS, or config inputs. It bootstraps
+exact npm `11.18.0` from a neutral directory with empty isolated user/global
+configuration, fixed default and `@fablebook` public registries, and no
+traditional token. Git advertisement, fetch, and the one snapshot-ref push
+likewise use a closed transport/config environment and no tag following.
+
+The publisher revalidates the current line before and after npm work. A clean
+or conflicting late descendant `H`/`X` does not block publication; containing
+`M` is sufficient while neither reconciliation nor finalization occurs. An
+existing package is reusable only when repository, integrity, shasum, and
+downloaded tarball bytes equal the independently packed bytes; mismatch is a
+permanent stop. Add-on publication requires exact matching public core
+`1.0.1`, and addon-present/core-absent is rejected. A lost publish response is
+accepted only after exact registry read-back.
+
+Publisher evidence schema 2 is written on success, validation failure,
+publication failure, and interruption, then uploaded with `if: always()`. It
+contains sanitized fixed error codes and durable npm state without raw child
+output, temporary paths, credentials, or configuration. It records that no
+candidate code, traditional token, reconciliation, tag, or GitHub Release
+mutation occurred.
 
 The accepted issue #14 state contract requires publication to complete before
 normal reconciliation or conflict recovery begins. Consequently this slice

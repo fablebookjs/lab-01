@@ -1,7 +1,8 @@
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
 export const REPOSITORY = 'fablebookjs/lab-01';
@@ -40,20 +41,45 @@ const SHA256 = /^[0-9a-f]{64}$/;
 const SHASUM = /^[0-9a-f]{40}$/;
 const INTEGRITY = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
 
-export const fail = (message) => {
-  throw new Error(message);
+export const fail = (code) => {
+  const error = new Error(code);
+  error.code = code;
+  throw error;
 };
 
 export function assertSha(value, label) {
   if (!SHA.test(value ?? '')) fail(`${label} must be a full lowercase SHA`);
 }
 
+const DANGEROUS_GIT_ENVIRONMENT = /^(?:GIT_(?:CONFIG|OBJECT|ALTERNATE|REPLACE|PROXY|SSL|ASKPASS|SSH|CEILING|DISCOVERY|COMMON|DIR|WORK_TREE|INDEX)|HTTP_PROXY$|HTTPS_PROXY$|ALL_PROXY$|http_proxy$|https_proxy$|all_proxy$|CURL_CA_BUNDLE$|SSL_CERT_FILE$)/;
+
+export function assertNoAmbientGitConfiguration(environment = process.env) {
+  if (Object.keys(environment).some((key) => DANGEROUS_GIT_ENVIRONMENT.test(key))) fail('AMBIENT_GIT_CONFIG_PROHIBITED');
+}
+
+export function closedGitEnvironment(additions = {}) {
+  return {
+    PATH: process.env.PATH,
+    HOME: process.env.RUNNER_TEMP ?? '/tmp',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_TERMINAL_PROMPT: '0',
+    ...additions,
+  };
+}
+
 export function git(cwd, ...args) {
-  return execFileSync('git', args, {
-    cwd,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  }).trim();
+  const safeArgs = args[0] === '--no-replace-objects' ? args : ['--no-replace-objects', ...args];
+  try {
+    return execFileSync('git', safeArgs, {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: closedGitEnvironment(),
+    }).trim();
+  } catch {
+    fail('GIT_COMMAND_FAILED');
+  }
 }
 
 export async function command(file, args, options = {}) {
@@ -66,8 +92,7 @@ export async function command(file, args, options = {}) {
     });
     return { stdout: result.stdout.trim(), stderr: result.stderr.trim() };
   } catch (error) {
-    const detail = error.stderr?.trim() || error.stdout?.trim() || error.message;
-    throw new Error(`${file} ${args.join(' ')} failed: ${detail.slice(-4000)}`, { cause: error });
+    fail(options.errorCode ?? 'SUBPROCESS_FAILED');
   }
 }
 
@@ -80,23 +105,18 @@ export function repositoryRemoteIsAllowed(remote) {
 }
 
 export function assertSafeGitConfiguration(repoRoot) {
-  const remote = git(repoRoot, 'config', '--get', 'remote.origin.url');
+  assertNoAmbientGitConfiguration();
+  const remote = git(repoRoot, '--no-replace-objects', 'config', '--local', '--get', 'remote.origin.url');
   if (!repositoryRemoteIsAllowed(remote)) fail(`origin is not the allowlisted ${REPOSITORY} repository`);
-  for (const key of ['remote.origin.pushurl', 'core.hooksPath']) {
-    try {
-      const value = git(repoRoot, 'config', '--get', key);
-      if (value) fail(`unsafe Git configuration ${key} is set`);
-    } catch (error) {
-      if (error.message.startsWith('unsafe Git configuration')) throw error;
-    }
-  }
-  let rewrites = '';
-  try {
-    rewrites = git(repoRoot, 'config', '--get-regexp', '^url\\..*\\.insteadof$');
-  } catch {
-    // No URL rewrites is the safe expected state.
-  }
-  if (rewrites) fail('unsafe Git URL rewrite configuration is set');
+  let local = '';
+  try { local = git(repoRoot, '--no-replace-objects', 'config', '--local', '--null', '--list'); } catch { fail('GIT_CONFIG_READ_FAILED'); }
+  const dangerous = local.split('\0').filter(Boolean).some((entry) =>
+    /^(?:remote\..*\.(?:pushurl|proxy|receivepack|uploadpack|tagopt)|core\.(?:hookspath|sshcommand|gitproxy|alternaterefscommand|attributesfile)|credential\.|https?\.|url\.|push\.followtags|include\.|protocol\.|filter\.|submodule\.|extensions\.)/i.test(entry),
+  );
+  if (dangerous) fail('UNSAFE_GIT_CONFIG');
+  const common = git(repoRoot, '--no-replace-objects', 'rev-parse', '--git-common-dir');
+  if (existsSync(join(resolve(repoRoot, common), 'objects/info/alternates'))) fail('GIT_ALTERNATES_PROHIBITED');
+  if (git(repoRoot, '--no-replace-objects', 'for-each-ref', '--format=%(refname)', 'refs/replace')) fail('GIT_REPLACE_REFS_PROHIBITED');
 }
 
 export function commitShape(repoRoot, sha) {
@@ -108,6 +128,28 @@ export function commitShape(repoRoot, sha) {
     tree: git(repoRoot, 'rev-parse', `${sha}^{tree}`),
     message: git(repoRoot, 'show', '-s', '--format=%B', sha),
   };
+}
+
+export function readBlob(repoRoot, sha, path) {
+  assertSha(sha, 'blob commit');
+  try {
+    return execFileSync('git', ['--no-replace-objects', 'cat-file', 'blob', `${sha}:${path}`], {
+      cwd: repoRoot,
+      env: closedGitEnvironment(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch {
+    fail('GIT_BLOB_READ_FAILED');
+  }
+}
+
+export function exactTreeEntries(repoRoot, sha, directory) {
+  const output = git(repoRoot, '--no-replace-objects', 'ls-tree', '-r', sha, '--', directory);
+  return output.split('\n').filter(Boolean).map((line) => {
+    const match = /^(\d{6}) (blob|tree) ([0-9a-f]{40})\t(.+)$/.exec(line);
+    if (!match) fail('GIT_TREE_ENTRY_INVALID');
+    return { mode: match[1], type: match[2], object: match[3], path: match[4] };
+  });
 }
 
 export function parseTrailers(message, subject) {
@@ -162,6 +204,7 @@ export function validateSnapshotShape(snapshot, metadata, merge) {
     snapshot.parents.length !== 1 ||
     snapshot.parents[0] !== merge.sha ||
     metadata.mergeSha !== merge.sha ||
+    metadata.tree !== snapshot.tree ||
     snapshot.tree === merge.tree
   ) {
     fail('V is not the exact one-parent transformed snapshot over M');
@@ -173,19 +216,25 @@ export async function readJson(path) {
 }
 
 export function validateManifest(manifest, spec, version = RELEASE_VERSION) {
-  if (manifest.name !== spec.name || manifest.version !== version || manifest.type !== 'module') {
-    fail(`unexpected manifest identity for ${spec.name}`);
+  const expectedKeys = spec.choice === 'core'
+    ? ['exports', 'files', 'name', 'repository', 'type', 'version']
+    : ['dependencies', 'exports', 'files', 'name', 'repository', 'type', 'version'];
+  if (JSON.stringify(Object.keys(manifest).sort()) !== JSON.stringify(expectedKeys)) {
+    fail(`MANIFEST_KEYS_INVALID_${spec.choice.toUpperCase()}`);
   }
-  if (manifest.exports !== './src/index.js') fail(`${spec.name} has an unexpected export`);
+  if (manifest.name !== spec.name || manifest.version !== version || manifest.type !== 'module') {
+    fail(`MANIFEST_IDENTITY_INVALID_${spec.choice.toUpperCase()}`);
+  }
+  if (manifest.exports !== './src/index.js') fail(`MANIFEST_EXPORT_INVALID_${spec.choice.toUpperCase()}`);
   if (JSON.stringify(manifest.files) !== JSON.stringify(['src'])) {
-    fail(`${spec.name} does not have the exact files allowlist`);
+    fail(`MANIFEST_FILES_INVALID_${spec.choice.toUpperCase()}`);
   }
   const expectedRepository = { type: 'git', url: REPOSITORY_URL, directory: spec.directory };
   if (JSON.stringify(manifest.repository) !== JSON.stringify(expectedRepository)) {
-    fail(`${spec.name} has an incompatible repository identity`);
+    fail(`MANIFEST_REPOSITORY_INVALID_${spec.choice.toUpperCase()}`);
   }
   if ('publishConfig' in manifest || manifest.private === true) {
-    fail(`${spec.name} contains an unsafe publication override`);
+    fail(`MANIFEST_PUBLICATION_OVERRIDE_${spec.choice.toUpperCase()}`);
   }
 }
 
@@ -196,10 +245,136 @@ export async function validateCandidateManifests(candidateDirectory, version = R
   validateManifest(core, PACKAGE_SPECS[0], version);
   validateManifest(addon, PACKAGE_SPECS[1], version);
   if (addon.dependencies?.[PACKAGE_SPECS[0].name] !== version) {
-    fail(`add-on does not depend on exact core ${version}`);
+    fail('ADDON_CORE_DEPENDENCY_INVALID');
   }
-  if (Object.keys(addon.dependencies).length !== 1) fail('add-on has unexpected dependencies');
+  if (Object.keys(addon.dependencies).length !== 1) fail('ADDON_DEPENDENCIES_INVALID');
   return { core, addon };
+}
+
+function validateRootManifest(root, version) {
+  if (JSON.stringify(Object.keys(root).sort()) !== JSON.stringify(['devDependencies', 'name', 'private', 'scripts', 'version', 'workspaces'])) {
+    fail('ROOT_MANIFEST_KEYS_INVALID');
+  }
+  if (
+    root.name !== '@fablebook/lab-01' || root.version !== version || root.private !== true ||
+    JSON.stringify(root.workspaces) !== JSON.stringify(['packages/*']) ||
+    JSON.stringify(root.scripts) !== JSON.stringify({
+      test: 'node --test test/*.test.mjs',
+      'test:qa:e2e': 'node --test test/qa-ready-release.e2e.mjs',
+      'qa:ready': 'node scripts/qa-ready-release.mjs',
+    }) ||
+    JSON.stringify(root.devDependencies) !== JSON.stringify({ verdaccio: '6.8.0' })
+  ) fail('ROOT_MANIFEST_INVALID');
+}
+
+function gitIndex(repoRoot, indexFile, args, input) {
+  try {
+    return execFileSync('git', ['--no-replace-objects', ...args], {
+      cwd: repoRoot,
+      env: closedGitEnvironment({ GIT_INDEX_FILE: indexFile }),
+      input,
+      encoding: input === undefined ? 'utf8' : undefined,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).toString().trim();
+  } catch {
+    fail('GIT_INDEX_OPERATION_FAILED');
+  }
+}
+
+function transformedContentIdentity(files) {
+  const hash = createHash('sha256');
+  for (const path of TRANSFORMED_FILES) {
+    hash.update(path);
+    hash.update('\0');
+    hash.update(files.get(path));
+    hash.update('\0');
+  }
+  return hash.digest('hex');
+}
+
+export function reconstructExpectedSnapshot(repoRoot, mergeSha, indexFile) {
+  const paths = {
+    root: 'package.json',
+    core: 'packages/core/package.json',
+    addon: 'packages/addon/package.json',
+    lock: 'package-lock.json',
+  };
+  const baseline = Object.fromEntries(Object.entries(paths).map(([key, path]) => [key, JSON.parse(readBlob(repoRoot, mergeSha, path))]));
+  validateRootManifest(baseline.root, BASE_VERSION);
+  validateManifest(baseline.core, PACKAGE_SPECS[0], BASE_VERSION);
+  validateManifest(baseline.addon, PACKAGE_SPECS[1], BASE_VERSION);
+  if (baseline.addon.dependencies?.[PACKAGE_SPECS[0].name] !== BASE_VERSION) fail('BASE_ADDON_EDGE_INVALID');
+  if (
+    baseline.lock.name !== baseline.root.name || baseline.lock.version !== BASE_VERSION || baseline.lock.lockfileVersion !== 3 ||
+    baseline.lock.packages?.['']?.version !== BASE_VERSION ||
+    baseline.lock.packages?.['packages/core']?.version !== BASE_VERSION ||
+    baseline.lock.packages?.['packages/addon']?.version !== BASE_VERSION ||
+    baseline.lock.packages?.['packages/addon']?.dependencies?.[PACKAGE_SPECS[0].name] !== BASE_VERSION
+  ) fail('BASE_LOCK_INVALID');
+  const transformed = structuredClone(baseline);
+  transformed.root.version = RELEASE_VERSION;
+  transformed.core.version = RELEASE_VERSION;
+  transformed.addon.version = RELEASE_VERSION;
+  transformed.addon.dependencies[PACKAGE_SPECS[0].name] = RELEASE_VERSION;
+  transformed.lock.version = RELEASE_VERSION;
+  transformed.lock.packages[''].version = RELEASE_VERSION;
+  transformed.lock.packages['packages/core'].version = RELEASE_VERSION;
+  transformed.lock.packages['packages/addon'].version = RELEASE_VERSION;
+  transformed.lock.packages['packages/addon'].dependencies[PACKAGE_SPECS[0].name] = RELEASE_VERSION;
+  validateRootManifest(transformed.root, RELEASE_VERSION);
+  validateManifest(transformed.core, PACKAGE_SPECS[0], RELEASE_VERSION);
+  validateManifest(transformed.addon, PACKAGE_SPECS[1], RELEASE_VERSION);
+  const files = new Map(Object.entries(paths).map(([key, path]) => [path, Buffer.from(`${JSON.stringify(transformed[key], null, 2)}\n`)]));
+  gitIndex(repoRoot, indexFile, ['read-tree', mergeSha]);
+  for (const path of TRANSFORMED_FILES) {
+    const row = git(repoRoot, 'ls-tree', mergeSha, '--', path);
+    if (!/^100644 blob [0-9a-f]{40}\t/.test(row)) fail('TRANSFORM_SOURCE_MODE_INVALID');
+    const object = gitIndex(repoRoot, indexFile, ['hash-object', '-w', '--stdin'], files.get(path));
+    gitIndex(repoRoot, indexFile, ['update-index', '--add', '--cacheinfo', `100644,${object},${path}`]);
+  }
+  return {
+    tree: gitIndex(repoRoot, indexFile, ['write-tree']),
+    contentSha256: transformedContentIdentity(files),
+    manifests: { core: transformed.core, addon: transformed.addon },
+  };
+}
+
+export function validateExactSnapshotTree(repoRoot, mergeSha, snapshotSha, expectedTree) {
+  const snapshot = commitShape(repoRoot, snapshotSha);
+  if (snapshot.parents.length !== 1 || snapshot.parents[0] !== mergeSha || snapshot.tree !== expectedTree) {
+    fail('SNAPSHOT_GRAPH_OR_TREE_INVALID');
+  }
+  const changes = git(repoRoot, 'diff-tree', '--no-commit-id', '--name-status', '-r', mergeSha, snapshotSha)
+    .split('\n').filter(Boolean);
+  const expected = TRANSFORMED_FILES.map((path) => `M\t${path}`);
+  if (JSON.stringify(changes) !== JSON.stringify(expected)) fail('SNAPSHOT_DIFF_ALLOWLIST_INVALID');
+  for (const path of TRANSFORMED_FILES) {
+    if (!/^100644 blob [0-9a-f]{40}\t/.test(git(repoRoot, 'ls-tree', snapshotSha, '--', path))) {
+      fail('SNAPSHOT_MODE_INVALID');
+    }
+  }
+  return snapshot;
+}
+
+export async function materializeInertPackages(repoRoot, snapshotSha, directory) {
+  for (const spec of PACKAGE_SPECS) {
+    const entries = exactTreeEntries(repoRoot, snapshotSha, spec.directory);
+    const expected = [
+      { mode: '100644', path: `${spec.directory}/package.json` },
+      { mode: '100644', path: `${spec.directory}/src/index.js` },
+    ];
+    if (
+      entries.length !== expected.length ||
+      entries.some((entry, index) => entry.mode !== expected[index].mode || entry.type !== 'blob' || entry.path !== expected[index].path)
+    ) fail(`PACKAGE_TREE_INVALID_${spec.choice.toUpperCase()}`);
+    const packageRoot = join(directory, spec.directory);
+    await mkdir(join(packageRoot, 'src'), { recursive: true });
+    await Promise.all(expected.map(async ({ path }) => {
+      const target = join(directory, path);
+      await writeFile(target, readBlob(repoRoot, snapshotSha, path), { mode: 0o644 });
+    }));
+  }
+  await validateCandidateManifests(directory);
 }
 
 export function assertNoTrackedNpmConfiguration(repoRoot, sha) {
@@ -272,16 +447,28 @@ export async function createClosedNpmEnvironment(tempRoot, { oidc = false } = {}
   return environment;
 }
 
+export async function assertPinnedNpmVersion(tempRoot, { oidc = false } = {}) {
+  const environment = await createClosedNpmEnvironment(tempRoot, { oidc });
+  const observed = await command('npm', ['--version'], {
+    cwd: tempRoot,
+    env: environment,
+    errorCode: 'NPM_VERSION_READ_FAILED',
+  });
+  if (observed.stdout !== NPM_VERSION) fail('NPM_VERSION_INVALID');
+  return environment;
+}
+
 export async function packPackages(candidateDirectory, packDirectory, env) {
   await mkdir(packDirectory, { recursive: true });
   const packages = [];
   for (const spec of PACKAGE_SPECS) {
     const result = await command(
       'npm',
-      ['pack', `./${spec.directory}`, '--json', '--ignore-scripts', '--pack-destination', packDirectory],
-      { cwd: candidateDirectory, env },
+      ['pack', join(candidateDirectory, spec.directory), '--json', '--ignore-scripts', '--pack-destination', packDirectory],
+      { cwd: packDirectory, env, errorCode: `NPM_PACK_FAILED_${spec.choice.toUpperCase()}` },
     );
-    const output = JSON.parse(result.stdout);
+    let output;
+    try { output = JSON.parse(result.stdout); } catch { fail(`NPM_PACK_OUTPUT_INVALID_${spec.choice.toUpperCase()}`); }
     if (!Array.isArray(output) || output.length !== 1) fail(`npm pack returned unexpected ${spec.name} output`);
     const item = output[0];
     if (item.name !== spec.name || item.version !== RELEASE_VERSION) fail(`npm pack returned unexpected ${spec.name} identity`);
@@ -369,17 +556,20 @@ export function validateQaEvidence(evidence, { stagedSha, sourceSha, qaRunId, pr
   };
 }
 
-export function buildSnapshotMessage({ mergeSha, qaRunId, stagedSha, sourceSha, packages }) {
+export function buildSnapshotMessage({ mergeSha, stagedSha, sourceSha, tree, contentSha256, packages }) {
   validatePackageEvidence(packages);
+  assertSha(tree, 'snapshot tree');
+  if (!SHA256.test(contentSha256 ?? '')) fail('SNAPSHOT_CONTENT_ID_INVALID');
   const byName = new Map(packages.map((item) => [item.name, item]));
-  return `release: snapshot v${RELEASE_VERSION}\n\nRelease-Snapshot-Version: 1\nRelease-Line: ${RELEASE_LINE}\nRelease-Version: ${RELEASE_VERSION}\nRelease-Merge: ${mergeSha}\nRelease-QA-Run: ${qaRunId}\nRelease-QA-Staged: ${stagedSha}\nRelease-QA-Source: ${sourceSha}\nCore-Integrity: ${byName.get(PACKAGE_SPECS[0].name).integrity}\nCore-Shasum: ${byName.get(PACKAGE_SPECS[0].name).shasum}\nAddon-Integrity: ${byName.get(PACKAGE_SPECS[1].name).integrity}\nAddon-Shasum: ${byName.get(PACKAGE_SPECS[1].name).shasum}\n`;
+  return `release: snapshot v${RELEASE_VERSION}\n\nRelease-Snapshot-Version: 1\nRelease-Line: ${RELEASE_LINE}\nRelease-Version: ${RELEASE_VERSION}\nRelease-Merge: ${mergeSha}\nRelease-QA-Staged: ${stagedSha}\nRelease-QA-Source: ${sourceSha}\nRelease-Tree: ${tree}\nRelease-Content-SHA256: ${contentSha256}\nCore-Integrity: ${byName.get(PACKAGE_SPECS[0].name).integrity}\nCore-Shasum: ${byName.get(PACKAGE_SPECS[0].name).shasum}\nAddon-Integrity: ${byName.get(PACKAGE_SPECS[1].name).integrity}\nAddon-Shasum: ${byName.get(PACKAGE_SPECS[1].name).shasum}\n`;
 }
 
 export function parseSnapshotMessage(message) {
   const trailers = parseTrailers(message, `release: snapshot v${RELEASE_VERSION}`);
   const required = [
-    'Release-Snapshot-Version', 'Release-Line', 'Release-Version', 'Release-Merge', 'Release-QA-Run',
-    'Release-QA-Staged', 'Release-QA-Source', 'Core-Integrity', 'Core-Shasum', 'Addon-Integrity', 'Addon-Shasum',
+    'Release-Snapshot-Version', 'Release-Line', 'Release-Version', 'Release-Merge',
+    'Release-QA-Staged', 'Release-QA-Source', 'Release-Tree', 'Release-Content-SHA256',
+    'Core-Integrity', 'Core-Shasum', 'Addon-Integrity', 'Addon-Shasum',
   ];
   if (trailers.size !== required.length || required.some((key) => !trailers.has(key))) fail('snapshot has unexpected metadata');
   const packages = PACKAGE_SPECS.map((spec) => ({
@@ -391,13 +581,16 @@ export function parseSnapshotMessage(message) {
   if (
     trailers.get('Release-Snapshot-Version') !== '1' ||
     trailers.get('Release-Line') !== RELEASE_LINE ||
-    trailers.get('Release-Version') !== RELEASE_VERSION
+    trailers.get('Release-Version') !== RELEASE_VERSION ||
+    !SHA.test(trailers.get('Release-Tree') ?? '') ||
+    !SHA256.test(trailers.get('Release-Content-SHA256') ?? '')
   ) fail('snapshot metadata identifies an incompatible release');
   return {
     mergeSha: trailers.get('Release-Merge'),
-    qaRunId: trailers.get('Release-QA-Run'),
     stagedSha: trailers.get('Release-QA-Staged'),
     sourceSha: trailers.get('Release-QA-Source'),
+    tree: trailers.get('Release-Tree'),
+    contentSha256: trailers.get('Release-Content-SHA256'),
     packages,
   };
 }

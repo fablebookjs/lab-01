@@ -19,36 +19,37 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == 'fablebookjs/lab-01' && github.ref == 'refs/heads/releases/v1.0'
+    if: github.repository == 'fablebookjs/lab-01' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     environment: npm-publish
     permissions:
       contents: read
       id-token: write
     steps:
-      - name: Check out exact V without persisted GitHub credentials
+      - name: Check out exact trusted default-main publisher
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
-          fetch-tags: true
+          fetch-tags: false
           persist-credentials: false
-          ref: release-snapshots/v1.0.1
+          ref: ${{ github.sha }}
 
-      - name: Install the pinned Node and npm toolchain
+      - name: Install pinned Node without package-manager cache
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24.18.0
           package-manager-cache: false
 
-      - name: Pin the trusted-publishing npm CLI
-        run: |
-          test -z "${NPM_TOKEN-}"
-          test -z "${NODE_AUTH_TOKEN-}"
-          npm install --global npm@11.18.0 --ignore-scripts --no-audit --no-fund
-          test "$(npm --version)" = "11.18.0"
+      - name: Bootstrap closed npm outside the project
+        run: >-
+          node scripts/bootstrap-npm-cli.mjs
+          --repository-root "$GITHUB_WORKSPACE"
+          --path-file "$GITHUB_PATH"
 
-      - name: Publish or reuse only the selected exact package
+      - name: Validate inert V data and publish or reuse only the selected package
         env:
+          EXPECTED_DISPATCH_SHA: ${{ github.sha }}
+          EXPECTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
           PACKAGE_CHOICE: ${{ inputs.package }}
         run: >-
           node scripts/publish-npm.mjs
@@ -56,10 +57,11 @@ jobs:
           --package "$PACKAGE_CHOICE"
           --evidence "$RUNNER_TEMP/publish-npm.json"
 
-      - name: Retain sanitized publication evidence
+      - name: Retain sanitized publication evidence on every outcome
+        if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: publish-npm-${{ inputs.package }}-${{ github.run_id }}
           path: ${{ runner.temp }}/publish-npm.json
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30

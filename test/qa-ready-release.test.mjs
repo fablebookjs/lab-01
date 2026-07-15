@@ -346,17 +346,19 @@ test('isolated npm environment ignores ambient registry, auth, proxy, and config
   });
 });
 
-test('workflow materializes staged authority through checkout without an anonymous fetch', async () => {
+test('workflow runs pinned trusted release-line QA code against exact staged candidate data', async () => {
   const workflow = await readFile(
     new URL('../.github/workflows/ready-release-qa.yml', import.meta.url),
     'utf8',
   );
   assert.match(workflow, /permissions:\n  contents: read\n  pull-requests: read/);
-  assert.match(workflow, /uses: actions\/checkout@v7/);
+  assert.match(workflow, /uses: actions\/checkout@[0-9a-f]{40} # v7/g);
   assert.match(workflow, /fetch-depth: 0/);
   assert.match(workflow, /fetch-tags: true/);
   assert.match(workflow, /persist-credentials: false/);
+  assert.match(workflow, /ref: releases\/v1\.0\n          path: trusted/);
   assert.match(workflow, /ref: .*pull_request\.head\.sha.*staged\/v1\.0/);
+  assert.match(workflow, /path: candidate/);
   assert.match(workflow, /head\.repo\.full_name == 'fablebookjs\/lab-01'/);
   assert.match(workflow, /head\.ref == 'staged\/v1\.0'/);
   assert.match(workflow, /base\.repo\.full_name == 'fablebookjs\/lab-01'/);
@@ -365,7 +367,9 @@ test('workflow materializes staged authority through checkout without an anonymo
   assert.match(workflow, /GITHUB_TOKEN: \$\{\{ github\.token \}\}/);
   assert.doesNotMatch(workflow, /- synchronize/);
   assert.match(workflow, /ready-release-qa-.*github\.sha/);
-  assert.match(workflow, /uses: actions\/upload-artifact@v6/);
+  assert.match(workflow, /node \.\.\/trusted\/scripts\/qa-ready-release\.mjs/);
+  assert.match(workflow, /uses: actions\/setup-node@[0-9a-f]{40} # v6/);
+  assert.match(workflow, /uses: actions\/upload-artifact@[0-9a-f]{40} # v6/);
   assert.doesNotMatch(workflow, /git fetch|staged_sha:|source_sha:/);
 });
 

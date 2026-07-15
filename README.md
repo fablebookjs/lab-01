@@ -37,8 +37,9 @@ non-workspace consumer, records sanitized identity and integrity evidence, and
 then removes the worktree, registry process, and registry storage. It does not
 publish to public npm or mutate GitHub state.
 
-The checked-in workflow first uses `actions/checkout` read authority to
-materialize the exact staged commit with full history, then rederives the one
+The checked-in workflow first checks out pinned trusted QA-controller code from
+the release line and bootstraps its closed toolchain. It then materializes the
+exact staged commit as candidate data with full history and rederives the one
 current ready PR and both current refs through the read-only GitHub API. A
 manual dispatch supplies no SHA authority. Local proofs must instead pass
 `--authority local`; their evidence is explicitly non-GitHub-current. Marking
@@ -57,12 +58,17 @@ pinned to the generated loopback origin. Candidate installation omits the
 development-only QA toolchain and cannot use public npm.
 
 The issue #19 preparation adds two deliberately separate public-release
-surfaces. `Prepare release snapshot` may create only the deterministic
-`release-snapshots/v1.0.1` ref after validating merged release intent `M` and a
-specified exact ready-QA run. `Publish npm package` is the one stable OIDC
-publisher identity. It can publish or reuse only `core` first and then `addon`
-from that exact snapshot. It cannot move the release line, tag, create a GitHub
-Release, or create the next proposal.
+surfaces. `Prepare release snapshot` runs from exact current default `main` and
+may create only the deterministic `release-snapshots/v1.0.1` locator after
+validating the unique latest merged release intent `M`, the latest successful
+exact-head ready-QA authorization, and a fresh isolated regeneration. The run
+ID is not part of `V`, so equivalent current QA runs converge. `Publish npm
+package` is the one stable OIDC publisher identity. It also runs only exact
+current-main code, treats `V` as inert Git data, independently reconstructs the
+allowed tree from `M`, and can publish or reuse only `core` first and then
+`addon`. It cannot execute candidate code, move the release line, tag, create a
+GitHub Release, or create the next proposal. Late descendants of `M` do not
+block incomplete package publication.
 
 This preparation is not permission to merge the current draft PR or publish.
 The exact `1.0.0` packages must first be published interactively, the two npm

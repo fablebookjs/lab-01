@@ -1,12 +1,12 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 
 import {
-  NPM_VERSION,
   PACKAGE_SPECS,
   REGISTRY,
   RELEASE_LINE,
@@ -15,18 +15,21 @@ import {
   REPOSITORY_URL,
   SNAPSHOT_REF,
   assertNoTrackedNpmConfiguration,
+  assertPinnedNpmVersion,
   assertSafeGitConfiguration,
   assertSha,
+  closedGitEnvironment,
   command,
   commitShape,
-  createClosedNpmEnvironment,
   fail,
   git,
+  materializeInertPackages,
   packPackages,
   packageEvidence,
   parseSnapshotMessage,
+  reconstructExpectedSnapshot,
   sanitizedEvidence,
-  validateCandidateManifests,
+  validateExactSnapshotTree,
   validateIntentShape,
   validateMergeShape,
   validateSnapshotShape,
@@ -34,16 +37,33 @@ import {
 
 function remoteRef(repoRoot, ref) {
   try {
-    const output = git(repoRoot, 'ls-remote', '--exit-code', 'origin', ref);
+    const output = execFileSync('git', ['--no-replace-objects', 'ls-remote', '--refs', '--exit-code', 'origin', ref], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: closedGitEnvironment(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
     const rows = output.split('\n').filter(Boolean);
-    if (rows.length !== 1) fail(`remote ${ref} is ambiguous`);
+    if (rows.length !== 1) fail('REMOTE_REF_AMBIGUOUS');
     const [sha, observedRef] = rows[0].split(/\s+/);
-    assertSha(sha, ref);
-    if (observedRef !== ref) fail(`remote returned an unexpected ${ref}`);
+    assertSha(sha, 'remote ref');
+    if (observedRef !== ref) fail('REMOTE_REF_IDENTITY_INVALID');
     return sha;
   } catch (error) {
     if (error.status === 2) return null;
-    throw error;
+    fail('REMOTE_REF_READ_FAILED');
+  }
+}
+
+function fetchObjects(repoRoot, shas) {
+  try {
+    execFileSync('git', ['--no-replace-objects', 'fetch', '--no-tags', '--no-write-fetch-head', 'origin', ...shas], {
+      cwd: repoRoot,
+      env: closedGitEnvironment(),
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+  } catch {
+    fail('RELEASE_OBJECT_FETCH_FAILED');
   }
 }
 
@@ -52,111 +72,115 @@ function repositoryMatches(repository, directory) {
 }
 
 async function fetchRegistryPackage(spec) {
-  const metadataUrl = new URL(`/${encodeURIComponent(spec.name)}/${RELEASE_VERSION}`, REGISTRY);
-  const response = await fetch(metadataUrl, { headers: { Accept: 'application/json' } });
+  let response;
+  try {
+    response = await fetch(new URL(`/${encodeURIComponent(spec.name)}/${RELEASE_VERSION}`, REGISTRY), { headers: { Accept: 'application/json' } });
+  } catch { fail(`NPM_QUERY_FAILED_${spec.choice.toUpperCase()}`); }
   if (response.status === 404) return { status: 'absent', name: spec.name };
-  if (!response.ok) fail(`registry query for ${spec.name} failed with ${response.status}`);
-  const metadata = await response.json();
+  if (!response.ok) fail(`NPM_QUERY_FAILED_${spec.choice.toUpperCase()}`);
+  let metadata;
+  try { metadata = await response.json(); } catch { fail(`NPM_METADATA_INVALID_${spec.choice.toUpperCase()}`); }
   if (
-    metadata.name !== spec.name ||
-    metadata.version !== RELEASE_VERSION ||
+    metadata.name !== spec.name || metadata.version !== RELEASE_VERSION ||
     !repositoryMatches(metadata.repository, spec.directory) ||
-    typeof metadata.dist?.integrity !== 'string' ||
-    typeof metadata.dist?.shasum !== 'string' ||
-    typeof metadata.dist?.tarball !== 'string'
-  ) fail(`PERMANENT STOP: registry metadata for ${spec.name} is incompatible`);
-  const tarballUrl = new URL(metadata.dist.tarball);
+    typeof metadata.dist?.integrity !== 'string' || typeof metadata.dist?.shasum !== 'string' || typeof metadata.dist?.tarball !== 'string'
+  ) fail(`NPM_METADATA_INCOMPATIBLE_${spec.choice.toUpperCase()}`);
   const archiveName = `${spec.name.slice(spec.name.indexOf('/') + 1)}-${RELEASE_VERSION}.tgz`;
   const expectedTarball = new URL(`/${spec.name}/-/${archiveName}`, REGISTRY);
-  if (tarballUrl.href !== expectedTarball.href) fail(`PERMANENT STOP: registry tarball for ${spec.name} has an incompatible URL`);
-  const tarballResponse = await fetch(tarballUrl);
-  if (!tarballResponse.ok) fail(`registry tarball for ${spec.name} failed with ${tarballResponse.status}`);
+  if (metadata.dist.tarball !== expectedTarball.href) fail(`NPM_TARBALL_URL_INCOMPATIBLE_${spec.choice.toUpperCase()}`);
+  let tarballResponse;
+  try { tarballResponse = await fetch(expectedTarball); } catch { fail(`NPM_TARBALL_READ_FAILED_${spec.choice.toUpperCase()}`); }
+  if (!tarballResponse.ok) fail(`NPM_TARBALL_READ_FAILED_${spec.choice.toUpperCase()}`);
   const bytes = Buffer.from(await tarballResponse.arrayBuffer());
   const integrity = `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
   const shasum = createHash('sha1').update(bytes).digest('hex');
-  if (integrity !== metadata.dist.integrity || shasum !== metadata.dist.shasum) {
-    fail(`registry tarball for ${spec.name} does not match its metadata`);
-  }
-  return {
-    status: 'present',
-    name: spec.name,
-    version: metadata.version,
-    repository: metadata.repository,
-    integrity,
-    shasum,
-    tarball: tarballUrl.href,
-  };
+  if (integrity !== metadata.dist.integrity || shasum !== metadata.dist.shasum) fail(`NPM_TARBALL_BYTES_INCOMPATIBLE_${spec.choice.toUpperCase()}`);
+  return { status: 'present', name: spec.name, version: metadata.version, repository: metadata.repository, integrity, shasum, tarball: expectedTarball.href };
 }
 
 export const liveNpmAdapter = {
   query: fetchRegistryPackage,
-  async publish(artifact, env) {
-    await command(
-      'npm',
-      [
-        'publish', artifact.tarball,
-        '--access', 'public',
-        '--ignore-scripts',
-        '--provenance',
-        '--registry', REGISTRY,
-      ],
-      { cwd: join(artifact.tarball, '..'), env },
-    );
+  async publish(artifact, env, neutralDirectory) {
+    await command('npm', [
+      'publish', artifact.tarball, '--access', 'public', '--ignore-scripts', '--provenance', '--registry', REGISTRY,
+    ], { cwd: neutralDirectory, env, errorCode: `NPM_PUBLISH_FAILED_${artifact.choice.toUpperCase()}` });
   },
 };
 
 function assertMatching(observation, artifact) {
-  if (observation.status !== 'present') fail(`${artifact.name}@${RELEASE_VERSION} is absent`);
-  if (observation.integrity !== artifact.integrity || observation.shasum !== artifact.shasum) {
-    fail(`PERMANENT STOP: npm ${artifact.name}@${RELEASE_VERSION} does not match V`);
-  }
-  const spec = PACKAGE_SPECS.find(({ name }) => name === artifact.name);
-  if (!repositoryMatches(observation.repository, spec.directory)) {
-    fail(`PERMANENT STOP: npm ${artifact.name}@${RELEASE_VERSION} has an incompatible repository`);
-  }
+  if (observation.status !== 'present') fail(`NPM_EXPECTED_PRESENT_${artifact.choice.toUpperCase()}`);
+  if (observation.integrity !== artifact.integrity || observation.shasum !== artifact.shasum) fail(`NPM_INTEGRITY_INCOMPATIBLE_${artifact.choice.toUpperCase()}`);
+  if (!repositoryMatches(observation.repository, artifact.directory)) fail(`NPM_REPOSITORY_INCOMPATIBLE_${artifact.choice.toUpperCase()}`);
 }
 
-export async function applyPublicationState({ choice, artifacts, adapter, npmEnvironment }) {
+export async function applyPublicationState({ choice, artifacts, adapter, npmEnvironment, neutralDirectory = tmpdir() }) {
   const selectedIndex = PACKAGE_SPECS.findIndex((spec) => spec.choice === choice);
-  if (selectedIndex < 0) fail('package choice must be exactly core or addon');
+  if (selectedIndex < 0) fail('PACKAGE_CHOICE_INVALID');
   const observations = [];
   for (let index = 0; index < PACKAGE_SPECS.length; index += 1) {
     const observation = await adapter.query(PACKAGE_SPECS[index]);
     observations.push(observation);
     if (observation.status === 'present') assertMatching(observation, artifacts[index]);
   }
-  if (observations[0].status === 'absent' && observations[1].status === 'present') {
-    fail('PERMANENT STOP: add-on exists while required core is absent');
-  }
-  if (choice === 'addon' && observations[0].status !== 'present') {
-    fail('add-on publication is blocked until exact matching core 1.0.1 is public');
-  }
-
+  if (observations[0].status === 'absent' && observations[1].status === 'present') fail('NPM_INVERSE_PARTIAL_STATE');
+  if (choice === 'addon' && observations[0].status !== 'present') fail('ADDON_BLOCKED_UNTIL_CORE');
   const before = observations[selectedIndex];
-  if (before.status === 'present') {
-    return { result: 'reused', before, after: before, observations };
-  }
+  if (before.status === 'present') return { result: 'reused', before, after: before, observations };
   try {
-    await adapter.publish(artifacts[selectedIndex], npmEnvironment);
+    await adapter.publish(artifacts[selectedIndex], npmEnvironment, neutralDirectory);
   } catch (error) {
     const raced = await adapter.query(PACKAGE_SPECS[selectedIndex]);
     if (raced.status === 'present') {
       assertMatching(raced, artifacts[selectedIndex]);
       return { result: 'published-after-ambiguous-response', before, after: raced, observations };
     }
-    throw new Error(`publication stopped at ${artifacts[selectedIndex].name}: ${error.message}`, { cause: error });
+    throw error;
   }
   const after = await adapter.query(PACKAGE_SPECS[selectedIndex]);
   assertMatching(after, artifacts[selectedIndex]);
   return { result: 'published-and-verified', before, after, observations };
 }
 
-function assertAncestor(repoRoot, ancestor, descendant, message) {
+function assertAncestor(repoRoot, ancestor, descendant, code) {
+  try { execFileSync('git', ['--no-replace-objects', 'merge-base', '--is-ancestor', ancestor, descendant], { cwd: repoRoot, env: closedGitEnvironment(), stdio: 'ignore' }); }
+  catch { fail(code); }
+}
+
+export function lineRelation(repoRoot, mergeSha, snapshotSha, lineHead) {
+  assertAncestor(repoRoot, mergeSha, lineHead, 'RELEASE_LINE_DOES_NOT_CONTAIN_M');
   try {
-    execFileSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], { cwd: repoRoot, stdio: 'ignore' });
-  } catch {
-    fail(message);
+    execFileSync('git', ['--no-replace-objects', 'merge-base', '--is-ancestor', snapshotSha, lineHead], { cwd: repoRoot, env: closedGitEnvironment(), stdio: 'ignore' });
+    fail('RELEASE_LINE_RECONCILED_BEFORE_PUBLICATION');
+  } catch (error) {
+    if (error.code === 'RELEASE_LINE_RECONCILED_BEFORE_PUBLICATION') throw error;
   }
+  return lineHead === mergeSha ? 'at-merge' : 'late-descendant';
+}
+
+async function durableNpmState(adapter) {
+  const state = [];
+  for (const spec of PACKAGE_SPECS) {
+    try {
+      const item = await adapter.query(spec);
+      state.push(item.status === 'present'
+        ? { name: spec.name, status: 'present', integrity: item.integrity, shasum: item.shasum, repository: item.repository }
+        : { name: spec.name, status: 'absent' });
+    } catch (error) {
+      state.push({ name: spec.name, status: 'unknown', code: error.code ?? 'NPM_STATE_READ_FAILED' });
+    }
+  }
+  return state;
+}
+
+export function assertTrustedMain(repoRoot, refAdapter) {
+  const local = git(repoRoot, 'rev-parse', 'HEAD');
+  const remote = refAdapter(repoRoot, 'refs/heads/main');
+  const dispatch = process.env.EXPECTED_DISPATCH_SHA;
+  const workflow = process.env.EXPECTED_WORKFLOW_SHA;
+  if (local !== remote || dispatch !== remote || workflow !== remote || process.env.GITHUB_REF !== 'refs/heads/main') {
+    fail('TRUSTED_MAIN_IDENTITY_MISMATCH');
+  }
+  return remote;
 }
 
 export async function publishFromSnapshot({
@@ -165,98 +189,103 @@ export async function publishFromSnapshot({
   evidencePath,
   npmAdapter = liveNpmAdapter,
   refAdapter = remoteRef,
+  fetchAdapter = fetchObjects,
   temporaryBase = tmpdir(),
   oidc = true,
 }) {
-  assertSafeGitConfiguration(repoRoot);
-  if (git(repoRoot, 'status', '--porcelain') !== '') fail('publisher requires a clean checkout');
-  if (process.env.NPM_TOKEN || process.env.NODE_AUTH_TOKEN) fail('traditional npm credentials are prohibited');
-  const npmVersion = execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim();
-  if (npmVersion !== NPM_VERSION) fail(`publisher requires npm ${NPM_VERSION}, observed ${npmVersion}`);
-
-  const snapshotSha = await refAdapter(repoRoot, SNAPSHOT_REF);
-  const lineHead = await refAdapter(repoRoot, `refs/heads/${RELEASE_LINE}`);
-  assertSha(snapshotSha, 'snapshot ref');
-  assertSha(lineHead, 'release line');
-  const snapshot = commitShape(repoRoot, snapshotSha);
-  const metadata = parseSnapshotMessage(snapshot.message);
-  assertSha(metadata.mergeSha, 'snapshot M');
-  assertSha(metadata.stagedSha, 'snapshot staged SHA');
-  assertSha(metadata.sourceSha, 'snapshot source SHA');
-  const merge = commitShape(repoRoot, metadata.mergeSha);
-  const source = commitShape(repoRoot, metadata.sourceSha);
-  const intent = commitShape(repoRoot, metadata.stagedSha);
-  intent.sourceTree = source.tree;
-  validateIntentShape(intent, source.sha);
-  validateMergeShape(merge, source, intent);
-  validateSnapshotShape(snapshot, metadata, merge);
-  assertAncestor(repoRoot, merge.sha, lineHead, 'release line does not contain sealed M');
+  const evidence = {
+    schemaVersion: 2,
+    operation: 'publish-npm',
+    repository: REPOSITORY,
+    choice,
+    status: 'started',
+    npm: { durable: [] },
+    error: null,
+    safety: { trustedMain: null, candidateExecuted: false, traditionalToken: false, reconciliationMutation: false, tagMutation: false, githubReleaseMutation: false },
+  };
+  let temporary;
+  let thrown;
   try {
-    execFileSync('git', ['merge-base', '--is-ancestor', snapshot.sha, lineHead], { cwd: repoRoot, stdio: 'ignore' });
-    fail('release line was reconciled to V before npm publication completed');
-  } catch (error) {
-    if (error.message.startsWith('release line was reconciled')) throw error;
-  }
-  assertNoTrackedNpmConfiguration(repoRoot, snapshot.sha);
-
-  const temporary = await mkdtemp(join(temporaryBase, 'lab-01-publish-'));
-  const candidate = join(temporary, 'candidate');
-  let worktreeAdded = false;
-  try {
-    git(repoRoot, 'worktree', 'add', '--detach', candidate, snapshot.sha);
-    worktreeAdded = true;
-    await validateCandidateManifests(candidate);
-    if (git(candidate, 'status', '--porcelain') !== '') fail('V checkout is not clean');
-    const npmEnvironment = await createClosedNpmEnvironment(join(temporary, 'npm'), { oidc });
-    const packed = await packPackages(candidate, join(temporary, 'packs'), npmEnvironment);
+    assertSafeGitConfiguration(repoRoot);
+    if (git(repoRoot, 'status', '--porcelain') !== '') fail('PUBLISHER_WORKTREE_DIRTY');
+    if (process.env.NPM_TOKEN || process.env.NODE_AUTH_TOKEN) fail('TRADITIONAL_NPM_TOKEN_PROHIBITED');
+    evidence.safety.trustedMain = assertTrustedMain(repoRoot, refAdapter);
+    temporary = await mkdtemp(join(temporaryBase, 'lab-01-publish-'));
+    const npmEnvironment = await assertPinnedNpmVersion(join(temporary, 'npm'), { oidc });
+    const snapshotSha = refAdapter(repoRoot, SNAPSHOT_REF);
+    const lineBefore = refAdapter(repoRoot, `refs/heads/${RELEASE_LINE}`);
+    assertSha(snapshotSha, 'snapshot ref');
+    assertSha(lineBefore, 'release line');
+    fetchAdapter(repoRoot, [snapshotSha, lineBefore]);
+    const snapshotMessage = commitShape(repoRoot, snapshotSha).message;
+    const metadata = parseSnapshotMessage(snapshotMessage);
+    fetchAdapter(repoRoot, [metadata.mergeSha, metadata.stagedSha, metadata.sourceSha]);
+    const merge = commitShape(repoRoot, metadata.mergeSha);
+    const source = commitShape(repoRoot, metadata.sourceSha);
+    const intent = commitShape(repoRoot, metadata.stagedSha);
+    intent.sourceTree = source.tree;
+    validateIntentShape(intent, source.sha);
+    validateMergeShape(merge, source, intent);
+    assertNoTrackedNpmConfiguration(repoRoot, merge.sha);
+    const expected = reconstructExpectedSnapshot(repoRoot, merge.sha, join(temporary, 'index'));
+    const snapshot = validateExactSnapshotTree(repoRoot, merge.sha, snapshotSha, expected.tree);
+    validateSnapshotShape(snapshot, metadata, merge);
+    if (metadata.contentSha256 !== expected.contentSha256) fail('SNAPSHOT_CONTENT_CROSSCHECK_FAILED');
+    evidence.release = { line: RELEASE_LINE, version: RELEASE_VERSION, sourceSha: source.sha, stagedSha: intent.sha, mergeSha: merge.sha };
+    evidence.snapshot = { ref: SNAPSHOT_REF, sha: snapshot.sha, tree: expected.tree, parent: merge.sha };
+    evidence.line = { before: lineBefore, beforeRelation: lineRelation(repoRoot, merge.sha, snapshot.sha, lineBefore), after: null, afterRelation: null };
+    const inert = join(temporary, 'inert');
+    await materializeInertPackages(repoRoot, expected.tree, inert);
+    const packed = await packPackages(inert, join(temporary, 'packs'), npmEnvironment);
     const identities = packageEvidence(packed);
     const reduced = identities.map(({ name, integrity, shasum }) => ({ name, integrity, shasum }));
-    if (JSON.stringify(reduced) !== JSON.stringify(metadata.packages)) fail('packed V tarballs do not equal snapshot metadata');
-    const publication = await applyPublicationState({ choice, artifacts: packed, adapter: npmAdapter, npmEnvironment });
-    const lineAfter = await refAdapter(repoRoot, `refs/heads/${RELEASE_LINE}`);
-    if (lineAfter !== lineHead) fail('release line changed during npm publication');
-    const evidence = sanitizedEvidence({
-      schemaVersion: 1,
-      operation: 'publish-npm',
-      repository: REPOSITORY,
-      choice,
-      release: { line: RELEASE_LINE, version: RELEASE_VERSION, sourceSha: source.sha, stagedSha: intent.sha, mergeSha: merge.sha },
-      qa: { runId: Number(metadata.qaRunId) },
-      snapshot: { ref: SNAPSHOT_REF, sha: snapshot.sha, tree: snapshot.tree, parent: merge.sha, packages: identities },
-      npm: publication,
-      safety: { releaseLineBefore: lineHead, releaseLineAfter: lineAfter, tagMutation: false, githubReleaseMutation: false, reconciliationMutation: false, traditionalToken: false },
-    });
-    if (evidencePath) await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
-    return evidence;
+    if (JSON.stringify(reduced) !== JSON.stringify(metadata.packages)) fail('SNAPSHOT_MESSAGE_HASH_CROSSCHECK_FAILED');
+    evidence.snapshot.packages = identities;
+    evidence.npm.publication = await applyPublicationState({ choice, artifacts: packed, adapter: npmAdapter, npmEnvironment, neutralDirectory: temporary });
+    const lineAfter = refAdapter(repoRoot, `refs/heads/${RELEASE_LINE}`);
+    fetchAdapter(repoRoot, [lineAfter]);
+    evidence.line.after = lineAfter;
+    evidence.line.afterRelation = lineRelation(repoRoot, merge.sha, snapshot.sha, lineAfter);
+    evidence.status = 'succeeded';
+  } catch (error) {
+    thrown = error;
+    evidence.status = 'failed';
+    evidence.error = { code: error.code ?? 'PUBLISHER_FAILED' };
   } finally {
-    if (worktreeAdded) {
-      try { git(repoRoot, 'worktree', 'remove', '--force', candidate); } catch { /* best-effort cleanup */ }
+    evidence.npm.durable = await durableNpmState(npmAdapter);
+    try {
+      if (evidencePath) await writeFile(evidencePath, `${JSON.stringify(sanitizedEvidence(evidence), null, 2)}\n`);
+    } catch {
+      try { fail('EVIDENCE_WRITE_FAILED'); } catch (error) { thrown ??= error; }
+    } finally {
+      if (temporary) await rm(temporary, { recursive: true, force: true });
     }
-    await rm(temporary, { recursive: true, force: true });
   }
+  if (thrown) throw thrown;
+  return evidence;
 }
 
 function parseArguments(args) {
   const values = {};
   for (let index = 0; index < args.length; index += 2) {
-    const key = args[index];
-    const value = args[index + 1];
-    if (!key?.startsWith('--') || value === undefined) fail('publisher arguments must be --key value pairs');
-    values[key.slice(2)] = value;
+    if (!args[index]?.startsWith('--') || args[index + 1] === undefined) fail('PUBLISHER_ARGUMENTS_INVALID');
+    values[args[index].slice(2)] = args[index + 1];
   }
-  for (const key of ['repository', 'package', 'evidence']) if (!values[key]) fail(`missing --${key}`);
-  if (values.repository !== REPOSITORY) fail(`refusing publication outside ${REPOSITORY}`);
+  for (const key of ['repository', 'package', 'evidence']) if (!values[key]) fail('PUBLISHER_ARGUMENTS_INVALID');
+  if (values.repository !== REPOSITORY) fail('PUBLISHER_REPOSITORY_INVALID');
   return values;
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   const args = parseArguments(process.argv.slice(2));
-  publishFromSnapshot({
-    repoRoot: git(process.cwd(), 'rev-parse', '--show-toplevel'),
-    choice: args.package,
-    evidencePath: args.evidence,
-  }).then((evidence) => console.log(JSON.stringify(evidence))).catch((error) => {
-    console.error(error.message);
-    process.exitCode = 1;
-  });
+  const interrupted = (signal) => {
+    try {
+      writeFileSync(args.evidence, `${JSON.stringify({ schemaVersion: 2, operation: 'publish-npm', repository: REPOSITORY, choice: args.package, status: 'interrupted', error: { code: signal }, npm: { durable: [{ status: 'unknown' }] } }, null, 2)}\n`);
+    } finally { process.exit(1); }
+  };
+  process.once('SIGINT', () => interrupted('SIGINT'));
+  process.once('SIGTERM', () => interrupted('SIGTERM'));
+  publishFromSnapshot({ repoRoot: git(process.cwd(), 'rev-parse', '--show-toplevel'), choice: args.package, evidencePath: args.evidence })
+    .then((evidence) => console.log(JSON.stringify({ status: evidence.status, choice: evidence.choice })))
+    .catch((error) => { console.error(error.code ?? 'PUBLISHER_FAILED'); process.exitCode = 1; });
 }

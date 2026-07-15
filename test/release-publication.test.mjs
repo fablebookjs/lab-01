@@ -1,35 +1,57 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { inspect } from 'node:util';
 import test from 'node:test';
 
-import { ensureSnapshotRef, validateMergedAuthority } from '../scripts/prepare-release-snapshot.mjs';
-import { applyPublicationState } from '../scripts/publish-npm.mjs';
+import {
+  assertTrustedPreparationMain,
+  ensureSnapshotRef,
+  retainedArtifactAvailable,
+  validateLatestMergedAuthority,
+} from '../scripts/prepare-release-snapshot.mjs';
+import {
+  applyPublicationState,
+  assertTrustedMain,
+  lineRelation,
+  publishFromSnapshot,
+} from '../scripts/publish-npm.mjs';
 import {
   PACKAGE_SPECS,
   RELEASE_LINE,
   RELEASE_VERSION,
   REPOSITORY,
   REPOSITORY_URL,
+  SNAPSHOT_REF,
   TRANSFORMED_FILES,
+  assertNoAmbientGitConfiguration,
+  assertSafeGitConfiguration,
   buildSnapshotMessage,
+  command,
   createClosedNpmEnvironment,
+  materializeInertPackages,
   parseSnapshotMessage,
-  validateIntentShape,
-  validateMergeShape,
-  validateQaEvidence,
-  validateSnapshotShape,
+  reconstructExpectedSnapshot,
+  validateExactSnapshotTree,
+  validateManifest,
 } from '../scripts/release-publication.mjs';
+import {
+  assertNoAmbientPackageConfiguration,
+  assertNoProjectNpmrc,
+} from '../scripts/bootstrap-npm-cli.mjs';
+import { command as qaCommand } from '../scripts/qa-ready-release.mjs';
 
-const sha = (value) => value.repeat(40);
-const sourceSha = sha('1');
-const stagedSha = sha('2');
-const mergeSha = sha('3');
-const snapshotSha = sha('4');
-const sourceTree = sha('5');
-const transformedTree = sha('6');
+const sourceRoot = new URL('../', import.meta.url);
+const checkedOutPackageVersion = process.env.LAB_01_EXPECTED_PACKAGE_VERSION ?? '1.0.0';
+const hex = (digit) => digit.repeat(40);
+const sourceSha = hex('1');
+const stagedSha = hex('2');
+const mergeSha = hex('3');
+const snapshotSha = hex('4');
+const transformedTree = hex('6');
+const contentSha256 = 'a'.repeat(64);
 const integrities = [
   `sha512-${Buffer.alloc(64, 1).toString('base64')}`,
   `sha512-${Buffer.alloc(64, 2).toString('base64')}`,
@@ -40,117 +62,123 @@ const packages = PACKAGE_SPECS.map((spec, index) => ({
   shasum: String(index + 1).repeat(40),
 }));
 
-function intent() {
-  return {
-    sha: stagedSha,
-    parents: [sourceSha],
-    tree: sourceTree,
-    sourceTree,
-    message: `release: propose v1.0.1\n\nRelease-Intent-Version: 1\nRelease-Line: releases/v1.0\nRelease-Version: 1.0.1\nRelease-Source: ${sourceSha}\n`,
-  };
+function git(cwd, ...args) {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    env: {
+      PATH: process.env.PATH,
+      HOME: tmpdir(),
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_AUTHOR_NAME: 'test',
+      GIT_AUTHOR_EMAIL: 'test@example.invalid',
+      GIT_COMMITTER_NAME: 'test',
+      GIT_COMMITTER_EMAIL: 'test@example.invalid',
+    },
+  }).trim();
 }
 
-function qaEvidence() {
-  return {
-    schemaVersion: 2,
-    repository: REPOSITORY,
-    authority: {
-      mode: 'github-current',
-      githubCurrent: true,
-      repository: REPOSITORY,
-      refs: {
-        staged: { name: 'staged/v1.0', sha: stagedSha },
-        source: { name: RELEASE_LINE, sha: sourceSha },
-      },
-      pullRequest: {
-        number: 12,
-        state: 'open',
-        draft: false,
-        head: { repository: REPOSITORY, ref: 'staged/v1.0', sha: stagedSha },
-        base: { repository: REPOSITORY, ref: RELEASE_LINE, sha: sourceSha },
-      },
-    },
-    release: {
-      version: RELEASE_VERSION,
-      stagedSha,
-      sourceSha,
-      sourceTree,
-      transformedTree,
-      transformedContentSha256: 'a'.repeat(64),
-    },
-    transformation: {
-      files: [...TRANSFORMED_FILES],
-      packageNames: PACKAGE_SPECS.map(({ name }) => name),
-      addonCoreDependency: RELEASE_VERSION,
-    },
-    registry: { packages: structuredClone(packages) },
-    consumer: { result: 'passed' },
-  };
+async function repositoryFixture() {
+  const directory = await mkdtemp(join(tmpdir(), 'lab-01-release-fixture-'));
+  for (const path of [
+    'package.json',
+    'package-lock.json',
+    'packages/core/package.json',
+    'packages/core/src/index.js',
+    'packages/addon/package.json',
+    'packages/addon/src/index.js',
+  ]) {
+    await mkdir(join(directory, path, '..'), { recursive: true });
+    const committedBaseline = execFileSync('git', ['show', `HEAD:${path}`], { cwd: process.cwd() });
+    await writeFile(join(directory, path), committedBaseline);
+  }
+  git(directory, 'init', '-q');
+  git(directory, 'remote', 'add', 'origin', 'https://github.com/fablebookjs/lab-01.git');
+  git(directory, 'add', '.');
+  git(directory, 'commit', '-qm', 'baseline');
+  return { directory, merge: git(directory, 'rev-parse', 'HEAD') };
 }
+
+function snapshotMessage(overrides = {}) {
+  return buildSnapshotMessage({
+    mergeSha,
+    stagedSha,
+    sourceSha,
+    tree: transformedTree,
+    contentSha256,
+    packages,
+    ...overrides,
+  });
+}
+
+test('V metadata is deterministic across equivalent QA run IDs and binds tree/content', () => {
+  const first = snapshotMessage();
+  const second = snapshotMessage({ qaRunId: 99 });
+  assert.equal(first, second);
+  assert.doesNotMatch(first, /Release-QA-Run/);
+  assert.match(first, new RegExp(`Release-Tree: ${transformedTree}`));
+  assert.match(first, new RegExp(`Release-Content-SHA256: ${contentSha256}`));
+  const parsed = parseSnapshotMessage(first);
+  assert.equal(parsed.tree, transformedTree);
+  assert.equal(parsed.contentSha256, contentSha256);
+});
 
 function authorityFixture() {
   const pull = {
-      number: 12,
-      state: 'closed',
-      merged: true,
-      base: { repo: { full_name: REPOSITORY }, ref: RELEASE_LINE, sha: sourceSha },
-      head: { repo: { full_name: REPOSITORY }, ref: 'staged/v1.0', sha: stagedSha },
-      merge_commit_sha: mergeSha,
-    };
+    id: 12,
+    number: 12,
+    state: 'closed',
+    merged: true,
+    merged_at: '2026-07-15T10:00:00Z',
+    base: { repo: { full_name: REPOSITORY }, ref: RELEASE_LINE, sha: sourceSha },
+    head: { repo: { full_name: REPOSITORY }, ref: 'staged/v1.0', sha: stagedSha },
+    merge_commit_sha: mergeSha,
+  };
   return {
     pull,
     pulls: [structuredClone(pull)],
-    run: {
-      id: 99,
-      status: 'completed',
-      conclusion: 'success',
-      path: '.github/workflows/ready-release-qa.yml',
-      head_sha: stagedSha,
-      event: 'pull_request',
-    },
-    artifacts: {
-      total_count: 1,
-      artifacts: [{ id: 7, name: `ready-release-qa-${stagedSha}`, expired: false }],
+    runs: {
+      workflow_runs: [
+        { id: 98, created_at: '2026-07-15T10:01:00Z', status: 'completed', conclusion: 'success', path: '.github/workflows/ready-release-qa.yml', head_sha: stagedSha, event: 'pull_request' },
+        { id: 99, created_at: '2026-07-15T10:02:00Z', status: 'completed', conclusion: 'success', path: '.github/workflows/ready-release-qa.yml', head_sha: stagedSha, event: 'workflow_dispatch' },
+      ],
     },
     prNumber: '12',
-    qaRunId: '99',
+    qaRunExpectation: '',
   };
 }
 
-test('accepted M and V graph shapes require ordered distinct release roles', () => {
-  const source = { sha: sourceSha, tree: sourceTree };
-  const staged = intent();
-  const merge = { sha: mergeSha, tree: sourceTree, parents: [sourceSha, stagedSha] };
-  const message = buildSnapshotMessage({ mergeSha, qaRunId: 99, stagedSha, sourceSha, packages });
-  const metadata = parseSnapshotMessage(message);
-  const snapshot = { sha: snapshotSha, tree: transformedTree, parents: [mergeSha] };
-  assert.doesNotThrow(() => validateIntentShape(staged, sourceSha));
-  assert.doesNotThrow(() => validateMergeShape(merge, source, staged));
-  assert.doesNotThrow(() => validateSnapshotShape(snapshot, metadata, merge));
+test('preparation requires the unique latest merged lifecycle PR and latest successful exact-head QA', () => {
+  const fixture = authorityFixture();
+  assert.equal(validateLatestMergedAuthority(fixture).canonicalRun.id, 99);
+  assert.equal(validateLatestMergedAuthority({ ...fixture, qaRunExpectation: '99' }).canonicalRun.id, 99);
 
-  assert.throws(() => validateMergeShape({ ...merge, parents: [stagedSha, sourceSha] }, source, staged), /ordered/);
-  assert.throws(() => validateSnapshotShape({ ...snapshot, parents: [sourceSha] }, metadata, merge), /one-parent/);
-  assert.throws(() => validateSnapshotShape({ ...snapshot, tree: sourceTree }, metadata, merge), /transformed/);
-  assert.throws(() => validateIntentShape({ ...staged, tree: transformedTree }, sourceSha), /not empty/);
+  const older = structuredClone(fixture.pull);
+  older.id = 11;
+  older.number = 11;
+  older.merged_at = '2026-07-15T09:00:00Z';
+  const newer = structuredClone(fixture.pull);
+  newer.id = 13;
+  newer.number = 13;
+  newer.merged_at = '2026-07-15T11:00:00Z';
+  assert.throws(
+    () => validateLatestMergedAuthority({ ...fixture, pull: older, pulls: [older, newer], prNumber: '11' }),
+    /LATEST_MERGED_RELEASE_PR_MISMATCH/,
+  );
+  assert.throws(
+    () => validateLatestMergedAuthority({ ...fixture, qaRunExpectation: '98' }),
+    /QA_RUN_EXPECTATION_STALE/,
+  );
+  const wrongHead = structuredClone(fixture);
+  wrongHead.runs.workflow_runs.forEach((run) => { run.head_sha = sourceSha; });
+  assert.throws(() => validateLatestMergedAuthority(wrongHead), /CURRENT_READY_QA_AUTHORIZATION_MISSING/);
 });
 
-test('snapshot authority rejects wrong PR, run, and artifact identities', () => {
-  const fixture = authorityFixture();
-  assert.equal(validateMergedAuthority(fixture).mergeSha, mergeSha);
-  const attacks = [
-    (value) => (value.pull.merged = false),
-    (value) => (value.pull.head.ref = 'other'),
-    (value) => (value.run.conclusion = 'failure'),
-    (value) => (value.run.head_sha = sourceSha),
-    (value) => value.pulls.push(structuredClone(value.pulls[0])),
-    (value) => value.artifacts.artifacts.push(structuredClone(value.artifacts.artifacts[0])),
-    (value) => (value.artifacts.artifacts[0].expired = true),
-  ];
-  for (const attack of attacks) {
-    const value = structuredClone(fixture);
-    attack(value);
-    assert.throws(() => validateMergedAuthority(value));
-  }
+test('expired, missing, or unreadable retained artifacts do not prevent trusted regeneration', async () => {
+  assert.equal(await retainedArtifactAvailable({ artifacts: async () => ({ artifacts: [{ expired: false }] }) }, 99), true);
+  assert.equal(await retainedArtifactAvailable({ artifacts: async () => ({ artifacts: [{ expired: true }] }) }, 99), false);
+  assert.equal(await retainedArtifactAvailable({ artifacts: async () => { throw new Error('expired artifact raw path'); } }, 99), false);
 });
 
 test('snapshot ref creation uses one mocked write and converges after reuse or lost response', async () => {
@@ -164,7 +192,7 @@ test('snapshot ref creation uses one mocked write and converges after reuse or l
         pushSnapshot: async (_root, value) => {
           writes.push(value);
           current = value;
-          if (ambiguous) throw new Error('lost ref success response');
+          if (ambiguous) throw Object.assign(new Error('private raw output'), { code: 'SNAPSHOT_REF_WRITE_FAILED' });
         },
       },
     };
@@ -172,50 +200,67 @@ test('snapshot ref creation uses one mocked write and converges after reuse or l
   const created = harness();
   assert.equal(await ensureSnapshotRef({ adapter: created.adapter, repoRoot: '/mock', snapshotSha }), 'created');
   assert.deepEqual(created.writes, [snapshotSha]);
-
-  const reused = harness({ initial: snapshotSha });
-  assert.equal(await ensureSnapshotRef({ adapter: reused.adapter, repoRoot: '/mock', snapshotSha }), 'reused');
-  assert.deepEqual(reused.writes, []);
-
-  const ambiguous = harness({ ambiguous: true });
+  assert.equal(await ensureSnapshotRef({ adapter: harness({ initial: snapshotSha }).adapter, repoRoot: '/mock', snapshotSha }), 'reused');
   assert.equal(
-    await ensureSnapshotRef({ adapter: ambiguous.adapter, repoRoot: '/mock', snapshotSha }),
+    await ensureSnapshotRef({ adapter: harness({ ambiguous: true }).adapter, repoRoot: '/mock', snapshotSha }),
     'created-after-ambiguous-response',
   );
   await assert.rejects(
     ensureSnapshotRef({ adapter: harness({ initial: sourceSha }).adapter, repoRoot: '/mock', snapshotSha }),
-    /incompatible/,
+    /EXISTING_SNAPSHOT_INCOMPATIBLE/,
   );
 });
 
-test('QA evidence binds exact source, transformed tree, package order and hashes', () => {
-  const expected = validateQaEvidence(qaEvidence(), { stagedSha, sourceSha, qaRunId: 99, prNumber: 12 });
-  assert.equal(expected.transformedTree, transformedTree);
-  const attacks = [
-    (value) => (value.release.transformedTree = sourceTree),
-    (value) => (value.authority.githubCurrent = false),
-    (value) => value.transformation.files.pop(),
-    (value) => value.registry.packages.reverse(),
-    (value) => (value.registry.packages[0].integrity = 'wrong'),
-    (value) => (value.consumer.result = 'failed'),
-  ];
-  for (const attack of attacks) {
-    const value = qaEvidence();
-    attack(value);
-    assert.throws(() => validateQaEvidence(value, { stagedSha, sourceSha, qaRunId: 99, prNumber: 12 }));
+test('trusted reconstruction rejects a forged V with extra core source', async () => {
+  const fixture = await repositoryFixture();
+  try {
+    const index = join(fixture.directory, 'index');
+    const expected = reconstructExpectedSnapshot(fixture.directory, fixture.merge, index);
+    const valid = git(fixture.directory, 'commit-tree', expected.tree, '-p', fixture.merge, '-m', 'valid V');
+    assert.doesNotThrow(() => validateExactSnapshotTree(fixture.directory, fixture.merge, valid, expected.tree));
+
+    const forgedIndex = join(fixture.directory, 'forged-index');
+    git(fixture.directory, 'read-tree', `--index-output=${forgedIndex}`, expected.tree);
+    const extra = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: fixture.directory, input: 'export const forged = true;\n', encoding: 'utf8' }).trim();
+    execFileSync('git', ['update-index', '--index-info'], {
+      cwd: fixture.directory,
+      env: { ...process.env, GIT_INDEX_FILE: forgedIndex },
+      input: `100644 ${extra}\tpackages/core/src/extra.js\n`,
+    });
+    const forgedTree = execFileSync('git', ['write-tree'], { cwd: fixture.directory, env: { ...process.env, GIT_INDEX_FILE: forgedIndex }, encoding: 'utf8' }).trim();
+    const forged = git(fixture.directory, 'commit-tree', forgedTree, '-p', fixture.merge, '-m', 'forged V');
+    assert.throws(
+      () => validateExactSnapshotTree(fixture.directory, fixture.merge, forged, expected.tree),
+      /SNAPSHOT_GRAPH_OR_TREE_INVALID/,
+    );
+    await assert.rejects(
+      materializeInertPackages(fixture.directory, forgedTree, join(fixture.directory, 'inert')),
+      /PACKAGE_TREE_INVALID_CORE/,
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('package manifests use an exact inert public allowlist', async () => {
+  for (const spec of PACKAGE_SPECS) {
+    const manifest = JSON.parse(await readFile(new URL(`${spec.directory}/package.json`, sourceRoot), 'utf8'));
+    assert.doesNotThrow(() => validateManifest(manifest, spec, checkedOutPackageVersion));
+    for (const [key, value] of [
+      ['scripts', { prepare: 'exfiltrate' }], ['bin', 'src/index.js'], ['bundledDependencies', ['x']],
+      ['gypfile', true], ['publishConfig', { registry: 'https://attacker.invalid/' }], ['config', { registry: 'x' }],
+    ]) {
+      assert.throws(() => validateManifest({ ...manifest, [key]: value }, spec, checkedOutPackageVersion), /MANIFEST_KEYS_INVALID/);
+    }
   }
 });
 
 function present(artifact) {
   const spec = PACKAGE_SPECS.find(({ name }) => name === artifact.name);
   return {
-    status: 'present',
-    name: artifact.name,
-    version: RELEASE_VERSION,
+    status: 'present', name: artifact.name, version: RELEASE_VERSION,
     repository: { type: 'git', url: REPOSITORY_URL, directory: spec.directory },
-    integrity: artifact.integrity,
-    shasum: artifact.shasum,
-    tarball: `https://registry.npmjs.org/${artifact.name}/-/${spec.choice}.tgz`,
+    integrity: artifact.integrity, shasum: artifact.shasum,
   };
 }
 
@@ -229,77 +274,85 @@ function publicationHarness(initial, { ambiguous = false } = {}) {
       publish: async (artifact) => {
         publishes.push(artifact.name);
         state.set(artifact.name, present(artifact));
-        if (ambiguous) throw new Error('lost success response');
+        if (ambiguous) throw Object.assign(new Error('private registry response'), { code: 'NPM_PUBLISH_FAILED' });
       },
     },
   };
 }
 
-test('core-first publication, partial continuation, and reruns converge', async () => {
-  const artifacts = packages.map((item) => ({ ...item, tarball: `/tmp/${item.name}.tgz` }));
+test('core-first publication, canonical partial continuation, and reruns converge', async () => {
+  const artifacts = packages.map((item, index) => ({ ...PACKAGE_SPECS[index], ...item, tarball: `/private/${index}.tgz` }));
   const absent = PACKAGE_SPECS.map(({ name }) => ({ status: 'absent', name }));
   const first = publicationHarness(absent);
   assert.equal((await applyPublicationState({ choice: 'core', artifacts, adapter: first.adapter, npmEnvironment: {} })).result, 'published-and-verified');
   assert.deepEqual(first.publishes, [PACKAGE_SPECS[0].name]);
-
   const continuation = publicationHarness([present(artifacts[0]), absent[1]]);
   assert.equal((await applyPublicationState({ choice: 'addon', artifacts, adapter: continuation.adapter, npmEnvironment: {} })).result, 'published-and-verified');
-  assert.deepEqual(continuation.publishes, [PACKAGE_SPECS[1].name]);
-
   const rerun = publicationHarness([present(artifacts[0]), present(artifacts[1])]);
   assert.equal((await applyPublicationState({ choice: 'addon', artifacts, adapter: rerun.adapter, npmEnvironment: {} })).result, 'reused');
-  assert.deepEqual(rerun.publishes, []);
+  const lost = publicationHarness(absent, { ambiguous: true });
+  assert.equal((await applyPublicationState({ choice: 'core', artifacts, adapter: lost.adapter, npmEnvironment: {} })).result, 'published-after-ambiguous-response');
 });
 
-test('publisher rejects wrong order and incompatible npm state permanently', async () => {
-  const artifacts = packages.map((item) => ({ ...item, tarball: `/tmp/${item.name}.tgz` }));
+test('publisher rejects inverse partial, wrong order, and mismatching durable state', async () => {
+  const artifacts = packages.map((item, index) => ({ ...PACKAGE_SPECS[index], ...item, tarball: `/private/${index}.tgz` }));
   const absent = PACKAGE_SPECS.map(({ name }) => ({ status: 'absent', name }));
   await assert.rejects(
     applyPublicationState({ choice: 'addon', artifacts, adapter: publicationHarness(absent).adapter, npmEnvironment: {} }),
-    /blocked until exact matching core/,
+    /ADDON_BLOCKED_UNTIL_CORE/,
+  );
+  await assert.rejects(
+    applyPublicationState({ choice: 'core', artifacts, adapter: publicationHarness([absent[0], present(artifacts[1])]).adapter, npmEnvironment: {} }),
+    /NPM_INVERSE_PARTIAL_STATE/,
   );
   const mismatch = present(artifacts[0]);
   mismatch.integrity = integrities[1];
   await assert.rejects(
     applyPublicationState({ choice: 'core', artifacts, adapter: publicationHarness([mismatch, absent[1]]).adapter, npmEnvironment: {} }),
-    /PERMANENT STOP/,
-  );
-  const wrongRepository = present(artifacts[0]);
-  wrongRepository.repository.url = 'git+https://github.com/other/repo.git';
-  await assert.rejects(
-    applyPublicationState({ choice: 'core', artifacts, adapter: publicationHarness([wrongRepository, absent[1]]).adapter, npmEnvironment: {} }),
-    /incompatible repository/,
+    /NPM_INTEGRITY_INCOMPATIBLE_CORE/,
   );
 });
 
-test('lost publish success is accepted only after exact registry readback', async () => {
-  const artifacts = packages.map((item) => ({ ...item, tarball: `/tmp/${item.name}.tgz` }));
-  const absent = PACKAGE_SPECS.map(({ name }) => ({ status: 'absent', name }));
-  const harness = publicationHarness(absent, { ambiguous: true });
-  const result = await applyPublicationState({ choice: 'core', artifacts, adapter: harness.adapter, npmEnvironment: {} });
-  assert.equal(result.result, 'published-after-ambiguous-response');
+test('late release-line descendants do not block package publication but reconciled V does', async () => {
+  const fixture = await repositoryFixture();
+  try {
+    const merge = fixture.merge;
+    const late = git(fixture.directory, 'commit-tree', git(fixture.directory, 'rev-parse', `${merge}^{tree}`), '-p', merge, '-m', 'late X');
+    const snapshot = git(fixture.directory, 'commit-tree', git(fixture.directory, 'rev-parse', `${merge}^{tree}`), '-p', merge, '-m', 'V');
+    assert.equal(lineRelation(fixture.directory, merge, snapshot, merge), 'at-merge');
+    assert.equal(lineRelation(fixture.directory, merge, snapshot, late), 'late-descendant');
+    const reconciled = git(fixture.directory, 'commit-tree', git(fixture.directory, 'rev-parse', `${merge}^{tree}`), '-p', snapshot, '-m', 'reconciled');
+    assert.throws(() => lineRelation(fixture.directory, merge, snapshot, reconciled), /RELEASE_LINE_RECONCILED_BEFORE_PUBLICATION/);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
 });
 
-test('closed npm environment ignores ambient config, registries, tokens and provenance attacks', async () => {
+test('npm and Git configuration attacks fail before tooling or transport', async () => {
+  assert.throws(() => assertNoAmbientPackageConfiguration({ npm_config_registry: 'https://attacker.invalid/' }), /AMBIENT_PACKAGE_CONFIG_PROHIBITED/);
+  assert.throws(() => assertNoAmbientGitConfiguration({ HTTPS_PROXY: 'https://attacker.invalid/' }), /AMBIENT_GIT_CONFIG_PROHIBITED/);
+  const fixture = await repositoryFixture();
+  try {
+    await writeFile(join(fixture.directory, '.npmrc'), 'registry=https://attacker.invalid/\n');
+    await assert.rejects(assertNoProjectNpmrc(fixture.directory), /PROJECT_NPM_CONFIG_PROHIBITED/);
+    await rm(join(fixture.directory, '.npmrc'));
+    git(fixture.directory, 'config', '--local', 'credential.helper', 'attacker');
+    assert.throws(() => assertSafeGitConfiguration(fixture.directory), /UNSAFE_GIT_CONFIG/);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('closed npm environment strips tokens, ambient registry, and project cwd authority', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'lab-01-publish-env-'));
   const previous = { ...process.env };
   try {
-    Object.assign(process.env, {
-      NPM_TOKEN: 'ambient-token',
-      NODE_AUTH_TOKEN: 'ambient-token',
-      NPM_CONFIG_REGISTRY: 'https://attacker.invalid/',
-      NPM_CONFIG_PROVENANCE: 'false',
-      NPM_CONFIG_USERCONFIG: '/tmp/attacker-npmrc',
-    });
+    Object.assign(process.env, { NPM_TOKEN: 'ambient', NODE_AUTH_TOKEN: 'ambient', NPM_CONFIG_REGISTRY: 'https://attacker.invalid/' });
     const env = await createClosedNpmEnvironment(directory);
     assert.equal(env.NPM_TOKEN, undefined);
     assert.equal(env.NODE_AUTH_TOKEN, undefined);
     assert.equal(env.NPM_CONFIG_REGISTRY, 'https://registry.npmjs.org/');
-    assert.equal(env.NPM_CONFIG_PROVENANCE, 'true');
-    const config = await readFile(env.NPM_CONFIG_USERCONFIG, 'utf8');
-    assert.match(config, /^registry=https:\/\/registry\.npmjs\.org\/$/m);
-    assert.match(config, /^provenance=true$/m);
-    assert.doesNotMatch(config, /token|attacker|provenance=false/);
+    assert.match(await readFile(env.NPM_CONFIG_USERCONFIG, 'utf8'), /^@fablebook:registry=https:\/\/registry\.npmjs\.org\/$/m);
   } finally {
     for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
     Object.assign(process.env, previous);
@@ -307,72 +360,120 @@ test('closed npm environment ignores ambient config, registries, tokens and prov
   }
 });
 
-test('OIDC environment retains only the exact GitHub-hosted publisher identity inputs', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'lab-01-oidc-env-'));
-  const previous = { ...process.env };
-  const required = {
-    ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.actions.example/',
-    ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'ephemeral-request-token',
-    GITHUB_ACTIONS: 'true',
-    GITHUB_EVENT_NAME: 'workflow_dispatch',
-    GITHUB_REF: 'refs/heads/releases/v1.0',
-    GITHUB_REF_NAME: 'releases/v1.0',
-    GITHUB_REPOSITORY: REPOSITORY,
-    GITHUB_REPOSITORY_ID: '1',
-    GITHUB_RUN_ATTEMPT: '1',
-    GITHUB_RUN_ID: '2',
-    GITHUB_RUN_NUMBER: '3',
-    GITHUB_SHA: snapshotSha,
-    GITHUB_WORKFLOW: 'Publish npm package',
-    GITHUB_WORKFLOW_REF: `${REPOSITORY}/.github/workflows/publish-npm.yml@refs/heads/releases/v1.0`,
-    GITHUB_WORKFLOW_SHA: snapshotSha,
-    RUNNER_ENVIRONMENT: 'github-hosted',
-  };
+test('raw child output, causes, properties, and temp paths never cross an error boundary', async () => {
+  const secret = `SECRET-${Date.now()}-/private/tmp/path`;
+  let observed;
   try {
-    Object.assign(process.env, required, { NPM_TOKEN: 'ambient', NODE_AUTH_TOKEN: 'ambient' });
-    const env = await createClosedNpmEnvironment(directory, { oidc: true });
-    for (const [key, value] of Object.entries(required)) assert.equal(env[key], value);
-    assert.equal(env.NPM_TOKEN, undefined);
-    assert.equal(env.NODE_AUTH_TOKEN, undefined);
-    process.env.RUNNER_ENVIRONMENT = 'self-hosted';
-    await assert.rejects(createClosedNpmEnvironment(join(directory, 'bad'), { oidc: true }), /incompatible/);
+    await command(process.execPath, ['-e', `process.stderr.write(${JSON.stringify(secret)}); process.exit(9)`], { errorCode: 'SANITIZED_FAILURE' });
+  } catch (error) {
+    observed = error;
+  }
+  assert.equal(observed.code, 'SANITIZED_FAILURE');
+  for (const serialized of [String(observed), inspect(observed, { showHidden: true }), JSON.stringify(observed), JSON.stringify({ ...observed })]) {
+    assert.doesNotMatch(serialized, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.doesNotMatch(serialized, /private\/tmp\/path/);
+  }
+  assert.equal(observed.cause, undefined);
+  assert.deepEqual(Object.keys(observed).sort(), ['code']);
+
+  let qaError;
+  try {
+    await qaCommand(process.execPath, ['-e', `process.stderr.write(${JSON.stringify(secret)}); process.exit(9)`]);
+  } catch (error) {
+    qaError = error;
+  }
+  assert.equal(qaError.message, 'QA_SUBPROCESS_FAILED');
+  assert.equal(qaError.cause, undefined);
+  assert.doesNotMatch(inspect(qaError, { showHidden: true }), /SECRET-|private\/tmp\/path/);
+});
+
+test('trusted-main identity requires local HEAD, remote main, dispatch SHA, workflow SHA, and main ref', async () => {
+  const fixture = await repositoryFixture();
+  const previous = { ...process.env };
+  try {
+    const head = git(fixture.directory, 'rev-parse', 'HEAD');
+    Object.assign(process.env, { EXPECTED_DISPATCH_SHA: head, EXPECTED_WORKFLOW_SHA: head, GITHUB_REF: 'refs/heads/main' });
+    assert.equal(assertTrustedMain(fixture.directory, () => head), head);
+    assert.equal(await assertTrustedPreparationMain(fixture.directory, { ref: async () => head }), head);
+    process.env.EXPECTED_WORKFLOW_SHA = sourceSha;
+    assert.throws(() => assertTrustedMain(fixture.directory, () => head), /TRUSTED_MAIN_IDENTITY_MISMATCH/);
   } finally {
     for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
     Object.assign(process.env, previous);
-    await rm(directory, { recursive: true, force: true });
+    await rm(fixture.directory, { recursive: true, force: true });
   }
 });
 
-test('publishable tarballs contain only package.json and src/index.js', () => {
-  for (const spec of PACKAGE_SPECS) {
-    const output = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json', `./${spec.directory}`], { encoding: 'utf8' }));
-    assert.deepEqual(output[0].files.map(({ path }) => path).sort(), ['package.json', 'src/index.js']);
+test('publisher writes sanitized durable evidence even when validation stops before publication', async () => {
+  const fixture = await repositoryFixture();
+  const evidencePath = join(fixture.directory, '..', `publish-evidence-${Date.now()}.json`);
+  const previous = { ...process.env };
+  const head = git(fixture.directory, 'rev-parse', 'HEAD');
+  try {
+    Object.assign(process.env, { EXPECTED_DISPATCH_SHA: head, EXPECTED_WORKFLOW_SHA: head, GITHUB_REF: 'refs/heads/main' });
+    const npmAdapter = {
+      query: async (spec) => ({ status: 'absent', name: spec.name }),
+      publish: async () => { throw new Error('must not publish'); },
+    };
+    await assert.rejects(publishFromSnapshot({
+      repoRoot: fixture.directory,
+      choice: 'core',
+      evidencePath,
+      npmAdapter,
+      refAdapter: (_root, ref) => (ref === 'refs/heads/main' ? head : null),
+      fetchAdapter: () => {},
+      oidc: false,
+    }));
+    const evidence = JSON.parse(await readFile(evidencePath, 'utf8'));
+    assert.equal(evidence.status, 'failed');
+    assert.deepEqual(evidence.npm.durable.map(({ status }) => status), ['absent', 'absent']);
+    assert.equal(typeof evidence.error.code, 'string');
+    assert.doesNotMatch(JSON.stringify(evidence), /must not publish|private|tmp\/lab-01-publish/);
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
+    Object.assign(process.env, previous);
+    await rm(evidencePath, { force: true });
+    await rm(fixture.directory, { recursive: true, force: true });
   }
 });
 
-test('workflow structures keep snapshot writes separate from tokenless OIDC publication', async () => {
-  const [snapshotWorkflow, publishWorkflow] = await Promise.all([
-    readFile(new URL('../.github/workflows/prepare-release-snapshot.yml', import.meta.url), 'utf8'),
-    readFile(new URL('../.github/workflows/publish-npm.yml', import.meta.url), 'utf8'),
-  ]);
-  assert.match(snapshotWorkflow, /workflow_dispatch:/);
-  assert.match(snapshotWorkflow, /contents: write/);
-  assert.match(snapshotWorkflow, /actions: read/);
-  assert.match(snapshotWorkflow, /pull-requests: read/);
-  assert.match(snapshotWorkflow, /refs\/heads\/releases\/v1\.0|refs\/heads\/releases\/v1\.0/);
+test('all release workflows bootstrap closed npm before any npm command and retain evidence', async () => {
+  for (const name of ['ready-release-qa.yml', 'prepare-release-snapshot.yml', 'publish-npm.yml']) {
+    const workflow = await readFile(new URL(`../.github/workflows/${name}`, import.meta.url), 'utf8');
+    assert.match(workflow, /scripts\/bootstrap-npm-cli\.mjs/);
+    assert.doesNotMatch(workflow.slice(0, workflow.indexOf('bootstrap-npm-cli.mjs')), /^\s+npm(?:@|\s)/m);
+    assert.match(workflow, /if: always\(\)[\s\S]*actions\/upload-artifact@[0-9a-f]{40} # v6/);
+    assert.match(workflow, /if-no-files-found: warn/);
+  }
+});
 
-  assert.match(publishWorkflow, /^on:\n  workflow_dispatch:/m);
-  assert.doesNotMatch(publishWorkflow, /pull_request:|push:|schedule:/);
-  assert.match(publishWorkflow, /runs-on: ubuntu-24\.04/);
-  assert.match(publishWorkflow, /github\.ref == 'refs\/heads\/releases\/v1\.0'/);
-  assert.match(publishWorkflow, /environment: npm-publish/);
-  assert.match(publishWorkflow, /permissions:\n      contents: read\n      id-token: write/);
-  assert.doesNotMatch(publishWorkflow, /contents: write|pull-requests:|actions: (?:read|write)/);
-  assert.match(publishWorkflow, /actions\/checkout@[0-9a-f]{40} # v6/);
-  assert.match(publishWorkflow, /actions\/setup-node@[0-9a-f]{40} # v6/);
-  assert.match(publishWorkflow, /node-version: 24\.18\.0/);
-  assert.match(publishWorkflow, /npm@11\.18\.0/);
-  assert.doesNotMatch(publishWorkflow, /NPM_TOKEN:|NODE_AUTH_TOKEN:|secrets\./);
+test('publish workflow executes only exact default-main trusted code under minimal OIDC authority', async () => {
+  const workflow = await readFile(new URL('../.github/workflows/publish-npm.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /^on:\n  workflow_dispatch:/m);
+  assert.doesNotMatch(workflow, /pull_request:|push:|schedule:|staged publishing/i);
+  assert.match(workflow, /github\.ref == 'refs\/heads\/main'/);
+  assert.match(workflow, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(workflow, /EXPECTED_DISPATCH_SHA: \$\{\{ github\.sha \}\}/);
+  assert.match(workflow, /EXPECTED_WORKFLOW_SHA: \$\{\{ github\.workflow_sha \}\}/);
+  assert.doesNotMatch(workflow, /checkout[\s\S]{0,300}(?:release-snapshots|releases\/v1\.0|staged\/v1\.0)/);
+  assert.match(workflow, /runs-on: ubuntu-24\.04/);
+  assert.match(workflow, /environment: npm-publish/);
+  assert.match(workflow, /permissions:\n      contents: read\n      id-token: write/);
+  assert.doesNotMatch(workflow, /contents: write|NPM_TOKEN:|NODE_AUTH_TOKEN:|secrets\./);
+  assert.match(workflow, /actions\/checkout@[0-9a-f]{40} # v6/);
+  assert.match(workflow, /actions\/setup-node@[0-9a-f]{40} # v6/);
+  assert.match(workflow, /node-version: 24\.18\.0/);
+});
+
+test('Ready QA pins every external action and separates trusted controller from candidate data', async () => {
+  const workflow = await readFile(new URL('../.github/workflows/ready-release-qa.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /actions\/checkout@[0-9a-f]{40} # v7/g);
+  assert.match(workflow, /actions\/setup-node@[0-9a-f]{40} # v6/);
+  assert.match(workflow, /actions\/upload-artifact@[0-9a-f]{40} # v6/);
+  assert.match(workflow, /ref: releases\/v1\.0\n          path: trusted/);
+  assert.match(workflow, /path: candidate/);
+  assert.match(workflow, /node \.\.\/trusted\/scripts\/qa-ready-release\.mjs/);
+  assert.match(workflow, /persist-credentials: false/g);
 });
 
 test('checked-in workflows contain no traditional npm credential or auth configuration', async () => {
@@ -381,4 +482,5 @@ test('checked-in workflows contain no traditional npm credential or auth configu
     const workflow = await readFile(new URL(name, directory), 'utf8');
     assert.doesNotMatch(workflow, /secrets\.(?:NPM|NODE_AUTH)|_authToken\s*=|NODE_AUTH_TOKEN:\s|NPM_TOKEN:\s/);
   }
+  assert.equal(SNAPSHOT_REF, 'refs/heads/release-snapshots/v1.0.1');
 });
