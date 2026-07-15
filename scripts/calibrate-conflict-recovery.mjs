@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { appendFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,6 +14,35 @@ const ROLES = ['source', 'intent', 'm', 'v', 'h', 'backup', 'line'];
 const FIXED_GRAPH_ROLES = ['source', 'intent', 'm', 'v', 'h'];
 const REF_SET = new Set(ROLES.map((role) => `${NAMESPACE}/${role}`));
 const PR_TITLE = 'Recover conflict calibration work after 1.0.1';
+const LIVE_REMOTE_URLS = [
+  'https://github.com/fablebookjs/lab-01',
+  'https://github.com/fablebookjs/lab-01.git',
+];
+const POST_CREATE_HISTORY_ATTEMPTS = 4;
+const POST_CREATE_RETRY_MS = 100;
+
+const HOSTILE_GIT_ENVIRONMENT = [
+  /^GIT_ALTERNATE_OBJECT_DIRECTORIES$/,
+  /^GIT_CEILING_DIRECTORIES$/,
+  /^GIT_COMMON_DIR$/,
+  /^GIT_CONFIG$/,
+  /^GIT_CONFIG_COUNT$/,
+  /^GIT_CONFIG_GLOBAL$/,
+  /^GIT_CONFIG_KEY_\d+$/,
+  /^GIT_CONFIG_NOSYSTEM$/,
+  /^GIT_CONFIG_PARAMETERS$/,
+  /^GIT_CONFIG_SYSTEM$/,
+  /^GIT_CONFIG_VALUE_\d+$/,
+  /^GIT_DIR$/,
+  /^GIT_DISCOVERY_ACROSS_FILESYSTEM$/,
+  /^GIT_GRAFT_FILE$/,
+  /^GIT_INDEX_FILE$/,
+  /^GIT_NAMESPACE$/,
+  /^GIT_OBJECT_DIRECTORY$/,
+  /^GIT_REPLACE_REF_BASE$/,
+  /^GIT_SHALLOW_FILE$/,
+  /^GIT_WORK_TREE$/,
+];
 
 const COMMIT_ENV = {
   GIT_AUTHOR_NAME: 'Fablebook Lab Conflict Calibration',
@@ -25,16 +54,20 @@ const COMMIT_ENV = {
 };
 
 export class Git {
-  constructor({ cwd = process.cwd(), remote = 'origin' } = {}) {
+  constructor({ cwd = process.cwd(), remote = 'origin', acceptedRemoteUrls = LIVE_REMOTE_URLS } = {}) {
     this.cwd = cwd;
     this.remote = remote;
+    this.acceptedRemoteUrls = new Set(acceptedRemoteUrls);
   }
 
   run(args, { env = {}, input, allowFailure = false } = {}) {
+    const inherited = Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => !HOSTILE_GIT_ENVIRONMENT.some((pattern) => pattern.test(key))),
+    );
     const result = spawnSync('git', args, {
       cwd: this.cwd,
       encoding: 'utf8',
-      env: { ...process.env, LC_ALL: 'C', ...env },
+      env: { ...inherited, LC_ALL: 'C', ...env },
       input,
     });
 
@@ -51,17 +84,54 @@ export class Git {
   text(args, options) {
     return this.run(args, options).stdout.trim();
   }
+
+  hostileEnvironmentKeys() {
+    return Object.keys(process.env).filter((key) =>
+      HOSTILE_GIT_ENVIRONMENT.some((pattern) => pattern.test(key)),
+    );
+  }
+
+  assertTrustedPushDestination() {
+    const hostile = this.hostileEnvironmentKeys();
+    if (hostile.length > 0) {
+      throw new Error(`Hostile inherited Git environment: ${hostile.sort().join(', ')}`);
+    }
+    if (this.remote !== 'origin') throw new Error(`Git writes require the exact origin remote, got ${this.remote}`);
+
+    const pushUrls = this.run(['config', '--get-all', 'remote.origin.pushurl'], { allowFailure: true });
+    if (pushUrls.status !== 1 || pushUrls.stdout.trim()) {
+      throw new Error('Explicit remote.origin.pushurl is forbidden');
+    }
+    const rewrites = this.run(
+      ['config', '--show-origin', '--get-regexp', '^url\\..*\\.(insteadof|pushinsteadof)$'],
+      { allowFailure: true },
+    );
+    if (rewrites.status !== 1 || rewrites.stdout.trim()) {
+      throw new Error('Configured Git URL rewrites are forbidden');
+    }
+
+    const fetchUrls = this.text(['remote', 'get-url', '--all', 'origin']).split('\n').filter(Boolean);
+    const effectivePushUrls = this.text(['remote', 'get-url', '--push', '--all', 'origin'])
+      .split('\n')
+      .filter(Boolean);
+    if (fetchUrls.length !== 1 || !this.acceptedRemoteUrls.has(fetchUrls[0])) {
+      throw new Error(`Untrusted effective origin fetch URL(s): ${fetchUrls.join(', ') || 'none'}`);
+    }
+    if (effectivePushUrls.length !== 1 || !this.acceptedRemoteUrls.has(effectivePushUrls[0])) {
+      throw new Error(`Untrusted effective origin push URL(s): ${effectivePushUrls.join(', ') || 'none'}`);
+    }
+    return { fetchUrl: fetchUrls[0], pushUrl: effectivePushUrls[0] };
+  }
 }
 
 export class GitHub {
-  constructor({ token = process.env.GITHUB_TOKEN, repository = REPOSITORY } = {}) {
+  constructor({ token = process.env.GITHUB_TOKEN } = {}) {
     if (!token) throw new Error('GITHUB_TOKEN is required for recovery PR operations');
     this.token = token;
-    this.repository = repository;
   }
 
   async request(path, { method = 'GET', body } = {}) {
-    const response = await fetch(`https://api.github.com/repos/${this.repository}${path}`, {
+    const response = await fetch(`https://api.github.com/repos/${REPOSITORY}${path}`, {
       method,
       headers: {
         Accept: 'application/vnd.github+json',
@@ -85,13 +155,17 @@ export class GitHub {
     return payload;
   }
 
-  listOpenPullRequests({ base, head }) {
-    const query = new URLSearchParams({ state: 'open', base, head, per_page: '100' });
+  listPullRequestHistory({ base, head }) {
+    const query = new URLSearchParams({ state: 'all', base, head, per_page: '100' });
     return this.request(`/pulls?${query}`);
   }
 
   createPullRequest(input) {
     return this.request('/pulls', { method: 'POST', body: input });
+  }
+
+  waitForRetry(milliseconds) {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
   }
 }
 
@@ -131,13 +205,36 @@ export function pushWithLease(git, ref, expected, next) {
   assertConflictRef(ref);
   if (expected !== null) assertSha(expected);
   assertSha(next);
+  git.assertTrustedPushDestination();
   return git.run(
     [
       'push',
       '--porcelain',
+      '--no-follow-tags',
       `--force-with-lease=${ref}:${expected ?? ''}`,
       git.remote,
       `${next}:${ref}`,
+    ],
+    { allowFailure: true },
+  );
+}
+
+function pushAtomicRecovery(git, graph) {
+  const backupRef = conflictRef('backup');
+  const lineRef = conflictRef('line');
+  for (const sha of [graph.h, graph.v]) assertSha(sha);
+  git.assertTrustedPushDestination();
+  return git.run(
+    [
+      'push',
+      '--porcelain',
+      '--atomic',
+      '--no-follow-tags',
+      `--force-with-lease=${backupRef}:${graph.h}`,
+      `--force-with-lease=${lineRef}:${graph.h}`,
+      git.remote,
+      `${graph.h}:${backupRef}`,
+      `${graph.v}:${lineRef}`,
     ],
     { allowFailure: true },
   );
@@ -234,14 +331,12 @@ export function verifyGraph(git, graph) {
   }
 
   const merge = git.run(['merge-tree', '--write-tree', graph.v, graph.h], { allowFailure: true });
-  const conflict = merge.stdout
-    .split('\n')
-    .map((line) => line.match(/^CONFLICT \((content|add\/add)\): Merge conflict in (.+)$/))
-    .find(Boolean);
-  if (merge.status === 0 || !conflict || conflict[2] !== FILE_PATH) {
+  const conflictLines = merge.stdout.split('\n').filter((line) => line.startsWith('CONFLICT '));
+  const exactConflict = `CONFLICT (add/add): Merge conflict in ${FILE_PATH}`;
+  if (merge.status !== 1 || conflictLines.length !== 1 || conflictLines[0] !== exactConflict) {
     throw new Error(`V and H did not produce the required genuine conflict: ${merge.stdout} ${merge.stderr}`);
   }
-  return { kind: conflict[1], path: FILE_PATH, mergeTreeExit: merge.status };
+  return { kind: 'add/add', path: FILE_PATH, mergeTreeExit: merge.status };
 }
 
 function installFixedGraphRefs(git, graph) {
@@ -254,7 +349,11 @@ function installFixedGraphRefs(git, graph) {
 
 function prepareFixedGraph(git, source) {
   assertSha(source);
-  const pinnedSource = remoteHead(git, conflictRef('source')) ?? source;
+  const existingSource = remoteHead(git, conflictRef('source'));
+  if (existingSource !== null && existingSource !== source) {
+    throw new Error(`Trusted main source drifted from fixed calibration source ${existingSource} to ${source}`);
+  }
+  const pinnedSource = existingSource ?? source;
   const graph = createGraph(git, pinnedSource);
   const conflict = verifyGraph(git, graph);
   const refResults = installFixedGraphRefs(git, graph);
@@ -288,6 +387,11 @@ function ensureOrRequireBackup(git, graph, { createIfAbsent }) {
     );
   }
 
+  return { result, ...verifyRemoteBackup(git, graph) };
+}
+
+function verifyRemoteBackup(git, graph) {
+  const backupRef = conflictRef('backup');
   const remoteBackup = remoteHead(git, backupRef);
   if (remoteBackup !== graph.h) throw new Error(`Remote recovery backup is ${remoteBackup}, expected ${graph.h}`);
   const lateCommits = [graph.h];
@@ -297,25 +401,54 @@ function ensureOrRequireBackup(git, graph, { createIfAbsent }) {
       throw new Error(`Late commit ${late} is not reachable from remote-backed H ${remoteBackup}`);
     }
   }
-  return { result, remoteBackup, lateCommits };
+  return { remoteBackup, lateCommits };
 }
 
 function forceLineToSnapshot(git, graph) {
   const lineRef = conflictRef('line');
   const observed = remoteHead(git, lineRef);
-  if (observed === graph.v) return { result: 'reused-release-snapshot', finalHead: graph.v };
+  if (observed === graph.v) {
+    const backup = verifyRemoteBackup(git, graph);
+    return { result: 'reused-release-snapshot', finalHead: graph.v, backup };
+  }
   if (observed !== graph.h) {
     throw new Error(`Conflict calibration line is ${observed ?? 'absent'}, expected complete H ${graph.h}`);
   }
-  const push = pushWithLease(git, lineRef, graph.h, graph.v);
+  verifyRemoteBackup(git, graph);
+  const push = pushAtomicRecovery(git, graph);
   if (push.status !== 0) {
+    const observedBackup = remoteHead(git, conflictRef('backup'));
+    const observedLine = remoteHead(git, lineRef);
+    if (observedBackup === graph.h && observedLine === graph.v) {
+      return {
+        result: 'forced-h-to-v-lost-success',
+        finalHead: observedLine,
+        backup: verifyRemoteBackup(git, graph),
+      };
+    }
+    if (
+      isExactStaleLeaseRejection(push, conflictRef('backup'), graph.h) ||
+      isExactStaleLeaseRejection(push, lineRef, graph.v)
+    ) {
+      throw new Error(
+        `Stale atomic lease rejected recovery force; backup=${observedBackup ?? 'absent'}, line=${observedLine ?? 'absent'}`,
+      );
+    }
     throw new Error(
-      `Expected-H force-with-lease for ${lineRef} was rejected: ${push.stderr.trim() || push.stdout.trim()}`,
+      `Atomic H-to-V force failed without stale-lease proof; backup=${observedBackup ?? 'absent'}, line=${observedLine ?? 'absent'}: ${push.stderr.trim() || push.stdout.trim()}`,
     );
   }
   const finalHead = remoteHead(git, lineRef);
   if (finalHead !== graph.v) throw new Error(`Remote line ${finalHead} is not exact V ${graph.v}`);
-  return { result: 'forced-h-to-v', finalHead };
+  const backup = verifyRemoteBackup(git, graph);
+  return { result: 'forced-h-to-v', finalHead, backup };
+}
+
+export function isExactStaleLeaseRejection(push, ref, candidate) {
+  assertConflictRef(ref);
+  assertSha(candidate);
+  const exact = `!\t${candidate}:${ref}\t[rejected] (stale info)`;
+  return push.status !== 0 && push.stdout.split('\n').includes(exact);
 }
 
 export function recoveryPullRequestBody(graph) {
@@ -329,13 +462,17 @@ export function recoveryPullRequestBody(graph) {
   );
 }
 
-function verifyRecoveryPullRequest(pr, graph) {
+function verifyRecoveryPullRequest(pr, graph, { requireEditableFields = false } = {}) {
   const base = conflictRef('line').replace('refs/heads/', '');
   const head = conflictRef('backup').replace('refs/heads/', '');
-  if (pr.number === 12) throw new Error('Refusing to use protected live release PR #12');
+  if (!Number.isInteger(pr.number) || pr.number <= 0 || pr.number === 12) {
+    throw new Error(`Invalid or protected recovery PR number: ${pr.number}`);
+  }
+  const canonicalUrl = `https://github.com/${REPOSITORY}/pull/${pr.number}`;
+  if (pr.html_url !== canonicalUrl) throw new Error(`Recovery PR URL is not canonical for #${pr.number}`);
   if (pr.state !== 'open' || pr.draft !== true) throw new Error('Recovery PR is not one open draft');
-  if (pr.title !== PR_TITLE || pr.body !== recoveryPullRequestBody(graph)) {
-    throw new Error('Existing recovery PR title or body does not match the fixed plan');
+  if (requireEditableFields && (pr.title !== PR_TITLE || pr.body !== recoveryPullRequestBody(graph))) {
+    throw new Error('Created recovery PR title or body does not match the fixed payload');
   }
   if (pr.base?.ref !== base || pr.base?.sha !== graph.v || pr.base?.repo?.full_name !== REPOSITORY) {
     throw new Error('Recovery PR base is not the exact calibration line at V');
@@ -351,9 +488,9 @@ async function ensureRecoveryPullRequest(github, graph) {
   const base = conflictRef('line').replace('refs/heads/', '');
   const head = conflictRef('backup').replace('refs/heads/', '');
   const qualifiedHead = `fablebookjs:${head}`;
-  let pulls = await github.listOpenPullRequests({ base, head: qualifiedHead });
+  let pulls = await github.listPullRequestHistory({ base, head: qualifiedHead });
   if (!Array.isArray(pulls)) throw new Error('GitHub did not return a pull request list');
-  if (pulls.length > 1) throw new Error('More than one open recovery PR exists for the fixed refs');
+  if (pulls.length > 1) throw new Error('More than one historical recovery PR exists for the fixed refs');
   if (pulls.length === 1) {
     return { action: 'reused', pull: verifyRecoveryPullRequest(pulls[0], graph) };
   }
@@ -365,10 +502,20 @@ async function ensureRecoveryPullRequest(github, graph) {
     head,
     draft: true,
   });
-  verifyRecoveryPullRequest(created, graph);
-  pulls = await github.listOpenPullRequests({ base, head: qualifiedHead });
-  if (!Array.isArray(pulls) || pulls.length !== 1) {
-    throw new Error('Recovery PR creation did not converge to exactly one open PR');
+  verifyRecoveryPullRequest(created, graph, { requireEditableFields: true });
+  for (let attempt = 1; attempt <= POST_CREATE_HISTORY_ATTEMPTS; attempt += 1) {
+    pulls = await github.listPullRequestHistory({ base, head: qualifiedHead });
+    if (!Array.isArray(pulls)) throw new Error('GitHub did not return a pull request list');
+    if (pulls.length > 0) break;
+    if (attempt < POST_CREATE_HISTORY_ATTEMPTS) {
+      const wait =
+        github.waitForRetry?.bind(github) ??
+        ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+      await wait(POST_CREATE_RETRY_MS * attempt);
+    }
+  }
+  if (pulls.length !== 1) {
+    throw new Error('Recovery PR creation did not converge to exactly one all-state historical PR');
   }
   const verified = verifyRecoveryPullRequest(pulls[0], graph);
   if (verified.number !== created.number) throw new Error('Recovery PR identity changed after creation');
@@ -378,11 +525,13 @@ async function ensureRecoveryPullRequest(github, graph) {
 export async function runConflictRecovery({ mode, git = new Git(), source, github = null }) {
   assertMode(mode);
   assertSha(source);
+  git.assertTrustedPushDestination();
   const prepared = prepareFixedGraph(git, source);
   const createEvidenceRefs = mode === 'inject-after-force';
   const line = requireCompatibleLine(git, prepared.graph, { createIfAbsent: createEvidenceRefs });
   const backup = ensureOrRequireBackup(git, prepared.graph, { createIfAbsent: createEvidenceRefs });
   const forced = forceLineToSnapshot(git, prepared.graph);
+  const finalBackup = verifyRemoteBackup(git, prepared.graph);
 
   const result = {
     mode,
@@ -395,8 +544,8 @@ export async function runConflictRecovery({ mode, git = new Git(), source, githu
     finalLine: forced.finalHead,
     backupRef: conflictRef('backup'),
     backupResult: backup.result,
-    remoteBackup: backup.remoteBackup,
-    lateCommits: backup.lateCommits,
+    remoteBackup: finalBackup.remoteBackup,
+    lateCommits: finalBackup.lateCommits,
   };
 
   if (mode === 'inject-after-force') {
@@ -475,25 +624,22 @@ export function finalizeResult(
   return result.intentionalFailure ? INTENTIONAL_FAILURE_EXIT_CODE : 0;
 }
 
-function assertLiveContext() {
+function assertLiveContext(git) {
   if (process.env.GITHUB_ACTIONS !== 'true') throw new Error('Live calibration runs only in GitHub Actions');
   if (process.env.GITHUB_REPOSITORY !== REPOSITORY) throw new Error('Wrong GitHub repository');
   if (process.env.GITHUB_EVENT_NAME !== 'workflow_dispatch') throw new Error('Wrong GitHub event');
   if (process.env.GITHUB_REF !== 'refs/heads/main') throw new Error('Conflict calibration must dispatch from main');
-  const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const head = git.text(['rev-parse', 'HEAD']);
   if (head !== process.env.GITHUB_SHA) throw new Error('Checked-out commit is not the trusted dispatch SHA');
-  const remote = execFileSync('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8' }).trim();
-  if (!['https://github.com/fablebookjs/lab-01', 'https://github.com/fablebookjs/lab-01.git'].includes(remote)) {
-    throw new Error(`Wrong origin: ${remote}`);
-  }
+  git.assertTrustedPushDestination();
 }
 
 async function main() {
-  assertLiveContext();
+  const git = new Git();
+  assertLiveContext(git);
   const modeIndex = process.argv.indexOf('--mode');
   const mode = modeIndex === -1 ? null : process.argv[modeIndex + 1];
   assertMode(mode);
-  const git = new Git();
   const source = git.text(['rev-parse', 'HEAD']);
   const github = mode === 'resume' ? new GitHub() : null;
   const result = await runConflictRecovery({ mode, git, source, github });
