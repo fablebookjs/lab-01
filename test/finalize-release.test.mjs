@@ -65,6 +65,7 @@ const expectedPackages = PACKAGE_SPECS.map((spec, index) => ({
   integrity: `sha512-${Buffer.alloc(64, index + 1).toString('base64')}`,
   shasum: String(index + 1).repeat(40),
 }));
+const snapshotContentSha256 = 'a'.repeat(64);
 
 function intentMessage(version = RELEASE_VERSION, source = ids.source) {
   return `release: propose v${version}\n\nRelease-Intent-Version: 1\nRelease-Line: releases/v1.0\nRelease-Version: ${version}\nRelease-Source: ${source}\n`;
@@ -138,7 +139,14 @@ class MemoryGit {
         sha: ids.snapshot,
         parents: [ids.merge],
         tree: trees.snapshot,
-        message: buildSnapshotMessage({ mergeSha: ids.merge, qaRunId: 29414043206, stagedSha: ids.intent, sourceSha: ids.source, packages: expectedPackages }),
+        message: buildSnapshotMessage({
+          mergeSha: ids.merge,
+          stagedSha: ids.intent,
+          sourceSha: ids.source,
+          tree: trees.snapshot,
+          contentSha256: snapshotContentSha256,
+          packages: expectedPackages,
+        }),
       }],
       [ids.late, { sha: ids.late, parents: [ids.merge], tree: trees.late, message: 'fix(core): deliberately late finite guard\n' }],
       [ids.otherLate, { sha: ids.otherLate, parents: [ids.merge], tree: trees.otherLate, message: 'fix(core): concurrent late guard\n' }],
@@ -206,7 +214,7 @@ class MemoryGit {
   async acceptedSnapshot(value) {
     assert.equal(value, ids.snapshot);
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       locator: SNAPSHOT_REF,
       sourceSha: ids.source,
       stagedSha: ids.intent,
@@ -215,8 +223,15 @@ class MemoryGit {
       intent: await this.commit(ids.intent),
       merge: await this.commit(ids.merge),
       snapshot: await this.commit(ids.snapshot),
+      treeSha: trees.snapshot,
+      contentSha256: snapshotContentSha256,
       packages: structuredClone(expectedPackages),
-      qa: { kind: 'accepted-snapshot-proof', label: 'accepted-snapshot-proof:fixture' },
+      qa: {
+        kind: 'accepted-snapshot-content',
+        treeSha: trees.snapshot,
+        contentSha256: snapshotContentSha256,
+        label: `accepted-snapshot-content:${trees.snapshot}:${snapshotContentSha256}`,
+      },
     };
   }
   async diffPaths(from, to) {
@@ -448,6 +463,31 @@ test('snapshot absence and the only canonical npm incomplete states are successf
   assert.deepEqual(allWrites(partial), []);
 });
 
+test('acceptedSnapshot authority is schema-2 tree/content bound with no QA run identity', async () => {
+  const value = fixture();
+  const state = await observe(value);
+  assert.equal(state.graph.authority.schemaVersion, 2);
+  assert.equal(state.graph.authority.treeSha, trees.snapshot);
+  assert.equal(state.graph.authority.contentSha256, snapshotContentSha256);
+  assert.deepEqual(state.graph.authority.qa, {
+    kind: 'accepted-snapshot-content',
+    treeSha: trees.snapshot,
+    contentSha256: snapshotContentSha256,
+    label: `accepted-snapshot-content:${trees.snapshot}:${snapshotContentSha256}`,
+  });
+  assert.doesNotMatch(value.gitAdapter.commits.get(ids.snapshot).message, /Release-QA-Run/);
+  assert.match(value.gitAdapter.commits.get(ids.snapshot).message, new RegExp(`Release-Tree: ${trees.snapshot}`));
+  assert.match(value.gitAdapter.commits.get(ids.snapshot).message, new RegExp(`Release-Content-SHA256: ${snapshotContentSha256}`));
+
+  const incompatible = fixture();
+  const acceptedSnapshot = incompatible.gitAdapter.acceptedSnapshot.bind(incompatible.gitAdapter);
+  incompatible.gitAdapter.acceptedSnapshot = async (shaValue) => ({
+    ...(await acceptedSnapshot(shaValue)),
+    contentSha256: 'b'.repeat(64),
+  });
+  await assert.rejects(observe(incompatible), /incomplete or incompatible authority record/);
+});
+
 test('inverse, metadata, downloaded-byte, repository, and add-on dependency mismatches permanently stop', async () => {
   const cases = [
     [{ status: 'absent', name: PACKAGE_SPECS[0].name }, npmPresent(1)],
@@ -669,7 +709,7 @@ test('complete pagination is bounded, ordered, and rejects duplicate page identi
   await assert.rejects(endless.paginate('/pulls?state=all'), /exceeded/);
 });
 
-test('wake-up ordering converges with no invocation performing more than one durable write', async () => {
+test('wake-up ordering converges with one classified action and at most one GitHub POST', async () => {
   const value = fixture();
   value.gitAdapter.refs[RELEASE_REF].sha = ids.late;
   value.gitAdapter.nextCommitShas.push(ids.reconciliation, ids.nextIntent);

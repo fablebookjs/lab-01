@@ -66,8 +66,13 @@ request. Drift observed before an adapter mutation aborts. A consumed POST
 authorization remains query-only if drift occurs before its POST.
 
 The snapshot parser is isolated inside `LiveGitAdapter.acceptedSnapshot(sha)`.
-The classifier consumes only its normalized authority record; no classifier or
-action parses snapshot trailers directly.
+It consumes schema-2 snapshot authority: Release-Snapshot-Version,
+Release-Line/Version/Merge, Release-QA-Staged/QA-Source, Release-Tree,
+Release-Content-SHA256, and both packages'
+integrity/shasum. There is no Release-QA-Run identity. The adapter binds the
+tree to V and independently hashes V's four committed transformed files before
+returning normalized tree/content authority. No classifier or action parses
+snapshot trailers directly.
 
 Repeated dispatches converge in this order:
 
@@ -158,7 +163,7 @@ spent-marker reuse path as an ordinary lost response or delayed visibility.
 
 ## Evidence and inspection
 
-Every run uploads sanitized JSON containing actor/event/permissions/source,
+Every run uploads sanitized schema-2 JSON containing actor/event/permissions/source,
 each pre-mutation main binding, release PR, S/I/M/V, QA authority, npm
 identities, H/J, action old/new refs, tag, Release ID/URL, recovery, next
 intent/PR, and full before/after canonical tuples for relevant refs, PRs,

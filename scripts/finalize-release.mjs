@@ -37,6 +37,7 @@ export const FAULTS = Object.freeze(['none', 'after-github-release-post']);
 export const FINALIZER_PERMISSIONS = Object.freeze({ contents: 'write', pullRequests: 'write' });
 
 const SHA = /^[0-9a-f]{40}$/;
+const SHA256 = /^[0-9a-f]{64}$/;
 const PAGE_SIZE = 100;
 const MAX_PAGES = 100;
 const HOSTILE_GIT_ENVIRONMENT = [
@@ -442,7 +443,7 @@ function assertSameRefs(before, after, label) {
 
 function validateAcceptedAuthority(authority, snapshotSha) {
   if (
-    authority?.schemaVersion !== 1 ||
+    authority?.schemaVersion !== 2 ||
     authority.locator !== SNAPSHOT_REF ||
     authority.snapshot?.sha !== snapshotSha ||
     authority.snapshot?.parents?.length !== 1 ||
@@ -458,6 +459,11 @@ function validateAcceptedAuthority(authority, snapshotSha) {
     authority.merge.parents[1] !== authority.intent.sha ||
     authority.merge.tree !== authority.source.tree ||
     authority.snapshot.tree === authority.merge.tree ||
+    authority.treeSha !== authority.snapshot.tree ||
+    !SHA256.test(authority.contentSha256 ?? '') ||
+    authority.qa?.kind !== 'accepted-snapshot-content' ||
+    authority.qa?.treeSha !== authority.treeSha ||
+    authority.qa?.contentSha256 !== authority.contentSha256 ||
     typeof authority.qa?.label !== 'string' ||
     !authority.qa.label
   ) {
@@ -1122,7 +1128,7 @@ export async function runFinalizerInvocation({ adapters, context, fault = 'none'
   }
 
   const evidence = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     operation: 'finalize-release',
     repository: REPOSITORY,
     context: before.context,
@@ -1343,8 +1349,19 @@ export class LiveGitAdapter {
     if (addonManifest.dependencies?.[PACKAGE_SPECS[0].name] !== RELEASE_VERSION || Object.keys(addonManifest.dependencies ?? {}).length !== 1) {
       fail(`V add-on manifest does not depend exactly on core ${RELEASE_VERSION}`);
     }
+    const content = createHash('sha256');
+    for (const path of TRANSFORMED_FILES) {
+      content.update(path);
+      content.update('\0');
+      content.update(runGit(['show', `${snapshot.sha}:${path}`], { cwd: this.cwd }).stdout);
+      content.update('\0');
+    }
+    const contentSha256 = content.digest('hex');
+    if (metadata.tree !== snapshot.tree || metadata.contentSha256 !== contentSha256) {
+      fail('V tree/content authority does not match its exact committed bytes');
+    }
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       locator: SNAPSHOT_REF,
       sourceSha: source.sha,
       stagedSha: intent.sha,
@@ -1353,8 +1370,15 @@ export class LiveGitAdapter {
       intent,
       merge,
       snapshot,
+      treeSha: metadata.tree,
+      contentSha256,
       packages: metadata.packages,
-      qa: { kind: 'ready-release-qa-run', runId: metadata.qaRunId, label: `ready-release-qa-run:${metadata.qaRunId}` },
+      qa: {
+        kind: 'accepted-snapshot-content',
+        treeSha: metadata.tree,
+        contentSha256,
+        label: `accepted-snapshot-content:${metadata.tree}:${contentSha256}`,
+      },
     };
   }
 
@@ -1641,7 +1665,7 @@ function liveContext(repoRoot) {
 
 function failureEvidence(error, evidence) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     operation: 'finalize-release',
     repository: REPOSITORY,
     outcome: 'failed-closed',
