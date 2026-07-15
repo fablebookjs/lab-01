@@ -9,8 +9,10 @@ import {
   Git,
   GitHub,
   NAMESPACE,
+  PullRequestPostError,
   ROLES,
   assertRecoveryTerminalRef,
+  classifyPullRequestResponse,
   createProposalCommit,
   createRecoveryGraph,
   parseRemoteAdvertisement,
@@ -20,7 +22,9 @@ import {
   recoveryTerminalRef,
   runRecoveryTerminal,
   verifyProposalCommit,
+  verifyProposalPullRequest,
   verifyRecoveryGraph,
+  verifyRecoveryPullRequest,
 } from '../scripts/calibrate-recovery-terminal.mjs';
 
 function command(cwd, args, env = {}) {
@@ -136,6 +140,7 @@ function proposalPull(state, input, number = 102) {
     draft: true,
     merged: false,
     merged_at: null,
+    merge_commit_sha: null,
     title: input.title,
     body: input.body,
     base: {
@@ -222,6 +227,7 @@ function normalMerge(f, graph, pr) {
     merged: true,
     merged_at: '2026-07-15T18:31:00Z',
     merge_commit_sha: merge,
+    base: { ...pr.base, sha: merge },
   });
   return merge;
 }
@@ -433,6 +439,137 @@ test('wrong, protected, contradictory, and duplicate recovery histories fail clo
   }
 });
 
+test('recovery PR validator requires exact open, closed-unmerged, and closed-merged tuples', async () => {
+  const { f, git, setup, pr } = await prepared();
+  try {
+    assert.equal(verifyRecoveryPullRequest(pr, git, setup.graph, f.source).status, 'open');
+    const openMutations = [
+      [(value) => { delete value.number; }, /Invalid or protected calibration PR number/],
+      [(value) => { value.number = null; }, /Invalid or protected calibration PR number/],
+      [(value) => { value.number = '101'; }, /Invalid or protected calibration PR number/],
+      [(value) => { value.html_url = null; }, /URL is not canonical/],
+      [(value) => { delete value.merged; }, /merged field is not exact boolean/],
+      [(value) => { value.merged = null; }, /merged field is not exact boolean/],
+      [(value) => { value.merged = 'false'; }, /merged field is not exact boolean/],
+      [(value) => { delete value.draft; }, /draft field is not exact false/],
+      [(value) => { value.draft = null; }, /draft field is not exact false/],
+      [(value) => { value.draft = 'false'; }, /draft field is not exact false/],
+      [(value) => { value.state = 'OPEN'; }, /state is not exact open or closed/],
+      [(value) => { delete value.merged_at; }, /contradictory state tuple/],
+      [(value) => { value.merge_commit_sha = 'a'.repeat(40); }, /contradictory state tuple/],
+    ];
+    for (const [mutate, error] of openMutations) {
+      const forged = structuredClone(pr);
+      mutate(forged);
+      assert.throws(() => verifyRecoveryPullRequest(forged, git, setup.graph, f.source), error);
+    }
+
+    const closed = { ...structuredClone(pr), state: 'closed' };
+    assert.equal(verifyRecoveryPullRequest(closed, git, setup.graph, f.source).status, 'closed-unmerged');
+    for (const [mutate, error] of [
+      [(value) => { value.base.sha = 'a'.repeat(40); }, /base is not the exact/],
+      [(value) => { value.merge_commit_sha = 'a'.repeat(40); }, /Closed-unmerged.*contradictory/],
+      [(value) => { value.merged_at = '2026-07-15T19:00:00Z'; }, /Closed-unmerged.*contradictory/],
+    ]) {
+      const forged = structuredClone(closed);
+      mutate(forged);
+      assert.throws(() => verifyRecoveryPullRequest(forged, git, setup.graph, f.source), error);
+    }
+
+    const mergedLine = normalMerge(f, setup.graph, pr);
+    assert.equal(verifyRecoveryPullRequest(pr, git, setup.graph, mergedLine).status, 'merged');
+    for (const [mutate, error] of [
+      [(value) => { value.merged = null; }, /merged field is not exact boolean/],
+      [(value) => { value.merged = false; }, /Closed-unmerged.*contradictory/],
+      [(value) => { value.merged_at = null; }, /lacks exact merged timestamp/],
+      [(value) => { value.merge_commit_sha = null; }, /Invalid commit identity/],
+      [(value) => { value.base.sha = setup.graph.source; }, /base is not the exact/],
+      [(value) => { value.draft = true; }, /draft field is not exact false/],
+    ]) {
+      const forged = structuredClone(pr);
+      mutate(forged);
+      assert.throws(() => verifyRecoveryPullRequest(forged, git, setup.graph, mergedLine), error);
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('proposal PR validator requires a fully typed exact open-draft tuple', async () => {
+  const { f, git, setup, line } = await prepared({ merge: true });
+  try {
+    const proposal = createProposalCommit(git, { line, recovery: setup.graph.recovery });
+    const state = {
+      source: f.source,
+      recovery: setup.graph.recovery,
+      recoveryNumber: 101,
+      line,
+      proposal,
+    };
+    const input = {
+      title: 'Propose the next patch after recovery-terminal calibration',
+      body: proposalPullRequestBody(state),
+      base: 'calibration/g1/recovery-terminal/line',
+      head: 'calibration/g1/recovery-terminal/proposal',
+      draft: true,
+    };
+    const exact = proposalPull(state, input);
+    assert.equal(verifyProposalPullRequest(exact, state), exact);
+    const mutations = [
+      [(value) => { delete value.number; }, /Invalid or protected calibration PR number/],
+      [(value) => { value.number = '102'; }, /Invalid or protected calibration PR number/],
+      [(value) => { value.html_url = null; }, /URL is not canonical/],
+      [(value) => { delete value.merged; }, /merged field is not exact boolean/],
+      [(value) => { value.merged = null; }, /merged field is not exact boolean/],
+      [(value) => { value.merged = 'false'; }, /merged field is not exact boolean/],
+      [(value) => { delete value.draft; }, /draft field is not exact true/],
+      [(value) => { value.draft = null; }, /draft field is not exact true/],
+      [(value) => { value.draft = 'true'; }, /draft field is not exact true/],
+      [(value) => { value.state = null; }, /state is not exact open or closed/],
+      [(value) => { delete value.merge_commit_sha; }, /contradictory state tuple/],
+      [(value) => { value.merge_commit_sha = 'a'.repeat(40); }, /contradictory state tuple/],
+      [(value) => { value.merged_at = '2026-07-15T19:00:00Z'; }, /contradictory state tuple/],
+      [(value) => { value.base.sha = setup.graph.source; }, /base is not the exact/],
+      [(value) => { value.head.ref = 'other'; }, /head is not the exact/],
+      [(value) => { value.head.sha = setup.graph.recovery; }, /head is not the exact/],
+      [(value) => { value.head.repo.full_name = 'other/repo'; }, /head is not the exact/],
+      [(value) => { value.state = 'closed'; }, /not one exact open draft/],
+    ];
+    for (const [mutate, error] of mutations) {
+      const forged = structuredClone(exact);
+      mutate(forged);
+      assert.throws(() => verifyProposalPullRequest(forged, state), error);
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('malformed recovery history and independently malformed hydrated detail both fail before writes', async () => {
+  for (const surface of ['history', 'detail']) {
+    const { f, git, github, pr } = await prepared();
+    try {
+      const exact = structuredClone(pr);
+      const malformed = structuredClone(pr);
+      delete malformed.merged;
+      github.listPullRequestHistoryPage = async ({ head, page }) =>
+        page === 1 && head.endsWith('/recovery')
+          ? [structuredClone(surface === 'history' ? malformed : exact)]
+          : [];
+      github.getPullRequest = async () => structuredClone(surface === 'detail' ? malformed : exact);
+      const pushes = git.pushes.length;
+      await assert.rejects(
+        runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github }),
+        /merged field is not exact boolean/,
+      );
+      assert.equal(git.pushes.length, pushes);
+      assert.equal(github.createCalls.length, 0);
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
 test('stale line, squash-like merge, and merge SHA mismatch cannot authorize proposal', async () => {
   for (const kind of ['stale', 'squash', 'sha-mismatch']) {
     const { f, git, setup, github, pr } = await prepared();
@@ -444,7 +581,13 @@ test('stale line, squash-like merge, and merge SHA mismatch cannot authorize pro
       } else if (kind === 'squash') {
         const squash = command(f.runner, ['commit-tree', `${setup.graph.recovery}^{tree}`, '-p', setup.graph.source, '-m', 'squash']);
         command(f.runner, ['push', '--force', f.remote, `${squash}:${recoveryTerminalRef('line')}`]);
-        Object.assign(pr, { state: 'closed', merged: true, merged_at: '2026-07-15T19:00:00Z', merge_commit_sha: squash });
+        Object.assign(pr, {
+          state: 'closed',
+          merged: true,
+          merged_at: '2026-07-15T19:00:00Z',
+          merge_commit_sha: squash,
+          base: { ...pr.base, sha: squash },
+        });
       } else {
         const line = normalMerge(f, setup.graph, pr);
         pr.merge_commit_sha = line.replace(/^./, line[0] === 'a' ? 'b' : 'a');
@@ -468,7 +611,7 @@ test('proposal history rejects closed, duplicate, or protected PRs and never rep
     await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
     const created = structuredClone(github.proposals[0]);
     const cases = [
-      [[{ ...created, state: 'closed' }], /not one open draft/],
+      [[{ ...created, state: 'closed' }], /not one exact open draft/],
       [[created, { ...created, number: 103, html_url: 'https://github.com/fablebookjs/lab-01/pull/103' }], /More than one historical proposal PR/],
       [[{ ...created, number: 19, html_url: 'https://github.com/fablebookjs/lab-01/pull/19' }], /protected/],
     ];
@@ -503,41 +646,193 @@ test('lost successful proposal POST converges through all-state visibility witho
   }
 });
 
-test('consumed marker plus delayed visibility converges, while permanent invisibility fails closed', async () => {
-  for (const visible of [true, false]) {
-    const { f, git, setup, github, line } = await prepared({ merge: true });
-    try {
-      const proposal = createProposalCommit(git, { line, recovery: setup.graph.recovery });
-      github.proposalSha = proposal;
-      command(f.runner, ['push', f.remote, `${proposal}:${recoveryTerminalRef('proposal')}`]);
-      command(f.runner, ['push', '--force', f.remote, `${proposal}:${recoveryTerminalRef('pr-attempt')}`]);
-      const input = {
-        title: 'Propose the next patch after recovery-terminal calibration',
-        body: proposalPullRequestBody({ source: f.source, recovery: setup.graph.recovery, recoveryNumber: 101, line, proposal }),
-        base: 'calibration/g1/recovery-terminal/line',
-        head: 'calibration/g1/recovery-terminal/proposal',
-        draft: true,
-      };
-      let proposalQueries = 0;
-      github.listPullRequestHistoryPage = async (filter) => {
-        if (filter.head.endsWith('/recovery')) return filter.page === 1 ? [structuredClone(github.recovery)] : [];
-        proposalQueries += 1;
-        return visible && proposalQueries >= 3 ? [proposalPull({ line, proposal }, input)] : [];
-      };
-      if (visible) {
-        const result = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
-        assert.equal(result.outcome, 'proposal-reused');
-        assert.ok(proposalQueries >= 3);
-      } else {
-        await assert.rejects(
-          runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github }),
-          /authorizes no second POST/,
-        );
+test('a definite first POST rejection remains resumable and the next run creates exactly once', async () => {
+  const { f, git, setup, github, line } = await prepared({ merge: true });
+  try {
+    github.proposalSha = createProposalCommit(git, { line, recovery: setup.graph.recovery });
+    let reject = true;
+    github.createPullRequest = async function rejectThenCreate(input) {
+      if (reject) {
+        this.createCalls.push(structuredClone(input));
+        throw new PullRequestPostError('unprocessable proposal payload', {
+          kind: 'client-rejection',
+          status: 422,
+        });
       }
-      assert.equal(github.createCalls.length, 0);
-    } finally {
-      f.cleanup();
+      return FakeGitHub.prototype.createPullRequest.call(this, input);
+    };
+
+    await assert.rejects(
+      runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github }),
+      /client-rejection has no visible canonical PR; a later exact sweep may retry one POST/,
+    );
+    assert.equal(github.createCalls.length, 1);
+    assert.equal(github.proposals.length, 0);
+    assert.equal(remoteRef(f, recoveryTerminalRef('pr-attempt')), github.proposalSha);
+
+    reject = false;
+    const recovered = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
+    assert.equal(recovered.outcome, 'proposal-created');
+    assert.equal(github.createCalls.length, 2);
+    assert.equal(github.proposals.length, 1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('lost success can retry into duplicate refusal and converge when the single winner becomes visible', async () => {
+  const { f, git, setup, github, line } = await prepared({ merge: true });
+  try {
+    const proposal = createProposalCommit(git, { line, recovery: setup.graph.recovery });
+    github.proposalSha = proposal;
+    let phase = 'lost-success';
+    let hiddenPull = null;
+    github.createPullRequest = async function loseThenRefuseDuplicate(input) {
+      this.createCalls.push(structuredClone(input));
+      if (phase === 'lost-success') {
+        hiddenPull = proposalPull({ line, proposal }, input);
+        throw new PullRequestPostError('socket closed after server accepted POST', { kind: 'ambiguous' });
+      }
+      phase = 'visible';
+      throw new PullRequestPostError('A pull request already exists for these refs', {
+        kind: 'duplicate',
+        status: 422,
+      });
+    };
+    github.listPullRequestHistoryPage = async (filter) => {
+      if (filter.head.endsWith('/recovery')) return filter.page === 1 ? [structuredClone(github.recovery)] : [];
+      if (filter.page !== 1) return [];
+      return phase === 'visible' ? [structuredClone(hiddenPull)] : [];
+    };
+
+    await assert.rejects(
+      runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github }),
+      /ambiguous has no visible canonical PR; a later exact sweep may retry one POST/,
+    );
+    assert.equal(github.createCalls.length, 1);
+    phase = 'duplicate';
+    const converged = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
+    assert.equal(converged.outcome, 'proposal-reused');
+    assert.equal(converged.proposal.pullAction, 'reused-after-duplicate-refusal');
+    assert.equal(github.createCalls.length, 2);
+    assert.equal(hiddenPull.number, converged.proposal.pullNumber);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('repeated ambiguity and permanent invisibility remain one-POST-per-run retryable state', async () => {
+  const { f, git, setup, github, line } = await prepared({ merge: true });
+  try {
+    github.proposalSha = createProposalCommit(git, { line, recovery: setup.graph.recovery });
+    github.createPullRequest = async function alwaysAmbiguous(input) {
+      this.createCalls.push(structuredClone(input));
+      throw new PullRequestPostError('network outcome unavailable', { kind: 'ambiguous' });
+    };
+
+    for (let run = 1; run <= 3; run += 1) {
+      await assert.rejects(
+        runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github }),
+        /ambiguous has no visible canonical PR; a later exact sweep may retry one POST/,
+      );
+      assert.equal(github.createCalls.length, run);
+      assert.equal(github.proposals.length, 0);
+      assert.equal(remoteRef(f, recoveryTerminalRef('proposal')), github.proposalSha);
+      assert.equal(remoteRef(f, recoveryTerminalRef('pr-attempt')), github.proposalSha);
     }
+
+    github.createPullRequest = FakeGitHub.prototype.createPullRequest;
+    const corrected = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
+    assert.equal(corrected.outcome, 'proposal-created');
+    assert.equal(github.createCalls.length, 4);
+    assert.equal(github.proposals.length, 1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('successful response with no visible history remains safely retryable instead of stranded', async () => {
+  const { f, git, setup, github, line } = await prepared({ merge: true });
+  try {
+    github.proposalSha = createProposalCommit(git, { line, recovery: setup.graph.recovery });
+    const normalHistory = github.listPullRequestHistoryPage.bind(github);
+    github.listPullRequestHistoryPage = async (filter) => {
+      if (filter.head.endsWith('/recovery')) return normalHistory(filter);
+      return [];
+    };
+    await assert.rejects(
+      runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github }),
+      /successful-response has no visible canonical PR; a later exact sweep may retry one POST/,
+    );
+    assert.equal(github.createCalls.length, 1);
+    assert.equal(github.proposals.length, 1);
+
+    github.createPullRequest = async function duplicateWhileHidden(input) {
+      this.createCalls.push(structuredClone(input));
+      throw new PullRequestPostError('A pull request already exists for these refs', {
+        kind: 'duplicate',
+        status: 422,
+      });
+    };
+    await assert.rejects(
+      runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github }),
+      /duplicate has no visible canonical PR; a later exact sweep may retry one POST/,
+    );
+    assert.equal(github.createCalls.length, 2);
+    assert.equal(github.proposals.length, 1);
+
+    github.listPullRequestHistoryPage = normalHistory;
+    const visible = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
+    assert.equal(visible.outcome, 'proposal-reused');
+    assert.equal(github.createCalls.length, 2);
+    assert.equal(github.proposals.length, 1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('successful response with delayed all-state visibility converges after one POST', async () => {
+  const { f, git, setup, github, line } = await prepared({ merge: true });
+  try {
+    const proposal = createProposalCommit(git, { line, recovery: setup.graph.recovery });
+    github.proposalSha = proposal;
+    let proposalQueries = 0;
+    github.listPullRequestHistoryPage = async function delayedHistory(filter) {
+      if (filter.head.endsWith('/recovery')) return filter.page === 1 ? [structuredClone(this.recovery)] : [];
+      if (filter.page !== 1) return [];
+      proposalQueries += 1;
+      return proposalQueries >= 3 ? structuredClone(this.proposals) : [];
+    };
+    const result = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
+    assert.equal(result.outcome, 'proposal-created');
+    assert.equal(github.createCalls.length, 1);
+    assert.ok(proposalQueries >= 3);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('concurrent same-base/head winner is reused after duplicate refusal with one local POST', async () => {
+  const { f, git, setup, github, line } = await prepared({ merge: true });
+  try {
+    const proposal = createProposalCommit(git, { line, recovery: setup.graph.recovery });
+    github.proposalSha = proposal;
+    github.createPullRequest = async function concurrentWinner(input) {
+      this.createCalls.push(structuredClone(input));
+      this.proposals.push(proposalPull({ line, proposal }, input, 104));
+      throw new PullRequestPostError('A pull request already exists for these refs', {
+        kind: 'duplicate',
+        status: 422,
+      });
+    };
+    const result = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
+    assert.equal(result.outcome, 'proposal-reused');
+    assert.equal(result.proposal.pullAction, 'reused-after-duplicate-refusal');
+    assert.equal(github.createCalls.length, 1);
+    assert.equal(github.proposals.length, 1);
+    assert.equal(result.proposal.pullNumber, 104);
+  } finally {
+    f.cleanup();
   }
 });
 
@@ -575,6 +870,14 @@ test('remote advertisement and GitHub API identity reject hostile or malformed i
     /Malformed/,
   );
   assert.throws(() => new GitHub({ token: 'bad\ntoken' }), /required/);
+  assert.equal(
+    classifyPullRequestResponse(422, { message: 'Validation Failed', errors: [{ message: 'A pull request already exists for these refs' }] }),
+    'duplicate',
+  );
+  assert.equal(classifyPullRequestResponse(422, { message: 'Validation Failed' }), 'client-rejection');
+  assert.equal(classifyPullRequestResponse(403, { message: 'Resource not accessible' }), 'client-rejection');
+  assert.equal(classifyPullRequestResponse(429, { message: 'try later' }), 'ambiguous');
+  assert.equal(classifyPullRequestResponse(503, { message: 'unavailable' }), 'ambiguous');
   const client = Object.create(GitHub.prototype);
   client.token = 'safe';
   await assert.rejects(client.request('/issues'), /Unsupported GitHub API path/);

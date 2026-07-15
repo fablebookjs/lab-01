@@ -296,29 +296,48 @@ export class GitHub {
 
   async request(path, { method = 'GET', body } = {}) {
     if (!/^\/pulls(?:\?|\/\d+$|$)/.test(path)) throw new Error(`Unsupported GitHub API path: ${path}`);
-    const response = await fetch(`https://api.github.com/repos/${REPOSITORY}${path}`, {
-      method,
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${this.token}`,
-        'X-GitHub-Api-Version': '2022-11-28',
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    let response;
+    try {
+      response = await fetch(`https://api.github.com/repos/${REPOSITORY}${path}`, {
+        method,
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${this.token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    } catch (error) {
+      throw new PullRequestPostError(`GitHub ${method} ${path} transport failed`, {
+        kind: 'ambiguous',
+        cause: error,
+      });
+    }
     const text = await response.text();
     let payload = null;
     if (text) {
       try {
         payload = JSON.parse(text);
       } catch {
-        throw new Error(`GitHub returned non-JSON status ${response.status}`);
+        throw new PullRequestPostError(`GitHub returned non-JSON status ${response.status}`, {
+          kind: method === 'POST' ? 'ambiguous' : 'client-rejection',
+          status: response.status,
+        });
       }
     }
-    if (!response.ok) throw new Error(`GitHub ${method} ${path} failed (${response.status}): ${payload?.message ?? text}`);
+    if (!response.ok) {
+      throw new PullRequestPostError(
+        `GitHub ${method} ${path} failed (${response.status}): ${payload?.message ?? text}`,
+        {
+          kind: classifyPullRequestResponse(response.status, payload),
+          status: response.status,
+        },
+      );
+    }
     return payload;
   }
 
-  listPullRequestHistoryPage({ base, head, page }) {
+  async listPullRequestHistoryPage({ base, head, page }) {
     const query = new URLSearchParams({
       state: 'all',
       base,
@@ -326,7 +345,16 @@ export class GitHub {
       per_page: String(HISTORY_PAGE_SIZE),
       page: String(page),
     });
-    return this.request(`/pulls?${query}`);
+    const listed = await this.request(`/pulls?${query}`);
+    if (!Array.isArray(listed)) return listed;
+    const hydrated = [];
+    for (const pull of listed) {
+      if (!Number.isInteger(pull?.number) || pull.number <= 0) {
+        throw new Error('GitHub pull request history contained an invalid number');
+      }
+      hydrated.push(await this.getPullRequest(pull.number));
+    }
+    return hydrated;
   }
 
   createPullRequest(input) {
@@ -341,6 +369,46 @@ export class GitHub {
   waitForRetry(milliseconds) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
   }
+}
+
+export class PullRequestPostError extends Error {
+  constructor(message, { kind, status = null, cause } = {}) {
+    super(message, cause === undefined ? undefined : { cause });
+    if (!['client-rejection', 'duplicate', 'ambiguous'].includes(kind)) {
+      throw new Error(`Unsupported pull request POST error kind: ${kind}`);
+    }
+    if (status !== null && (!Number.isInteger(status) || status < 100 || status > 599)) {
+      throw new Error(`Invalid HTTP status: ${status}`);
+    }
+    this.name = 'PullRequestPostError';
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+function responseErrorText(payload) {
+  const values = [payload?.message];
+  if (Array.isArray(payload?.errors)) {
+    for (const error of payload.errors) values.push(typeof error === 'string' ? error : error?.message);
+  }
+  return values.filter((value) => typeof value === 'string').join(' ');
+}
+
+export function classifyPullRequestResponse(status, payload) {
+  if (!Number.isInteger(status)) throw new Error(`Invalid HTTP status: ${status}`);
+  const message = responseErrorText(payload);
+  if (
+    status === 422 &&
+    /(?:pull request.*already exists|already exists.*pull request)/i.test(message)
+  ) {
+    return 'duplicate';
+  }
+  if (status >= 500 || [408, 425, 429].includes(status)) return 'ambiguous';
+  return 'client-rejection';
+}
+
+function classifyPullRequestPostError(error) {
+  return error instanceof PullRequestPostError ? error.kind : 'ambiguous';
 }
 
 function assertMode(mode) {
@@ -560,15 +628,46 @@ function assertPullNumber(pr) {
 function assertPullRefs(pr, role, { baseSha, headSha }) {
   const base = recoveryTerminalRef('line').replace('refs/heads/', '');
   const head = recoveryTerminalRef(role).replace('refs/heads/', '');
-  if (pr.base?.ref !== base || pr.base?.repo?.full_name !== REPOSITORY) {
+  if (
+    pr.base?.ref !== base ||
+    pr.base?.sha !== baseSha ||
+    pr.base?.repo?.full_name !== REPOSITORY
+  ) {
     throw new Error('Calibration PR base is not the exact same-repository fixed line');
   }
   if (pr.head?.ref !== head || pr.head?.sha !== headSha || pr.head?.repo?.full_name !== REPOSITORY) {
     throw new Error(`Calibration PR head is not the exact same-repository ${role} ref`);
   }
-  if (baseSha !== null && pr.base?.sha !== baseSha) {
-    throw new Error('Calibration PR base SHA is not the expected fixed line');
+}
+
+function assertPullStateTuple(pr, { expectedDraft }) {
+  if (pr.state !== 'open' && pr.state !== 'closed') {
+    throw new Error(`Calibration PR state is not exact open or closed: ${pr.state}`);
   }
+  if (typeof pr.merged !== 'boolean') throw new Error('Calibration PR merged field is not exact boolean');
+  if (typeof pr.draft !== 'boolean' || pr.draft !== expectedDraft) {
+    throw new Error(`Calibration PR draft field is not exact ${expectedDraft}`);
+  }
+
+  if (pr.state === 'open') {
+    if (pr.merged !== false || pr.merged_at !== null || pr.merge_commit_sha !== null) {
+      throw new Error('Open calibration PR has a contradictory state tuple');
+    }
+    return 'open';
+  }
+
+  if (pr.merged === false) {
+    if (pr.merged_at !== null || pr.merge_commit_sha !== null) {
+      throw new Error('Closed-unmerged calibration PR has a contradictory state tuple');
+    }
+    return 'closed-unmerged';
+  }
+
+  if (typeof pr.merged_at !== 'string' || !pr.merged_at) {
+    throw new Error('Closed-merged calibration PR lacks exact merged timestamp');
+  }
+  assertSha(pr.merge_commit_sha);
+  return 'closed-merged';
 }
 
 function selectSingleHistory(pulls, kind) {
@@ -587,20 +686,17 @@ function assertProposalStillSuppressed(graph, initialProposal, initialMarker) {
 
 export function verifyRecoveryPullRequest(pr, git, graph, currentLine) {
   assertPullNumber(pr);
-  assertPullRefs(pr, 'recovery', { baseSha: pr.state === 'open' ? graph.source : null, headSha: graph.recovery });
-  if (pr.state === 'open') {
-    if (pr.merged === true || pr.merged_at != null) throw new Error('Open recovery PR has contradictory merged state');
+  const tuple = assertPullStateTuple(pr, { expectedDraft: false });
+  const expectedBase = tuple === 'closed-merged' ? currentLine : graph.source;
+  assertPullRefs(pr, 'recovery', { baseSha: expectedBase, headSha: graph.recovery });
+  if (tuple === 'open') {
     if (currentLine !== graph.source) throw new Error('Recovery PR is open but fixed line is not exact source');
     return { status: 'open', pull: pr };
   }
-  if (pr.state !== 'closed') throw new Error(`Unsupported recovery PR state: ${pr.state}`);
-  if (pr.merged !== true) {
-    if (pr.merged_at != null) throw new Error('Unmerged recovery PR has a merged timestamp');
+  if (tuple === 'closed-unmerged') {
     if (currentLine !== graph.source) throw new Error('Closed unmerged recovery PR changed the fixed line');
     return { status: 'closed-unmerged', pull: pr };
   }
-  if (typeof pr.merged_at !== 'string' || !pr.merged_at) throw new Error('Merged recovery PR lacks merged timestamp');
-  assertSha(pr.merge_commit_sha);
   if (currentLine !== pr.merge_commit_sha) throw new Error('Current fixed line is not the recovery PR merge commit');
   ensureCommitAvailable(git, currentLine);
   if (parents(git, currentLine).join(' ') !== `${graph.source} ${graph.recovery}`) {
@@ -624,9 +720,9 @@ export function proposalPullRequestBody(state) {
 
 export function verifyProposalPullRequest(pr, state, { requireEditableFields = false } = {}) {
   assertPullNumber(pr);
+  const tuple = assertPullStateTuple(pr, { expectedDraft: true });
   assertPullRefs(pr, 'proposal', { baseSha: state.line, headSha: state.proposal });
-  if (pr.state !== 'open' || pr.draft !== true) throw new Error('Proposal PR is not one open draft');
-  if (pr.merged === true || pr.merged_at != null) throw new Error('Proposal PR has contradictory merged state');
+  if (tuple !== 'open') throw new Error('Proposal PR is not one exact open draft');
   if (requireEditableFields && (pr.title !== PROPOSAL_TITLE || pr.body !== proposalPullRequestBody(state))) {
     throw new Error('Created proposal PR editable payload is not canonical');
   }
@@ -670,26 +766,20 @@ async function ensureProposalPullRequest(github, git, state) {
   if (marker !== state.recovery && marker !== state.proposal) {
     throw new Error(`PR-attempt marker is ${marker ?? 'absent'}, expected recovery or proposal`);
   }
-  let pulls = marker === state.proposal
-    ? await pollProposalHistory(github, git, query, assertState)
-    : await listHistory(github, git, query, assertState);
+  let pulls = await listHistory(github, git, query, assertState);
   let existing = selectSingleHistory(pulls, 'proposal');
   if (existing) return { action: 'reused', pull: verifyProposalPullRequest(existing, state) };
-  if (marker === state.proposal) {
-    throw new Error('PR-attempt marker authorizes no second POST and no canonical proposal PR is visible');
+
+  let markerResult = 'reused';
+  if (marker === state.recovery) {
+    markerResult = advanceFixedRef(git, markerRef, state.recovery, state.proposal);
+    marker = git.remoteRef(markerRef);
+    if (marker !== state.proposal) throw new Error('PR-attempt marker did not reach exact proposal');
   }
 
-  const markerResult = advanceFixedRef(git, markerRef, state.recovery, state.proposal);
-  marker = git.remoteRef(markerRef);
-  if (marker !== state.proposal) throw new Error('PR-attempt marker did not reach exact proposal');
-  if (markerResult === 'advanced-lost-success') {
-    pulls = await pollProposalHistory(github, git, query, assertState);
-    existing = selectSingleHistory(pulls, 'proposal');
-    if (existing) return { action: 'reused-after-marker-lost-success', pull: verifyProposalPullRequest(existing, state) };
-    throw new Error('PR-attempt marker transition was ambiguous; refusing POST without retained PR evidence');
-  }
-
-  let created;
+  let created = null;
+  let postError = null;
+  let postOutcome = 'successful-response';
   try {
     assertSweepAnchors(git, state.source, { recovery: state.recovery }, {
       line: state.line,
@@ -709,18 +799,41 @@ async function ensureProposalPullRequest(github, git, state) {
       proposal: state.proposal,
     });
   } catch (error) {
-    pulls = await pollProposalHistory(github, git, query, assertState);
-    existing = selectSingleHistory(pulls, 'proposal');
-    if (existing) return { action: 'reused-after-ambiguous-create', pull: verifyProposalPullRequest(existing, state) };
-    throw new Error(`Proposal PR POST was ambiguous and no canonical PR became visible: ${error.message}`, { cause: error });
+    postError = error;
+    postOutcome = classifyPullRequestPostError(error);
   }
-  verifyProposalPullRequest(created, state, { requireEditableFields: true });
+
+  if (created !== null) {
+    try {
+      verifyProposalPullRequest(created, state, { requireEditableFields: true });
+    } catch (error) {
+      postError = error;
+      postOutcome = 'ambiguous';
+      created = null;
+    }
+  }
   pulls = await pollProposalHistory(github, git, query, assertState);
   existing = selectSingleHistory(pulls, 'proposal');
-  if (!existing) throw new Error('Proposal PR creation did not become visible in all-state history');
-  const verified = verifyProposalPullRequest(existing, state);
-  if (verified.number !== created.number) throw new Error('Proposal PR identity changed after creation');
-  return { action: 'created', pull: verified };
+  if (existing) {
+    const verified = verifyProposalPullRequest(existing, state);
+    if (created !== null && verified.number !== created.number) {
+      throw new Error('Proposal PR identity changed after successful creation response');
+    }
+    const action = created !== null
+      ? 'created'
+      : postOutcome === 'duplicate'
+        ? 'reused-after-duplicate-refusal'
+        : postOutcome === 'client-rejection'
+          ? 'reused-after-client-rejection'
+          : 'reused-after-ambiguous-create';
+    return { action, pull: verified, markerResult, postOutcome };
+  }
+
+  const detail = postError instanceof Error ? postError.message : 'no error detail';
+  throw new Error(
+    `Proposal PR POST outcome ${postOutcome} has no visible canonical PR; a later exact sweep may retry one POST: ${detail}`,
+    postError instanceof Error ? { cause: postError } : undefined,
+  );
 }
 
 export async function runSweep({ git = new Git(), source, github }) {
@@ -750,13 +863,15 @@ export async function runSweep({ git = new Git(), source, github }) {
     assertProposalStillSuppressed(graph, initialProposal, initialMarker);
     return { mode: 'sweep', outcome: 'blocked-recovery-absent', graph, recoveryPullRequest: null, proposal: null };
   }
-  assertPullNumber(recoveryPull);
-  assertPullRefs(recoveryPull, 'recovery', { baseSha: null, headSha: graph.recovery });
+  const recoveryHistoryState = verifyRecoveryPullRequest(recoveryPull, git, graph, currentLine);
   assertSweepAnchors(git, source, graph, { line: currentLine, marker: initialMarker, proposal: initialProposal });
   const recoveryDetail = await github.getPullRequest(recoveryPull.number);
   assertSweepAnchors(git, source, graph, { line: currentLine, marker: initialMarker, proposal: initialProposal });
   if (recoveryDetail?.number !== recoveryPull.number) throw new Error('Recovery PR identity changed during hydration');
   const recovery = verifyRecoveryPullRequest(recoveryDetail, git, graph, currentLine);
+  if (recovery.status !== recoveryHistoryState.status) {
+    throw new Error('Recovery PR state changed during exact history hydration');
+  }
   if (recovery.status !== 'merged') {
     assertProposalStillSuppressed(graph, initialProposal, initialMarker);
     return {

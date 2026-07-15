@@ -14,11 +14,12 @@ The experiment can write exactly five branch refs:
 | `calibration/g1/recovery-terminal/line` | Dedicated line; initially `source`, later the operator-created normal recovery merge |
 | `calibration/g1/recovery-terminal/recovery` | One deterministic child of `source` containing the fixed recovery change |
 | `calibration/g1/recovery-terminal/proposal` | One structured empty child of the recovered line; absent until recovery is proven merged |
-| `calibration/g1/recovery-terminal/pr-attempt` | Lost-POST authorization marker, initially `recovery` and consumed once to `proposal` |
+| `calibration/g1/recovery-terminal/pr-attempt` | Resumable POST-state marker, initially `recovery` and advanced once to exact `proposal` |
 
 `source`, `line`, and `recovery` are the smallest deterministic recovery graph.
 `proposal` is the required output. `pr-attempt` is the one additional state needed
-to prevent a second POST after an ambiguous response. No other marker is created.
+to prove that every later POST attempt uses the same installed proposal identity.
+It does not permanently consume retry authority. No other marker is created.
 
 Both workflows are manual, trusted-main-only, share the same non-cancelling
 concurrency group, and check out the exact dispatch SHA without persisted checkout
@@ -74,9 +75,9 @@ and `pull-requests: write`.
      --repo fablebookjs/lab-01 --ref main
    ```
 
-7. Dispatch the sweep again. It must reuse the same proposal SHA and PR with no
-   ref write and no second POST. Editable proposal title/body changes do not
-   change the authoritative ref, commit, or PR identity:
+7. Dispatch the sweep again. With the canonical PR visible, it must reuse the
+   same proposal SHA and PR with no ref write or POST. Editable proposal
+   title/body changes do not change the authoritative ref, commit, or PR identity:
 
    ```sh
    gh workflow run calibrate-recovery-terminal-sweep.yml \
@@ -87,9 +88,50 @@ The sweep reads fully paginated, all-state PR history for exact same-repository
 base/head identities. Absent, open, or closed-unmerged recovery suppresses before
 the proposal is computed or written. Duplicate history, stale line state, wrong
 repository identity, non-normal merge topology, or contradictory API state fails
-closed. After `pr-attempt` reaches `proposal`, reruns query and poll only: a
-visible canonical PR converges, while no visible PR refuses another POST. A POST
-that succeeds before its response is lost converges through the same history.
+closed.
+
+Every authoritative PR object has an exact state tuple:
+
+| PR state | `state` | `merged` | `draft` | `merged_at` | `merge_commit_sha` | Exact base/head SHAs |
+| --- | --- | --- | --- | --- | --- | --- |
+| Open recovery | `open` | `false` | `false` | `null` | `null` | `source` / `recovery` |
+| Closed-unmerged recovery | `closed` | `false` | `false` | `null` | `null` | `source` / `recovery` |
+| Merged recovery | `closed` | `true` | `false` | non-empty string | current `line` | current `line` / `recovery` |
+| Open proposal | `open` | `false` | `true` | `null` | `null` | recovered `line` / `proposal` |
+
+Missing, null, stringly typed, or contradictory state fields fail closed. A
+merged recovery additionally requires current `line = merge_commit_sha`, exact
+ordered `[source, recovery]` parents, and the exact recovery tree. A proposal PR
+in any closed or merged tuple fails closed rather than authorizing replacement.
+
+## Resumable proposal POST protocol
+
+The repository has already proven GitHub's uniqueness rule for an open
+same-repository PR with one exact base/head pair: a second create request is
+refused as already existing rather than creating another PR identity. This
+calibration relies only on that uniqueness behavior.
+
+Each sweep queries complete all-state exact history before POSTing. An existing
+exact open draft is reused with no POST; closed, merged, duplicate, or wrong
+identity fails closed. If no PR is visible, the run installs or reuses the exact
+proposal ref and `pr-attempt = proposal`, then makes at most one POST. It queries
+and polls complete exact history again after every outcome:
+
+- a successful response must converge on that same returned PR identity;
+- a definite client rejection records no creation, fails the run if history is
+  empty, and leaves the exact state retryable by a later sweep;
+- an already-exists/duplicate refusal requeries and converges only on the single
+  exact visible PR;
+- a network, timeout, rate-limit, malformed response, or 5xx outcome is
+  ambiguous and converges only if the single exact PR becomes visible;
+- delayed visibility is polled within a fixed bound; persistent invisibility
+  fails that run but never strands the namespace, so a corrected later sweep may
+  make one exact POST attempt again.
+
+Thus a lost successful response can be followed by a later duplicate refusal
+and then converge when the one server-side PR becomes visible. Repeated
+ambiguity never creates a second identity and never permits more than one POST
+per run.
 
 ## Explicit boundary
 
