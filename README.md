@@ -19,7 +19,10 @@ npm test
 The draft release PR proposes `1.0.1` from a structured empty commit on
 `staged/v1.0`. Its base is `releases/v1.0`, which started at the same commit as
 `main` and tag `v1.0.0`. Pushes to the release line now automatically refresh
-that same draft PR from the exact current release-line head.
+that same draft PR from the exact current release-line head. A separate,
+locally tested workflow is ready for later default-branch installation to
+replace a closed, unmerged release PR with a clean draft; it is not enabled or
+calibrated against GitHub authority in this branch.
 
 See [the release-process note](docs/release-process.md) for the current contract
 and explicit automation limits.
@@ -35,7 +38,9 @@ The checked-in workflow first uses `actions/checkout` read authority to
 materialize the exact staged commit with full history, then rederives the one
 current ready PR and both current refs through the read-only GitHub API. A
 manual dispatch supplies no SHA authority. Local proofs must instead pass
-`--authority local`; their evidence is explicitly non-GitHub-current.
+`--authority local`; their evidence is explicitly non-GitHub-current. The
+ready-QA and close-and-regenerate workflows are not live until they are
+installed on the default branch and calibrated against the current release PR.
 
 The pinned Verdaccio toolchain is bootstrapped separately from the candidate.
 Candidate, publish, and consumer npm subprocesses receive closed environments,

@@ -14,6 +14,10 @@ This repository currently demonstrates only the first visible release intent:
 4. A push to `releases/v1.0` automatically refreshes `staged/v1.0` with a new
    empty intent based on the exact current line head and updates the existing
    draft PR in place. A manual workflow dispatch is the recovery wake-up.
+5. The close-and-regenerate handler is implemented for later installation on
+   the default branch. When installed, closing the current release PR without
+   merging creates a fresh structured empty intent commit and one new draft PR.
+   The closed PR remains untouched as the historical review and comment record.
 
 The maintainer re-reads both remote refs and the matching open draft PR before
 acting. It accepts only this repository, release line, staged line, fixed
@@ -22,6 +26,27 @@ replaced using an expected-old guarded ref update; a concurrent release-line
 advance causes the run to stop so a later wake-up can include the newer fix.
 `node scripts/maintain-release-draft.mjs --dry-run` validates and reports the
 current action without creating a commit, changing a ref, or editing the PR.
+
+The close handler treats `pull_request_target` deliveries only as wake-ups. It
+accepts the exact same-repository `staged/v1.0` to `releases/v1.0` identity,
+checks out only trusted `releases/v1.0` code, and re-reads the refs and current
+PR history. A merged release PR never regenerates. Unrelated events do nothing;
+fork, partial release-PR identities, reopened historical PRs, and ambiguous
+state fail closed. A delayed close for an older PR cannot alter a newer PR, and
+a duplicate delivery recognizes an existing open draft replacement rather than
+creating another one.
+
+Before reusing the same head/base pair, the handler writes a fresh empty intent
+commit. The write uses `--force-with-lease` with the exact observed old staged
+SHA. Both refs are checked immediately before and after the write, and any
+concurrent release or staged advance restarts state derivation. Replacement PR
+creation always sends `draft: true` and uses the same generated body as normal
+draft maintenance.
+
+The workflow is deliberately not live merely because it exists on this local
+branch: `pull_request_target` installation on the default branch, built-in token
+PR-creation authority, event behavior, actor, input/output SHAs, and branch-rule
+behavior still require controlled GitHub calibration before the first demo.
 
 In the future contract, merging the current validated release PR is explicit
 authorization to publish its exact source. **Do not merge today's PR:** no
@@ -41,9 +66,9 @@ commit must be the structured one-parent empty intent for exact version
 `actions/checkout@v7` materializes the exact PR head (or current staged branch
 for manual recovery) with full history and tags while it has checkout read
 authority, then removes persisted credentials. No anonymous post-checkout Git
-fetch is used. The private-repository shape is statically tested, but an actual
-GitHub Actions run in the private lab is still required before this workflow is
-treated as installed proof.
+fetch is used. The authenticated checkout shape is statically tested, but an
+actual GitHub Actions run against the current public laboratory PR is still
+required before this workflow is treated as installed proof.
 
 The workflow bootstraps the exactly locked Verdaccio development toolchain from
 public npm as a separate trusted-tooling step with scripts disabled and an
@@ -89,14 +114,15 @@ persist checkout credentials, and performs no GitHub or public npm write. All wo
 storage, generated credentials/configuration, packages, and consumer files are
 temporary; only sanitized evidence is retained.
 
-## Not yet automated
+## Not yet live or implemented
 
-The following lifecycle stages are intentionally **NOT YET AUTOMATED**:
+Ready-state exact-version QA and close-and-regenerate are implemented and
+tested locally, but neither workflow is installed on the default branch or
+calibrated against the current release PR. Do not mark the PR ready or close it
+for a lifecycle demonstration until that controlled installation is complete.
 
-- replacing a closed, unmerged proposal;
-- publishing packages, reconciling branches, tagging `v1.0.1`, or creating a
-  GitHub Release.
-
-Those stages are follow-on work. This slice does not publish to npm, create a
-`v1.0.1` tag or GitHub Release, or mutate any Storybook resource. The draft
-maintainer does not execute pull-request-head code.
+Public package publication, branch reconciliation, tagging `v1.0.1`, and
+creating a GitHub Release are intentionally **NOT YET IMPLEMENTED**. This slice
+does not publish to public npm, create a `v1.0.1` tag or GitHub Release, or
+mutate any Storybook resource. The draft maintainer does not execute
+pull-request-head code.
