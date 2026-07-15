@@ -1,0 +1,9 @@
+{
+  "name": "@fablebook/lab-01-addon",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": "./src/index.js",
+  "dependencies": {
+    "@fablebook/lab-01-core": "1.0.0"
+  }
+}

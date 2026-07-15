@@ -1,0 +1,13 @@
+{
+  "name": "@fablebook/lab-01-consumer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test consumer.test.mjs"
+  },
+  "dependencies": {
+    "@fablebook/lab-01-addon": "1.0.0",
+    "@fablebook/lab-01-core": "1.0.0"
+  }
+}
