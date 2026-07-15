@@ -13,15 +13,16 @@ This repository currently demonstrates only the first visible release intent:
    the editable PR title and body are not.
 4. A push to `releases/v1.0` automatically refreshes `staged/v1.0` with a new
    empty intent based on the exact current line head and updates the existing
-   draft PR in place. A manual workflow dispatch is the recovery wake-up.
+   PR in place while preserving whether it is draft or ready. A manual workflow
+   dispatch is the recovery wake-up.
 5. The close-and-regenerate handler is implemented for later installation on
    the default branch. When installed, closing the current release PR without
    merging creates a fresh structured empty intent commit and one new draft PR.
    The closed PR remains untouched as the historical review and comment record.
 
-The maintainer re-reads both remote refs and the matching open draft PR before
+The maintainer re-reads both remote refs and the matching open release PR before
 acting. It accepts only this repository, release line, staged line, fixed
-`1.0.1` target, and one matching open draft PR. A stale staged intent is
+`1.0.1` target, and one matching open draft-or-ready PR. A stale staged intent is
 replaced using an expected-old guarded ref update; a concurrent release-line
 advance causes the run to stop so a later wake-up can include the newer fix.
 `node scripts/maintain-release-draft.mjs --dry-run` validates and reports the
@@ -31,7 +32,9 @@ The close handler treats `pull_request_target` deliveries only as wake-ups. It
 accepts the exact same-repository `staged/v1.0` to `releases/v1.0` identity,
 checks out only trusted `releases/v1.0` code, and re-reads the refs and current
 PR history. A merged release PR never regenerates. Unrelated events do nothing;
-fork, partial release-PR identities, and ambiguous state fail closed. After the
+ordinary fix PRs whose head is not `staged/v1.0` are unrelated even when they
+target the release line. A staged head with the wrong base or repository, a
+fork, and ambiguous state fail closed. After the
 triggering event is matched to the same historical PR and closed head, the
 latest durable lifecycle PR decides the action. A latest merged PR is a no-op;
 a latest closed, unmerged PR gets a replacement even when an older close was

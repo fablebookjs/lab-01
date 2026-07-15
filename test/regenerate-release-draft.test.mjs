@@ -171,8 +171,11 @@ test('unrelated closes are ignored while suspicious release identities fail clos
   assert.throws(() => classifyCloseEvent(eventFor(fork)), /unexpected base, head, or repository/);
 
   const wrongHead = pull({ number: 9, headRef: 'feature/example' });
+  assert.deepEqual(classifyCloseEvent(eventFor(wrongHead)), { action: 'ignored-unrelated' });
+
+  const wrongBase = pull({ number: 9, baseRef: 'main' });
   assert.throws(
-    () => classifyCloseEvent(eventFor(wrongHead)),
+    () => classifyCloseEvent(eventFor(wrongBase)),
     /unexpected base, head, or repository/,
   );
 });

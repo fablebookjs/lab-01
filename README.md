@@ -19,7 +19,8 @@ npm test
 The draft release PR proposes `1.0.1` from a structured empty commit on
 `staged/v1.0`. Its base is `releases/v1.0`, which started at the same commit as
 `main` and tag `v1.0.0`. Pushes to the release line now automatically refresh
-that same draft PR from the exact current release-line head. A separate,
+that same PR from the exact current release-line head while preserving whether
+it is draft or ready. A separate,
 locally tested workflow is ready for later default-branch installation to
 replace a closed, unmerged release PR with a clean draft; it is not enabled or
 calibrated against GitHub authority in this branch.
