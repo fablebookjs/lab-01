@@ -98,7 +98,7 @@ Every authoritative PR object has an exact state tuple:
 | Closed-unmerged recovery | `closed` | `false` | `false` | `null` | `null` | `source` / `recovery` |
 | Merged recovery | `closed` | `true` | `false` | non-empty string | current `line` | `source` / `recovery` |
 | Open proposal | `open` | `false` | `true` | `null` | `null` or full synthetic SHA | recovered `line` / `proposal` |
-| Closed-unmerged proposal | `closed` | `false` | `true` | `null` | `null` | recovered `line` / `proposal` |
+| Closed-unmerged proposal | `closed` | `false` | `true` | `null` | `null` or full synthetic SHA | recovered `line` / `proposal` |
 
 Missing, null, stringly typed, or contradictory state fields fail closed. A
 merged recovery additionally requires current `line = merge_commit_sha`, exact
@@ -111,6 +111,11 @@ open PR #16. GitHub retains the pre-merge base SHA on a merged PR. Mergeable
 open PRs can expose a synthetic merge SHA while a conflicting open PR can expose
 `null`. A nullable synthetic SHA is retained as evidence only; it never
 authorizes or identifies the fixed line.
+
+Read-only closed-unmerged proposal PR #1 also retains a full synthetic
+`merge_commit_sha`. Closed proposal history therefore accepts either `null` or
+one lowercase full SHA and records that value only as non-authoritative evidence;
+the recovered line, proposal ref, and proposal commit remain the sole identities.
 
 ## Resumable proposal POST protocol
 

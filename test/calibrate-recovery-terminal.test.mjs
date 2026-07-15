@@ -22,6 +22,7 @@ import {
   recoveryTerminalRef,
   runRecoveryTerminal,
   verifyProposalCommit,
+  verifyProposalHistoryPullRequest,
   verifyProposalPullRequest,
   verifyRecoveryGraph,
   verifyRecoveryPullRequest,
@@ -29,6 +30,7 @@ import {
 
 const RECOVERY_SYNTHETIC_MERGE_SHA = '9'.repeat(40);
 const PROPOSAL_SYNTHETIC_MERGE_SHA = '8'.repeat(40);
+const CLOSED_PROPOSAL_SYNTHETIC_MERGE_SHA = `${'7'.repeat(39)}a`;
 
 function command(cwd, args, env = {}) {
   return execFileSync('git', args, {
@@ -531,6 +533,32 @@ test('proposal PR validator accepts only live nullable/full synthetic open-draft
     const exact = proposalPull(state, input);
     assert.equal(verifyProposalPullRequest(exact, state), exact);
     assert.equal(verifyProposalPullRequest({ ...structuredClone(exact), merge_commit_sha: null }, state).number, exact.number);
+    const observedPr1ClosedShape = {
+      ...structuredClone(exact),
+      state: 'closed',
+      merged: false,
+      merged_at: null,
+      merge_commit_sha: CLOSED_PROPOSAL_SYNTHETIC_MERGE_SHA,
+    };
+    assert.equal(
+      verifyProposalHistoryPullRequest(observedPr1ClosedShape, state).status,
+      'closed-unmerged',
+    );
+    assert.equal(
+      verifyProposalHistoryPullRequest({ ...observedPr1ClosedShape, merge_commit_sha: null }, state).status,
+      'closed-unmerged',
+    );
+    assert.throws(
+      () => verifyProposalHistoryPullRequest({
+        ...observedPr1ClosedShape,
+        merge_commit_sha: CLOSED_PROPOSAL_SYNTHETIC_MERGE_SHA.toUpperCase(),
+      }, state),
+      /Invalid commit identity/,
+    );
+    assert.throws(
+      () => verifyProposalPullRequest(observedPr1ClosedShape, state),
+      /not one exact open draft/,
+    );
     const mutations = [
       [(value) => { delete value.number; }, /Invalid or protected calibration PR number/],
       [(value) => { value.number = '102'; }, /Invalid or protected calibration PR number/],
@@ -630,12 +658,13 @@ test('several retained closed proposal attempts plus one open exact PR reuse wit
       state: 'closed',
       merged: false,
       merged_at: null,
-      merge_commit_sha: null,
+      merge_commit_sha: CLOSED_PROPOSAL_SYNTHETIC_MERGE_SHA,
     };
     const closed103 = {
       ...structuredClone(closed102),
       number: 103,
       html_url: 'https://github.com/fablebookjs/lab-01/pull/103',
+      merge_commit_sha: null,
     };
     const open104 = {
       ...structuredClone(open),
@@ -647,6 +676,10 @@ test('several retained closed proposal attempts plus one open exact PR reuse wit
     assert.equal(reused.outcome, 'proposal-reused');
     assert.equal(reused.proposal.pullNumber, 104);
     assert.deepEqual(reused.proposal.closedPullNumbers, [102, 103]);
+    assert.deepEqual(reused.proposal.closedPullAttempts, [
+      { number: 102, syntheticMergeSha: CLOSED_PROPOSAL_SYNTHETIC_MERGE_SHA },
+      { number: 103, syntheticMergeSha: null },
+    ]);
     assert.equal(github.createCalls.length, 1);
     assert.equal(created.proposal.sha, reused.proposal.sha);
   } finally {
@@ -663,12 +696,15 @@ test('closed-only exact proposal history creates one replacement and preserves t
       state: 'closed',
       merged: false,
       merged_at: null,
-      merge_commit_sha: null,
+      merge_commit_sha: CLOSED_PROPOSAL_SYNTHETIC_MERGE_SHA,
     });
     const replacement = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
     assert.equal(replacement.outcome, 'proposal-created');
     assert.equal(replacement.proposal.pullNumber, 103);
     assert.deepEqual(replacement.proposal.closedPullNumbers, [102]);
+    assert.deepEqual(replacement.proposal.closedPullAttempts, [
+      { number: 102, syntheticMergeSha: CLOSED_PROPOSAL_SYNTHETIC_MERGE_SHA },
+    ]);
     assert.equal(replacement.proposal.sha, first.proposal.sha);
     assert.equal(github.proposals.length, 2);
     assert.equal(github.proposals.filter((pull) => pull.state === 'open').length, 1);
@@ -844,7 +880,7 @@ test('hidden accepted proposal that closes permits one later open replacement wi
       state: 'closed',
       merged: false,
       merged_at: null,
-      merge_commit_sha: null,
+      merge_commit_sha: CLOSED_PROPOSAL_SYNTHETIC_MERGE_SHA,
     });
     phase = 'closed-hidden';
 
@@ -852,6 +888,9 @@ test('hidden accepted proposal that closes permits one later open replacement wi
     assert.equal(replacement.outcome, 'proposal-created');
     assert.equal(replacement.proposal.pullNumber, 103);
     assert.deepEqual(replacement.proposal.closedPullNumbers, [102]);
+    assert.deepEqual(replacement.proposal.closedPullAttempts, [
+      { number: 102, syntheticMergeSha: CLOSED_PROPOSAL_SYNTHETIC_MERGE_SHA },
+    ]);
     assert.equal(replacement.proposal.sha, proposal);
     assert.equal(github.createCalls.length, 2);
   } finally {

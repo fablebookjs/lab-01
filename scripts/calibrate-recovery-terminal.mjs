@@ -640,7 +640,7 @@ function assertPullRefs(pr, role, { baseSha, headSha }) {
   }
 }
 
-function assertPullStateTuple(pr, { expectedDraft }) {
+function assertPullStateTuple(pr, { expectedDraft, allowClosedUnmergedSynthetic = false }) {
   if (pr.state !== 'open' && pr.state !== 'closed') {
     throw new Error(`Calibration PR state is not exact open or closed: ${pr.state}`);
   }
@@ -658,8 +658,14 @@ function assertPullStateTuple(pr, { expectedDraft }) {
   }
 
   if (pr.merged === false) {
-    if (pr.merged_at !== null || pr.merge_commit_sha !== null) {
+    if (pr.merged_at !== null) {
       throw new Error('Closed-unmerged calibration PR has a contradictory state tuple');
+    }
+    if (pr.merge_commit_sha !== null) {
+      if (!allowClosedUnmergedSynthetic) {
+        throw new Error('Closed-unmerged calibration PR has a contradictory state tuple');
+      }
+      assertSha(pr.merge_commit_sha);
     }
     return 'closed-unmerged';
   }
@@ -727,9 +733,12 @@ export function verifyProposalPullRequest(pr, state, { requireEditableFields = f
   return pr;
 }
 
-function verifyProposalHistoryPullRequest(pr, state) {
+export function verifyProposalHistoryPullRequest(pr, state) {
   assertPullNumber(pr);
-  const tuple = assertPullStateTuple(pr, { expectedDraft: true });
+  const tuple = assertPullStateTuple(pr, {
+    expectedDraft: true,
+    allowClosedUnmergedSynthetic: true,
+  });
   assertPullRefs(pr, 'proposal', { baseSha: state.line, headSha: state.proposal });
   return { status: tuple, pull: pr };
 }
@@ -753,6 +762,13 @@ function selectProposalHistory(pulls, state) {
     open = pull;
   }
   return { open, closed, total: pulls.length };
+}
+
+function closedProposalEvidence(closed) {
+  return closed.map((pull) => ({
+    number: pull.number,
+    syntheticMergeSha: pull.merge_commit_sha,
+  }));
 }
 
 function assertSweepAnchors(git, source, graph, { line = null, marker = null, proposal = undefined } = {}) {
@@ -801,6 +817,7 @@ async function ensureProposalPullRequest(github, git, state) {
       action: 'reused',
       pull: verifyProposalPullRequest(history.open, state),
       closedPullNumbers: history.closed.map((pull) => pull.number),
+      closedPullAttempts: closedProposalEvidence(history.closed),
     };
   }
 
@@ -865,6 +882,7 @@ async function ensureProposalPullRequest(github, git, state) {
       markerResult,
       postOutcome,
       closedPullNumbers: history.closed.map((pull) => pull.number),
+      closedPullAttempts: closedProposalEvidence(history.closed),
     };
   }
 
@@ -958,6 +976,7 @@ export async function runSweep({ git = new Git(), source, github }) {
       pullUrl: pull.pull.html_url,
       syntheticMergeSha: pull.pull.merge_commit_sha,
       closedPullNumbers: pull.closedPullNumbers,
+      closedPullAttempts: pull.closedPullAttempts,
     },
   };
 }
@@ -972,7 +991,7 @@ export function buildSummary(result) {
     ? (
         `- Proposal: \`${result.proposal.ref}\` = \`${result.proposal.sha}\`, active PR [#${result.proposal.pullNumber}](${result.proposal.pullUrl})\n` +
         `- Active proposal synthetic merge SHA: \`${result.proposal.syntheticMergeSha ?? 'null'}\`\n` +
-        `- Retained closed proposal attempts: ${result.proposal.closedPullNumbers.length > 0 ? result.proposal.closedPullNumbers.map((number) => `#${number}`).join(', ') : 'none'}\n`
+        `- Retained closed proposal attempts: ${result.proposal.closedPullAttempts.length > 0 ? result.proposal.closedPullAttempts.map(({ number, syntheticMergeSha }) => `#${number} (synthetic merge: ${syntheticMergeSha ?? 'null'})`).join(', ') : 'none'}\n`
       )
     : '- Proposal: suppressed; no proposal ref or PR write was authorized by this sweep\n';
   return (
