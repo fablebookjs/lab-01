@@ -26,8 +26,22 @@ export const BOOTSTRAP = Object.freeze({
   tree: 'c17e4b63e8fd8b0bff28e1b9e24caa203d29d80e',
   registry: 'https://registry.npmjs.org/',
   packages: Object.freeze([
-    Object.freeze({ name: '@fablebook/lab-01-core', version: '1.0.0', path: 'packages/core' }),
-    Object.freeze({ name: '@fablebook/lab-01-addon', version: '1.0.0', path: 'packages/addon' }),
+    Object.freeze({
+      name: '@fablebook/lab-01-core',
+      version: '1.0.0',
+      path: 'packages/core',
+      integrity:
+        'sha512-D2/F0PkQoENQagqntg1tUB0zn8lOen0jnqvyw0sbRLN3fkMJ4OR60geERuANxq0Ihx0RlCoYoP1lQhzb2KQZ+g==',
+      shasum: '8ff5241867ebd1c2747c23ea016342c7cd101f6d',
+    }),
+    Object.freeze({
+      name: '@fablebook/lab-01-addon',
+      version: '1.0.0',
+      path: 'packages/addon',
+      integrity:
+        'sha512-DssrVgnRMbPG5qVqt0yr43ImplnR2YJZyCZkr0Yvp5h+wJHo5x9qL2Svpo3GyruuMZm1zdIhKJPAYYmZe7m78g==',
+      shasum: '5ccab401d844a0254bd1914b5b96d798462a5017',
+    }),
   ]),
 });
 
@@ -38,12 +52,23 @@ const TERMINATION_SIGNALS = Object.freeze(['SIGINT', 'SIGTERM', 'SIGHUP']);
 const SIGNAL_NUMBERS = Object.freeze({ SIGHUP: 1, SIGINT: 2, SIGTERM: 15 });
 const INTEGRITY_PATTERN = /^sha512-[A-Za-z0-9+/]{86}==$/;
 const SHASUM_PATTERN = /^[0-9a-f]{40}$/;
+const privateErrorFacts = new WeakMap();
+
+const CHILD_CLASSIFICATIONS = new Set(['not-found', 'duplicate', 'ambiguous']);
 
 class BootstrapError extends Error {
-  constructor(message) {
+  constructor(message, { code = 'BOOTSTRAP_FAILED', classification } = {}) {
     super(message);
     this.name = 'BootstrapError';
     this.safeToReport = true;
+    this.code = code;
+    if (CHILD_CLASSIFICATIONS.has(classification)) this.classification = classification;
+    privateErrorFacts.set(this, {
+      kind: 'bootstrap',
+      message,
+      code,
+      classification: this.classification,
+    });
   }
 }
 
@@ -55,12 +80,30 @@ export class BootstrapInterrupted extends Error {
     this.phase = phase ?? 'between-operations';
     this.exitCode = 128 + SIGNAL_NUMBERS[signal];
     this.safeToReport = true;
+    privateErrorFacts.set(this, { kind: 'interruption', signal, phase: this.phase });
   }
 }
 
-const fail = (message) => {
-  throw new BootstrapError(message);
+const fail = (message, code) => {
+  throw new BootstrapError(message, { code });
 };
+
+function sanitizeBoundaryError(error) {
+  const facts = privateErrorFacts.get(error);
+  if (facts?.kind === 'interruption') {
+    return new BootstrapInterrupted(facts.signal, facts.phase);
+  }
+  if (facts?.kind === 'bootstrap') {
+    return new BootstrapError(facts.message, {
+      code: facts.code,
+      classification: facts.classification,
+    });
+  }
+  return new BootstrapError('bootstrap failed at a private boundary', {
+    code: 'PRIVATE_BOUNDARY_FAILURE',
+    classification: 'ambiguous',
+  });
+}
 
 const hashesEqual = (left, right) =>
   left?.integrity === right?.integrity && left?.shasum === right?.shasum;
@@ -181,21 +224,29 @@ function runCommand(controller, file, args, options = {}) {
         stderr += chunk;
       });
     }
-    child.once('error', (error) => {
+    child.once('error', () => {
       controller.detach(child);
-      rejectPromise(error);
+      rejectPromise(
+        new BootstrapError('subprocess could not start', { code: 'SUBPROCESS_START_FAILED' }),
+      );
     });
-    child.once('close', (code, signal) => {
+    child.once('close', (code) => {
       controller.detach(child);
       if (controller.interruption) {
         rejectPromise(controller.interruption);
       } else if (code === 0) {
         resolvePromise({ stdout, stderr });
       } else {
-        const error = new BootstrapError(`${file} exited with status ${code ?? signal}`);
-        error.stdout = stdout;
-        error.stderr = stderr;
-        rejectPromise(error);
+        const classification =
+          options.failureClassifier === 'npm-view' && /\bE404\b/.test(`${stdout}\n${stderr}`)
+            ? 'not-found'
+            : 'ambiguous';
+        rejectPromise(
+          new BootstrapError('subprocess failed closed', {
+            code: options.failureCode ?? 'SUBPROCESS_FAILED',
+            classification,
+          }),
+        );
       }
     });
   });
@@ -246,6 +297,29 @@ export function buildNpmEnvironment(
   };
 }
 
+export function buildGitEnvironment(
+  ambient,
+  { home, temporary, globalConfig, systemConfig },
+) {
+  const clean = {};
+  for (const [name, value] of Object.entries(ambient)) {
+    if (safeAmbientEnvironmentName(name)) clean[name] = value;
+  }
+  return {
+    ...clean,
+    HOME: home,
+    XDG_CONFIG_HOME: home,
+    TMPDIR: temporary,
+    TMP: temporary,
+    TEMP: temporary,
+    GIT_CONFIG_GLOBAL: globalConfig,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_SYSTEM: systemConfig,
+    GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_OPTIONAL_LOCKS: '0',
+  };
+}
+
 export function validatePublishConfig(manifest, label) {
   const publishConfig = manifest.publishConfig;
   if (publishConfig === undefined) return;
@@ -260,19 +334,26 @@ export function validatePublishConfig(manifest, label) {
   }
 }
 
-export async function rejectProjectNpmConfigs(directory, relative = '') {
+export async function rejectProjectNpmConfigs(directory) {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
-    const display = relative ? `${relative}/${entry.name}` : entry.name;
     if (entry.name.toLowerCase() === '.npmrc') {
-      fail(`v1.0.0 contains prohibited project npm configuration at ${display}`);
+      fail('v1.0.0 contains prohibited project npm configuration');
     }
-    if (entry.isDirectory()) await rejectProjectNpmConfigs(path, display);
+    if (entry.isDirectory()) await rejectProjectNpmConfigs(path);
   }
 }
 
-async function readJson(path) {
-  return JSON.parse(await readFile(path, 'utf8'));
+function parsePrivateJson(value, label) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    fail(`${label} is not valid JSON`, 'INVALID_PRIVATE_JSON');
+  }
+}
+
+async function readJson(path, label = 'manifest') {
+  return parsePrivateJson(await readFile(path, 'utf8'), label);
 }
 
 async function validateBaselineTree(source) {
@@ -331,7 +412,8 @@ export function validateArtifacts(artifacts) {
     if (
       actual.name !== expected.name ||
       actual.version !== expected.version ||
-      actual.path !== expected.path
+      actual.path !== expected.path ||
+      !hashesEqual(actual, expected)
     ) {
       fail(`unexpected package at publish position ${index + 1}`);
     }
@@ -369,9 +451,9 @@ const npmArguments = (context, args) => [
 export async function prepareArtifacts(context) {
   const git = async (...args) =>
     (
-      await context.run('git', args, {
+      await context.run('git', ['--no-replace-objects', ...args], {
         cwd: context.root,
-        env: process.env,
+        env: context.gitEnvironment,
         phase: 'git-read',
       })
     ).stdout.trim();
@@ -388,14 +470,18 @@ export async function prepareArtifacts(context) {
   await context.testHooks?.afterBaselineResolved?.({ root, commit, tree });
 
   const archive = join(context.temporaryDirectory, 'baseline.tar');
-  await context.run('git', ['archive', '--format=tar', `--output=${archive}`, commit], {
-    cwd: root,
-    env: process.env,
-    phase: 'archive-baseline',
-  });
+  await context.run(
+    'git',
+    ['--no-replace-objects', 'archive', '--format=tar', `--output=${archive}`, commit],
+    {
+      cwd: root,
+      env: context.gitEnvironment,
+      phase: 'archive-baseline',
+    },
+  );
   await context.run('tar', ['-xf', archive, '-C', context.source], {
     cwd: context.commandDirectory,
-    env: process.env,
+    env: context.gitEnvironment,
     phase: 'extract-baseline',
   });
   await validateBaselineTree(context.source);
@@ -417,7 +503,7 @@ export async function prepareArtifacts(context) {
         phase: `pack:${expected.name}`,
       },
     );
-    const packed = JSON.parse(result.stdout);
+    const packed = parsePrivateJson(result.stdout, 'npm pack response');
     if (!Array.isArray(packed) || packed.length !== 1) fail('npm pack returned unexpected output');
     const [metadata] = packed;
     if (
@@ -432,17 +518,20 @@ export async function prepareArtifacts(context) {
     const tarball = join(context.packs, metadata.filename);
     const manifestResult = await context.run('tar', ['-xOf', tarball, 'package/package.json'], {
       cwd: context.commandDirectory,
-      env: process.env,
+      env: context.gitEnvironment,
       phase: `inspect-pack:${expected.name}`,
     });
-    validatePackedManifest(JSON.parse(manifestResult.stdout), expected);
+    validatePackedManifest(
+      parsePrivateJson(manifestResult.stdout, 'packed package manifest'),
+      expected,
+    );
     const hashes = await hashTarball(tarball);
-    if (!hashesEqual(hashes, metadata)) {
+    if (!hashesEqual(hashes, metadata) || !hashesEqual(hashes, expected)) {
       fail(
-        `npm pack hashes do not match the packed bytes for ${expected.name}@${expected.version}`,
+        `packed bytes do not match the reviewed baseline for ${expected.name}@${expected.version}`,
       );
     }
-    packages.push({ ...expected, tarball, ...hashes });
+    packages.push({ ...expected, tarball });
   }
 
   return {
@@ -470,9 +559,11 @@ async function queryVersion(context, artifact) {
         cwd: context.commandDirectory,
         env: context.npmEnvironment,
         phase: `view:${artifact.name}`,
+        failureCode: 'NPM_VIEW_FAILED',
+        failureClassifier: 'npm-view',
       },
     );
-    const manifest = JSON.parse(result.stdout);
+    const manifest = parsePrivateJson(result.stdout, 'npm registry response');
     if (
       manifest.name !== artifact.name ||
       manifest.version !== artifact.version ||
@@ -491,8 +582,7 @@ async function queryVersion(context, artifact) {
     };
   } catch (error) {
     context.throwIfInterrupted();
-    const diagnostic = `${error.stdout ?? ''}\n${error.stderr ?? ''}`;
-    if (/\bE404\b/.test(diagnostic)) return null;
+    if (error instanceof BootstrapError && error.classification === 'not-found') return null;
     if (error instanceof BootstrapError && error.message.startsWith('registry ')) throw error;
     fail(`read-only registry query failed for ${artifact.name}@${artifact.version}`);
   }
@@ -666,6 +756,8 @@ export async function runBootstrap({
     const commandDirectory = join(temporaryDirectory, 'command');
     const userConfig = join(temporaryDirectory, 'npmrc');
     const globalConfig = join(temporaryDirectory, 'global-npmrc');
+    const gitGlobalConfig = join(temporaryDirectory, 'global-gitconfig');
+    const gitSystemConfig = join(temporaryDirectory, 'system-gitconfig');
     await Promise.all([
       mkdir(source),
       mkdir(packs),
@@ -687,13 +779,23 @@ export async function runBootstrap({
       ].join('\n'),
       { mode: 0o600 },
     );
-    await writeFile(globalConfig, '', { mode: 0o600 });
+    await Promise.all([
+      writeFile(globalConfig, '', { mode: 0o600 }),
+      writeFile(gitGlobalConfig, '', { mode: 0o600 }),
+      writeFile(gitSystemConfig, '', { mode: 0o600 }),
+    ]);
     const npmEnvironment = buildNpmEnvironment(ambientEnvironment, {
       userConfig,
       globalConfig,
       home,
       cache,
       temporary,
+    });
+    const gitEnvironment = buildGitEnvironment(ambientEnvironment, {
+      home,
+      temporary,
+      globalConfig: gitGlobalConfig,
+      systemConfig: gitSystemConfig,
     });
     const context = {
       root,
@@ -707,6 +809,7 @@ export async function runBootstrap({
       userConfig,
       globalConfig,
       npmEnvironment,
+      gitEnvironment,
       signal: signalController.signal,
       throwIfInterrupted: () => signalController.throwIfInterrupted(),
       run: (file, args, options) => runCommand(signalController, file, args, options),
@@ -810,10 +913,10 @@ export async function runBootstrap({
       }
     }
   } catch (error) {
-    caught = error;
-    if (error instanceof BootstrapInterrupted) {
+    caught = sanitizeBoundaryError(error);
+    if (caught instanceof BootstrapInterrupted) {
       outcome = 'interrupted';
-      markInterruptedRecord(records, error);
+      markInterruptedRecord(records, caught);
     }
   } finally {
     try {
@@ -825,14 +928,14 @@ export async function runBootstrap({
       }
     } catch (error) {
       cleanupRemoved = false;
-      if (!caught) caught = error;
+      if (!caught) caught = sanitizeBoundaryError(error);
       outcome = caught instanceof BootstrapInterrupted ? 'interrupted' : 'failed';
     }
     signalController.dispose();
   }
 
   if (signalController.interruption) {
-    caught = signalController.interruption;
+    caught = sanitizeBoundaryError(signalController.interruption);
     outcome = 'interrupted';
     markInterruptedRecord(records, caught);
   }

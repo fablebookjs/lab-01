@@ -11,11 +11,13 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { inspect } from 'node:util';
 
 import {
   BOOTSTRAP,
   CONFIRMATION,
   bootstrapOperations,
+  buildGitEnvironment,
   buildNpmEnvironment,
   classifyExisting,
   hashBytes,
@@ -34,7 +36,6 @@ const artifacts = () => ({
   packages: BOOTSTRAP.packages.map((package_, index) => ({
     ...package_,
     tarball: `/temporary/package-${index}.tgz`,
-    ...packageHash(index),
   })),
 });
 
@@ -60,6 +61,31 @@ const operations = (overrides = {}) => ({
 
 async function temporaryBase() {
   return mkdtemp(join(tmpdir(), 'bootstrap-test-'));
+}
+
+function completeErrorInspection(error) {
+  const strings = [
+    String(error),
+    error.stack ?? '',
+    JSON.stringify(error),
+    inspect(error, { depth: null, showHidden: true }),
+  ];
+  const seen = new WeakSet();
+  const visit = (value) => {
+    if (typeof value === 'string') {
+      strings.push(value);
+      return;
+    }
+    if (!value || typeof value !== 'object' || seen.has(value)) return;
+    seen.add(value);
+    for (const key of Reflect.ownKeys(value)) {
+      strings.push(String(key));
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor && 'value' in descriptor) visit(descriptor.value);
+    }
+  };
+  visit(error);
+  return strings.join('\n');
 }
 
 test('sanitizes adversarial ambient npm settings and credentials case-insensitively', () => {
@@ -103,6 +129,43 @@ test('sanitizes adversarial ambient npm settings and credentials case-insensitiv
     NPM_CONFIG_UPDATE_NOTIFIER: 'false',
     NPM_CONFIG_USERCONFIG: '/isolated/npmrc',
     NPM_CONFIG_WORKSPACES: 'false',
+  });
+});
+
+test('removes inherited Git object, replacement, and config redirection', () => {
+  const environment = buildGitEnvironment(
+    {
+      PATH: '/bin',
+      HOME: '/ambient/home',
+      GIT_DIR: '/attacker/repository',
+      GIT_OBJECT_DIRECTORY: '/attacker/objects',
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: '/attacker/alternates',
+      GIT_REPLACE_REF_BASE: 'refs/attacker/',
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.useReplaceRefs',
+      GIT_CONFIG_VALUE_0: 'true',
+      GIT_CONFIG_PARAMETERS: "'core.useReplaceRefs'='true'",
+    },
+    {
+      home: '/isolated/home',
+      temporary: '/isolated/tmp',
+      globalConfig: '/isolated/global-gitconfig',
+      systemConfig: '/isolated/system-gitconfig',
+    },
+  );
+
+  assert.deepEqual(environment, {
+    PATH: '/bin',
+    HOME: '/isolated/home',
+    XDG_CONFIG_HOME: '/isolated/home',
+    TMPDIR: '/isolated/tmp',
+    TMP: '/isolated/tmp',
+    TEMP: '/isolated/tmp',
+    GIT_CONFIG_GLOBAL: '/isolated/global-gitconfig',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_SYSTEM: '/isolated/system-gitconfig',
+    GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_OPTIONAL_LOCKS: '0',
   });
 });
 
@@ -176,6 +239,9 @@ test('binds the exact repository, tag, commit, tree, package versions, and order
   const wrongVersion = artifacts();
   wrongVersion.packages[0].version = '1.0.1';
   assert.throws(() => validateArtifacts(wrongVersion), /publish position 1/);
+  const wrongBytes = artifacts();
+  Object.assign(wrongBytes.packages[0], packageHash(9));
+  assert.throws(() => validateArtifacts(wrongBytes), /publish position 1/);
 });
 
 test('rejects project npmrc and publishConfig registry/access/provenance overrides', async () => {
@@ -295,6 +361,61 @@ test('archives the resolved commit even if the v1.0.0 tag moves afterward', asyn
           shasum: '5ccab401d844a0254bd1914b5b96d798462a5017',
         },
       ],
+    );
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('real refs/replace attack cannot substitute baseline tree or packed bytes', async () => {
+  const base = await temporaryBase();
+  const clone = join(base, 'replace-attack-clone');
+  try {
+    execFileSync('git', ['clone', '--no-hardlinks', '--quiet', process.cwd(), clone]);
+    execFileSync('git', ['remote', 'set-url', 'origin', BOOTSTRAP.remoteUrls[0]], { cwd: clone });
+    const advancedTree = execFileSync('git', ['rev-parse', 'HEAD^{tree}'], {
+      cwd: clone,
+      encoding: 'utf8',
+    }).trim();
+    assert.notEqual(advancedTree, BOOTSTRAP.tree);
+    execFileSync('git', ['replace', BOOTSTRAP.tree, advancedTree], { cwd: clone });
+
+    const attackedSource = execFileSync(
+      'git',
+      ['show', `${BOOTSTRAP.commit}:packages/core/src/index.js`],
+      { cwd: clone, encoding: 'utf8' },
+    );
+    const baselineSource = execFileSync(
+      'git',
+      ['--no-replace-objects', 'show', `${BOOTSTRAP.commit}:packages/core/src/index.js`],
+      { cwd: clone, encoding: 'utf8' },
+    );
+    assert.notEqual(attackedSource, baselineSource);
+
+    const result = await runBootstrap({
+      root: clone,
+      ambientEnvironment: {
+        ...process.env,
+        GIT_OBJECT_DIRECTORY: join(base, 'attacker-objects'),
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: join(base, 'attacker-alternates'),
+        GIT_REPLACE_REF_BASE: 'refs/replace/',
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'core.useReplaceRefs',
+        GIT_CONFIG_VALUE_0: 'true',
+      },
+      operations: { ...bootstrapOperations, queryVersion: async () => null },
+      temporaryBase: base,
+      log() {},
+    });
+
+    assert.deepEqual(result.source, {
+      tag: BOOTSTRAP.tag,
+      commit: BOOTSTRAP.commit,
+      tree: BOOTSTRAP.tree,
+    });
+    assert.deepEqual(
+      result.packages.map(({ expected }) => expected),
+      BOOTSTRAP.packages.map(({ integrity, shasum }) => ({ integrity, shasum })),
     );
   } finally {
     await rm(base, { recursive: true, force: true });
@@ -471,6 +592,73 @@ test('default irreversible-boundary check rehashes the current tarball bytes', a
       bootstrapOperations.verifyBeforePublish({}, artifact),
       /packed bytes changed before publishing/,
     );
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('API errors and generic logging cannot recover private child diagnostics', async () => {
+  const base = await temporaryBase();
+  const sentinel = 'raw-token-sentinel-must-stay-private';
+  try {
+    for (const failure of ['managed-child', 'generic-boundary']) {
+      let temporaryDirectory;
+      const logged = [];
+      let rejected;
+      try {
+        await runBootstrap({
+          operations: operations({
+            async prepareArtifacts(context) {
+              temporaryDirectory = context.temporaryDirectory;
+              if (failure === 'managed-child') {
+                await context.run(
+                  process.execPath,
+                  [
+                    '-e',
+                    [
+                      'process.stdout.write(process.argv[1]);',
+                      'process.stderr.write(process.argv[1] + " " + process.argv[2]);',
+                      'process.exit(7);',
+                    ].join(' '),
+                    sentinel,
+                    context.userConfig,
+                  ],
+                  {
+                    cwd: context.commandDirectory,
+                    env: { PATH: process.env.PATH },
+                    phase: 'private-diagnostic-regression',
+                  },
+                );
+              }
+              const cause = new Error(`${sentinel} ${context.userConfig}`);
+              const error = new Error(`${sentinel} ${context.userConfig}`, { cause });
+              error.nested = { diagnostic: sentinel, path: context.userConfig };
+              throw error;
+            },
+          }),
+          temporaryBase: base,
+          log(value) {
+            logged.push(value);
+          },
+        });
+      } catch (error) {
+        rejected = error;
+      }
+
+      assert.ok(rejected instanceof Error);
+      assert.equal(Object.hasOwn(rejected, 'stdout'), false);
+      assert.equal(Object.hasOwn(rejected, 'stderr'), false);
+      assert.equal(rejected.cause, undefined);
+      assert.equal(rejected.evidence.cleanup.temporaryStateRemoved, true);
+      assert.equal(rejected.classification, 'ambiguous');
+      const inspection = completeErrorInspection(rejected);
+      const serializedLogs = JSON.stringify(logged);
+      for (const privateValue of [sentinel, temporaryDirectory, 'npmrc']) {
+        assert.equal(inspection.includes(privateValue), false);
+        assert.equal(serializedLogs.includes(privateValue), false);
+      }
+      await assert.rejects(access(temporaryDirectory));
+    }
   } finally {
     await rm(base, { recursive: true, force: true });
   }

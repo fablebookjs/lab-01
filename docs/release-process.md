@@ -79,6 +79,10 @@ repository, package, version, package order, project `.npmrc`, or package
 publication override outside its fixed contract. Core is packed before the
 add-on. The default registry and `@fablebook` scope are both bound to
 `https://registry.npmjs.org/` in isolated config and command arguments.
+Every Git identity/object read disables replacement objects and uses a closed
+Git environment that cannot inherit object, alternate-object, repository, or
+config redirection. The reviewed SHA-512 and SHA-1 values for both package
+tarballs are fixed in the allowlist as an independent byte-level guard.
 
 Each packed manifest is re-read from its tarball. SHA-512 SRI and SHA-1 are
 calculated from the actual packed bytes, compared with `npm pack` metadata,
@@ -86,7 +90,10 @@ and recalculated immediately before publication. Existing or newly published
 versions are accepted only when both registry metadata and a freshly
 downloaded tarball match those expected hashes. Sanitized output retains the
 expected and observed hashes and state without npm credentials, configuration
-contents, raw npm diagnostics, or temporary paths.
+contents, raw npm diagnostics, or temporary paths. Raw child output is used
+only inside the private missing/ambiguous-result classifier; rejected API
+errors and generic error serialization receive only sanitized codes, messages,
+state, and evidence.
 
 Only the operator may start the mutating mode in an interactive terminal:
 

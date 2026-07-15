@@ -113,7 +113,6 @@ import {
   BOOTSTRAP,
   CONFIRMATION,
   exitForInterruption,
-  hashBytes,
   runBootstrap,
 } from ${JSON.stringify(bootstrapUrl)};
 
@@ -122,7 +121,6 @@ await mkdir(runBase, { recursive: true });
 const packages = BOOTSTRAP.packages.map((value, index) => ({
   ...value,
   tarball: \`/fixture/package-${'${index}'}.tgz\`,
-  ...hashBytes(Buffer.alloc(64, index + 1)),
 }));
 const artifacts = {
   repository: BOOTSTRAP.repository,
