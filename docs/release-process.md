@@ -32,7 +32,9 @@ The close handler treats `pull_request_target` deliveries only as wake-ups. It
 accepts the exact same-repository `staged/v1.0` to `releases/v1.0` identity,
 checks out only trusted `releases/v1.0` code, and re-reads the refs and current
 PR history. A merged release PR never regenerates. Unrelated events do nothing;
-fork, partial release-PR identities, and ambiguous state fail closed. After the
+ordinary fix PRs whose head is not `staged/v1.0` are unrelated even when they
+target the release line. A staged head with the wrong base or repository, a
+fork, and ambiguous state fail closed. After the
 triggering event is matched to the same historical PR and closed head, the
 latest durable lifecycle PR decides the action. A latest merged PR is a no-op;
 a latest closed, unmerged PR gets a replacement even when an older close was

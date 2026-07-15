@@ -45,7 +45,7 @@ export function classifyCloseEvent(event, repository = REPOSITORY) {
 
   const baseRef = pull.base?.ref;
   const headRef = pull.head?.ref;
-  if (baseRef !== RELEASE_LINE && headRef !== STAGED_LINE) {
+  if (headRef !== STAGED_LINE) {
     return { action: 'ignored-unrelated' };
   }
 
