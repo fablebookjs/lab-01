@@ -27,6 +27,9 @@ import {
   verifyRecoveryPullRequest,
 } from '../scripts/calibrate-recovery-terminal.mjs';
 
+const RECOVERY_SYNTHETIC_MERGE_SHA = '9'.repeat(40);
+const PROPOSAL_SYNTHETIC_MERGE_SHA = '8'.repeat(40);
+
 function command(cwd, args, env = {}) {
   return execFileSync('git', args, {
     cwd,
@@ -116,7 +119,7 @@ function recoveryPull(graph, number = 101) {
     draft: false,
     merged: false,
     merged_at: null,
-    merge_commit_sha: null,
+    merge_commit_sha: RECOVERY_SYNTHETIC_MERGE_SHA,
     title: 'Complete dedicated recovery-terminal calibration',
     body: 'operator body',
     base: {
@@ -140,7 +143,7 @@ function proposalPull(state, input, number = 102) {
     draft: true,
     merged: false,
     merged_at: null,
-    merge_commit_sha: null,
+    merge_commit_sha: PROPOSAL_SYNTHETIC_MERGE_SHA,
     title: input.title,
     body: input.body,
     base: {
@@ -164,6 +167,7 @@ class FakeGitHub {
     this.listCalls = [];
     this.getCalls = [];
     this.createCalls = [];
+    this.nextProposalNumber = 102;
   }
 
   async listPullRequestHistoryPage(filter) {
@@ -180,7 +184,8 @@ class FakeGitHub {
       line: this.recovery.merge_commit_sha,
       proposal: remoteProposalFromInput(this, input),
     };
-    const pull = proposalPull(state, input);
+    const pull = proposalPull(state, input, this.nextProposalNumber);
+    this.nextProposalNumber += 1;
     this.proposals.push(pull);
     return structuredClone(pull);
   }
@@ -227,7 +232,6 @@ function normalMerge(f, graph, pr) {
     merged: true,
     merged_at: '2026-07-15T18:31:00Z',
     merge_commit_sha: merge,
-    base: { ...pr.base, sha: merge },
   });
   return merge;
 }
@@ -387,7 +391,12 @@ test('absent and closed-unmerged recovery suppress with no proposal mutation', a
     const { f, git, setup, github, pr } = await prepared();
     try {
       if (kind === 'absent') github.recovery = null;
-      else Object.assign(pr, { state: 'closed', merged: false, merged_at: null });
+      else Object.assign(pr, {
+        state: 'closed',
+        merged: false,
+        merged_at: null,
+        merge_commit_sha: null,
+      });
       const pushes = git.pushes.length;
       const result = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
       assert.equal(result.outcome, `blocked-recovery-${kind}`);
@@ -439,10 +448,16 @@ test('wrong, protected, contradictory, and duplicate recovery histories fail clo
   }
 });
 
-test('recovery PR validator requires exact open, closed-unmerged, and closed-merged tuples', async () => {
+test('recovery PR validator matches read-only PR16-23 open, conflict, and normal-merge tuple semantics', async () => {
   const { f, git, setup, pr } = await prepared();
   try {
-    assert.equal(verifyRecoveryPullRequest(pr, git, setup.graph, f.source).status, 'open');
+    const mergeableOpen = verifyRecoveryPullRequest(pr, git, setup.graph, f.source);
+    assert.equal(mergeableOpen.status, 'open');
+    assert.equal(mergeableOpen.syntheticMergeSha, RECOVERY_SYNTHETIC_MERGE_SHA);
+    const conflictShape = { ...structuredClone(pr), merge_commit_sha: null };
+    const conflictingOpen = verifyRecoveryPullRequest(conflictShape, git, setup.graph, f.source);
+    assert.equal(conflictingOpen.status, 'open');
+    assert.equal(conflictingOpen.syntheticMergeSha, null);
     const openMutations = [
       [(value) => { delete value.number; }, /Invalid or protected calibration PR number/],
       [(value) => { value.number = null; }, /Invalid or protected calibration PR number/],
@@ -456,7 +471,7 @@ test('recovery PR validator requires exact open, closed-unmerged, and closed-mer
       [(value) => { value.draft = 'false'; }, /draft field is not exact false/],
       [(value) => { value.state = 'OPEN'; }, /state is not exact open or closed/],
       [(value) => { delete value.merged_at; }, /contradictory state tuple/],
-      [(value) => { value.merge_commit_sha = 'a'.repeat(40); }, /contradictory state tuple/],
+      [(value) => { value.merge_commit_sha = 'not-a-sha'; }, /Invalid commit identity/],
     ];
     for (const [mutate, error] of openMutations) {
       const forged = structuredClone(pr);
@@ -464,7 +479,7 @@ test('recovery PR validator requires exact open, closed-unmerged, and closed-mer
       assert.throws(() => verifyRecoveryPullRequest(forged, git, setup.graph, f.source), error);
     }
 
-    const closed = { ...structuredClone(pr), state: 'closed' };
+    const closed = { ...structuredClone(pr), state: 'closed', merge_commit_sha: null };
     assert.equal(verifyRecoveryPullRequest(closed, git, setup.graph, f.source).status, 'closed-unmerged');
     for (const [mutate, error] of [
       [(value) => { value.base.sha = 'a'.repeat(40); }, /base is not the exact/],
@@ -483,7 +498,7 @@ test('recovery PR validator requires exact open, closed-unmerged, and closed-mer
       [(value) => { value.merged = false; }, /Closed-unmerged.*contradictory/],
       [(value) => { value.merged_at = null; }, /lacks exact merged timestamp/],
       [(value) => { value.merge_commit_sha = null; }, /Invalid commit identity/],
-      [(value) => { value.base.sha = setup.graph.source; }, /base is not the exact/],
+      [(value) => { value.base.sha = mergedLine; }, /base is not the exact/],
       [(value) => { value.draft = true; }, /draft field is not exact false/],
     ]) {
       const forged = structuredClone(pr);
@@ -495,7 +510,7 @@ test('recovery PR validator requires exact open, closed-unmerged, and closed-mer
   }
 });
 
-test('proposal PR validator requires a fully typed exact open-draft tuple', async () => {
+test('proposal PR validator accepts only live nullable/full synthetic open-draft tuple shapes', async () => {
   const { f, git, setup, line } = await prepared({ merge: true });
   try {
     const proposal = createProposalCommit(git, { line, recovery: setup.graph.recovery });
@@ -515,6 +530,7 @@ test('proposal PR validator requires a fully typed exact open-draft tuple', asyn
     };
     const exact = proposalPull(state, input);
     assert.equal(verifyProposalPullRequest(exact, state), exact);
+    assert.equal(verifyProposalPullRequest({ ...structuredClone(exact), merge_commit_sha: null }, state).number, exact.number);
     const mutations = [
       [(value) => { delete value.number; }, /Invalid or protected calibration PR number/],
       [(value) => { value.number = '102'; }, /Invalid or protected calibration PR number/],
@@ -526,14 +542,14 @@ test('proposal PR validator requires a fully typed exact open-draft tuple', asyn
       [(value) => { value.draft = null; }, /draft field is not exact true/],
       [(value) => { value.draft = 'true'; }, /draft field is not exact true/],
       [(value) => { value.state = null; }, /state is not exact open or closed/],
-      [(value) => { delete value.merge_commit_sha; }, /contradictory state tuple/],
-      [(value) => { value.merge_commit_sha = 'a'.repeat(40); }, /contradictory state tuple/],
+      [(value) => { delete value.merge_commit_sha; }, /Invalid commit identity/],
+      [(value) => { value.merge_commit_sha = 'not-a-sha'; }, /Invalid commit identity/],
       [(value) => { value.merged_at = '2026-07-15T19:00:00Z'; }, /contradictory state tuple/],
       [(value) => { value.base.sha = setup.graph.source; }, /base is not the exact/],
       [(value) => { value.head.ref = 'other'; }, /head is not the exact/],
       [(value) => { value.head.sha = setup.graph.recovery; }, /head is not the exact/],
       [(value) => { value.head.repo.full_name = 'other/repo'; }, /head is not the exact/],
-      [(value) => { value.state = 'closed'; }, /not one exact open draft/],
+      [(value) => { value.state = 'closed'; value.merge_commit_sha = null; }, /not one exact open draft/],
     ];
     for (const [mutate, error] of mutations) {
       const forged = structuredClone(exact);
@@ -586,7 +602,6 @@ test('stale line, squash-like merge, and merge SHA mismatch cannot authorize pro
           merged: true,
           merged_at: '2026-07-15T19:00:00Z',
           merge_commit_sha: squash,
-          base: { ...pr.base, sha: squash },
         });
       } else {
         const line = normalMerge(f, setup.graph, pr);
@@ -604,16 +619,92 @@ test('stale line, squash-like merge, and merge SHA mismatch cannot authorize pro
   }
 });
 
-test('proposal history rejects closed, duplicate, or protected PRs and never reposts', async () => {
+test('several retained closed proposal attempts plus one open exact PR reuse without POST', async () => {
+  const { f, git, setup, github, line } = await prepared({ merge: true });
+  try {
+    github.proposalSha = createProposalCommit(git, { line, recovery: setup.graph.recovery });
+    const created = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
+    const open = structuredClone(github.proposals[0]);
+    const closed102 = {
+      ...structuredClone(open),
+      state: 'closed',
+      merged: false,
+      merged_at: null,
+      merge_commit_sha: null,
+    };
+    const closed103 = {
+      ...structuredClone(closed102),
+      number: 103,
+      html_url: 'https://github.com/fablebookjs/lab-01/pull/103',
+    };
+    const open104 = {
+      ...structuredClone(open),
+      number: 104,
+      html_url: 'https://github.com/fablebookjs/lab-01/pull/104',
+    };
+    github.proposals = [closed102, closed103, open104];
+    const reused = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
+    assert.equal(reused.outcome, 'proposal-reused');
+    assert.equal(reused.proposal.pullNumber, 104);
+    assert.deepEqual(reused.proposal.closedPullNumbers, [102, 103]);
+    assert.equal(github.createCalls.length, 1);
+    assert.equal(created.proposal.sha, reused.proposal.sha);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('closed-only exact proposal history creates one replacement and preserves the stable proposal SHA', async () => {
+  const { f, git, setup, github, line } = await prepared({ merge: true });
+  try {
+    github.proposalSha = createProposalCommit(git, { line, recovery: setup.graph.recovery });
+    const first = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
+    Object.assign(github.proposals[0], {
+      state: 'closed',
+      merged: false,
+      merged_at: null,
+      merge_commit_sha: null,
+    });
+    const replacement = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
+    assert.equal(replacement.outcome, 'proposal-created');
+    assert.equal(replacement.proposal.pullNumber, 103);
+    assert.deepEqual(replacement.proposal.closedPullNumbers, [102]);
+    assert.equal(replacement.proposal.sha, first.proposal.sha);
+    assert.equal(github.proposals.length, 2);
+    assert.equal(github.proposals.filter((pull) => pull.state === 'open').length, 1);
+    assert.equal(github.createCalls.length, 2);
+
+    const rerun = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
+    assert.equal(rerun.proposal.pullNumber, 103);
+    assert.equal(github.createCalls.length, 2);
+
+    Object.assign(github.proposals.find((pull) => pull.number === 103), {
+      state: 'closed',
+      merged: false,
+      merged_at: null,
+      merge_commit_sha: null,
+    });
+    const secondReplacement = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
+    assert.equal(secondReplacement.proposal.pullNumber, 104);
+    assert.deepEqual(secondReplacement.proposal.closedPullNumbers, [102, 103]);
+    assert.equal(github.createCalls.length, 3);
+    assert.equal(github.proposals.filter((pull) => pull.state === 'open').length, 1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('proposal history rejects two open, any merged, duplicate records, or protected identities before POST', async () => {
   const { f, git, setup, github, line } = await prepared({ merge: true });
   try {
     github.proposalSha = createProposalCommit(git, { line, recovery: setup.graph.recovery });
     await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
-    const created = structuredClone(github.proposals[0]);
+    const open = structuredClone(github.proposals[0]);
     const cases = [
-      [[{ ...created, state: 'closed' }], /not one exact open draft/],
-      [[created, { ...created, number: 103, html_url: 'https://github.com/fablebookjs/lab-01/pull/103' }], /More than one historical proposal PR/],
-      [[{ ...created, number: 19, html_url: 'https://github.com/fablebookjs/lab-01/pull/19' }], /protected/],
+      [[open, { ...structuredClone(open), number: 103, html_url: 'https://github.com/fablebookjs/lab-01/pull/103' }], /More than one open proposal PR/],
+      [[{ ...structuredClone(open), state: 'closed', merged: true, merged_at: '2026-07-15T20:00:00Z', merge_commit_sha: line }], /Merged proposal PR/],
+      [[open, structuredClone(open)], /appears more than once in history/],
+      [[{ ...structuredClone(open), number: 19, html_url: 'https://github.com/fablebookjs/lab-01/pull/19' }], /protected/],
     ];
     for (const [pulls, error] of cases) {
       github.proposals = pulls;
@@ -664,7 +755,7 @@ test('a definite first POST rejection remains resumable and the next run creates
 
     await assert.rejects(
       runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github }),
-      /client-rejection has no visible canonical PR; a later exact sweep may retry one POST/,
+      /client-rejection has no visible open canonical PR.*later exact sweep may retry one POST/,
     );
     assert.equal(github.createCalls.length, 1);
     assert.equal(github.proposals.length, 0);
@@ -707,7 +798,7 @@ test('lost success can retry into duplicate refusal and converge when the single
 
     await assert.rejects(
       runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github }),
-      /ambiguous has no visible canonical PR; a later exact sweep may retry one POST/,
+      /ambiguous has no visible open canonical PR.*later exact sweep may retry one POST/,
     );
     assert.equal(github.createCalls.length, 1);
     phase = 'duplicate';
@@ -716,6 +807,53 @@ test('lost success can retry into duplicate refusal and converge when the single
     assert.equal(converged.proposal.pullAction, 'reused-after-duplicate-refusal');
     assert.equal(github.createCalls.length, 2);
     assert.equal(hiddenPull.number, converged.proposal.pullNumber);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('hidden accepted proposal that closes permits one later open replacement with closed history retained', async () => {
+  const { f, git, setup, github, line } = await prepared({ merge: true });
+  try {
+    const proposal = createProposalCommit(git, { line, recovery: setup.graph.recovery });
+    github.proposalSha = proposal;
+    let phase = 'first-hidden';
+    let hiddenClosed = null;
+    let replacementOpen = null;
+    github.createPullRequest = async function hiddenCloseThenReplace(input) {
+      this.createCalls.push(structuredClone(input));
+      if (phase === 'first-hidden') {
+        hiddenClosed = proposalPull({ line, proposal }, input, 102);
+        throw new PullRequestPostError('response lost after first create', { kind: 'ambiguous' });
+      }
+      replacementOpen = proposalPull({ line, proposal }, input, 103);
+      phase = 'replacement-visible';
+      return structuredClone(replacementOpen);
+    };
+    github.listPullRequestHistoryPage = async (filter) => {
+      if (filter.head.endsWith('/recovery')) return filter.page === 1 ? [structuredClone(github.recovery)] : [];
+      if (filter.page !== 1 || phase !== 'replacement-visible') return [];
+      return [structuredClone(hiddenClosed), structuredClone(replacementOpen)];
+    };
+
+    await assert.rejects(
+      runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github }),
+      /ambiguous has no visible open canonical PR/,
+    );
+    Object.assign(hiddenClosed, {
+      state: 'closed',
+      merged: false,
+      merged_at: null,
+      merge_commit_sha: null,
+    });
+    phase = 'closed-hidden';
+
+    const replacement = await runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github });
+    assert.equal(replacement.outcome, 'proposal-created');
+    assert.equal(replacement.proposal.pullNumber, 103);
+    assert.deepEqual(replacement.proposal.closedPullNumbers, [102]);
+    assert.equal(replacement.proposal.sha, proposal);
+    assert.equal(github.createCalls.length, 2);
   } finally {
     f.cleanup();
   }
@@ -733,7 +871,7 @@ test('repeated ambiguity and permanent invisibility remain one-POST-per-run retr
     for (let run = 1; run <= 3; run += 1) {
       await assert.rejects(
         runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github }),
-        /ambiguous has no visible canonical PR; a later exact sweep may retry one POST/,
+        /ambiguous has no visible open canonical PR.*later exact sweep may retry one POST/,
       );
       assert.equal(github.createCalls.length, run);
       assert.equal(github.proposals.length, 0);
@@ -762,7 +900,7 @@ test('successful response with no visible history remains safely retryable inste
     };
     await assert.rejects(
       runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github }),
-      /successful-response has no visible canonical PR; a later exact sweep may retry one POST/,
+      /successful-response has no visible open canonical PR.*later exact sweep may retry one POST/,
     );
     assert.equal(github.createCalls.length, 1);
     assert.equal(github.proposals.length, 1);
@@ -776,7 +914,7 @@ test('successful response with no visible history remains safely retryable inste
     };
     await assert.rejects(
       runRecoveryTerminal({ mode: 'sweep', git, source: f.source, github }),
-      /duplicate has no visible canonical PR; a later exact sweep may retry one POST/,
+      /duplicate has no visible open canonical PR.*later exact sweep may retry one POST/,
     );
     assert.equal(github.createCalls.length, 2);
     assert.equal(github.proposals.length, 1);

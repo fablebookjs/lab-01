@@ -650,9 +650,10 @@ function assertPullStateTuple(pr, { expectedDraft }) {
   }
 
   if (pr.state === 'open') {
-    if (pr.merged !== false || pr.merged_at !== null || pr.merge_commit_sha !== null) {
+    if (pr.merged !== false || pr.merged_at !== null) {
       throw new Error('Open calibration PR has a contradictory state tuple');
     }
+    if (pr.merge_commit_sha !== null) assertSha(pr.merge_commit_sha);
     return 'open';
   }
 
@@ -687,11 +688,10 @@ function assertProposalStillSuppressed(graph, initialProposal, initialMarker) {
 export function verifyRecoveryPullRequest(pr, git, graph, currentLine) {
   assertPullNumber(pr);
   const tuple = assertPullStateTuple(pr, { expectedDraft: false });
-  const expectedBase = tuple === 'closed-merged' ? currentLine : graph.source;
-  assertPullRefs(pr, 'recovery', { baseSha: expectedBase, headSha: graph.recovery });
+  assertPullRefs(pr, 'recovery', { baseSha: graph.source, headSha: graph.recovery });
   if (tuple === 'open') {
     if (currentLine !== graph.source) throw new Error('Recovery PR is open but fixed line is not exact source');
-    return { status: 'open', pull: pr };
+    return { status: 'open', pull: pr, syntheticMergeSha: pr.merge_commit_sha };
   }
   if (tuple === 'closed-unmerged') {
     if (currentLine !== graph.source) throw new Error('Closed unmerged recovery PR changed the fixed line');
@@ -719,14 +719,40 @@ export function proposalPullRequestBody(state) {
 }
 
 export function verifyProposalPullRequest(pr, state, { requireEditableFields = false } = {}) {
-  assertPullNumber(pr);
-  const tuple = assertPullStateTuple(pr, { expectedDraft: true });
-  assertPullRefs(pr, 'proposal', { baseSha: state.line, headSha: state.proposal });
-  if (tuple !== 'open') throw new Error('Proposal PR is not one exact open draft');
+  const verified = verifyProposalHistoryPullRequest(pr, state);
+  if (verified.status !== 'open') throw new Error('Proposal PR is not one exact open draft');
   if (requireEditableFields && (pr.title !== PROPOSAL_TITLE || pr.body !== proposalPullRequestBody(state))) {
     throw new Error('Created proposal PR editable payload is not canonical');
   }
   return pr;
+}
+
+function verifyProposalHistoryPullRequest(pr, state) {
+  assertPullNumber(pr);
+  const tuple = assertPullStateTuple(pr, { expectedDraft: true });
+  assertPullRefs(pr, 'proposal', { baseSha: state.line, headSha: state.proposal });
+  return { status: tuple, pull: pr };
+}
+
+function selectProposalHistory(pulls, state) {
+  const seenNumbers = new Set();
+  const closed = [];
+  let open = null;
+  for (const pull of pulls) {
+    const verified = verifyProposalHistoryPullRequest(pull, state);
+    if (seenNumbers.has(pull.number)) throw new Error(`Proposal PR #${pull.number} appears more than once in history`);
+    seenNumbers.add(pull.number);
+    if (verified.status === 'closed-merged') {
+      throw new Error(`Merged proposal PR #${pull.number} is forbidden in recovery-terminal history`);
+    }
+    if (verified.status === 'closed-unmerged') {
+      closed.push(pull);
+      continue;
+    }
+    if (open !== null) throw new Error('More than one open proposal PR exists for the exact fixed refs');
+    open = pull;
+  }
+  return { open, closed, total: pulls.length };
 }
 
 function assertSweepAnchors(git, source, graph, { line = null, marker = null, proposal = undefined } = {}) {
@@ -742,16 +768,18 @@ function assertSweepAnchors(git, source, graph, { line = null, marker = null, pr
   }
 }
 
-async function pollProposalHistory(github, git, query, assertState) {
+async function pollProposalHistory(github, git, query, assertState, state) {
   let pulls = [];
+  let selected = { open: null, closed: [], total: 0 };
   for (let attempt = 1; attempt <= VISIBILITY_ATTEMPTS; attempt += 1) {
     pulls = await listHistory(github, git, query, assertState);
-    if (pulls.length > 0) return pulls;
+    selected = selectProposalHistory(pulls, state);
+    if (selected.open !== null) return { pulls, selected };
     if (attempt < VISIBILITY_ATTEMPTS) {
       await (github.waitForRetry?.(VISIBILITY_RETRY_MS * attempt) ?? Promise.resolve());
     }
   }
-  return pulls;
+  return { pulls, selected };
 }
 
 async function ensureProposalPullRequest(github, git, state) {
@@ -767,8 +795,14 @@ async function ensureProposalPullRequest(github, git, state) {
     throw new Error(`PR-attempt marker is ${marker ?? 'absent'}, expected recovery or proposal`);
   }
   let pulls = await listHistory(github, git, query, assertState);
-  let existing = selectSingleHistory(pulls, 'proposal');
-  if (existing) return { action: 'reused', pull: verifyProposalPullRequest(existing, state) };
+  let history = selectProposalHistory(pulls, state);
+  if (history.open !== null) {
+    return {
+      action: 'reused',
+      pull: verifyProposalPullRequest(history.open, state),
+      closedPullNumbers: history.closed.map((pull) => pull.number),
+    };
+  }
 
   let markerResult = 'reused';
   if (marker === state.recovery) {
@@ -812,10 +846,9 @@ async function ensureProposalPullRequest(github, git, state) {
       created = null;
     }
   }
-  pulls = await pollProposalHistory(github, git, query, assertState);
-  existing = selectSingleHistory(pulls, 'proposal');
-  if (existing) {
-    const verified = verifyProposalPullRequest(existing, state);
+  ({ pulls, selected: history } = await pollProposalHistory(github, git, query, assertState, state));
+  if (history.open !== null) {
+    const verified = verifyProposalPullRequest(history.open, state);
     if (created !== null && verified.number !== created.number) {
       throw new Error('Proposal PR identity changed after successful creation response');
     }
@@ -826,12 +859,18 @@ async function ensureProposalPullRequest(github, git, state) {
         : postOutcome === 'client-rejection'
           ? 'reused-after-client-rejection'
           : 'reused-after-ambiguous-create';
-    return { action, pull: verified, markerResult, postOutcome };
+    return {
+      action,
+      pull: verified,
+      markerResult,
+      postOutcome,
+      closedPullNumbers: history.closed.map((pull) => pull.number),
+    };
   }
 
   const detail = postError instanceof Error ? postError.message : 'no error detail';
   throw new Error(
-    `Proposal PR POST outcome ${postOutcome} has no visible canonical PR; a later exact sweep may retry one POST: ${detail}`,
+    `Proposal PR POST outcome ${postOutcome} has no visible open canonical PR after retaining ${history.closed.length} closed attempt(s); a later exact sweep may retry one POST: ${detail}`,
     postError instanceof Error ? { cause: postError } : undefined,
   );
 }
@@ -878,7 +917,11 @@ export async function runSweep({ git = new Git(), source, github }) {
       mode: 'sweep',
       outcome: `blocked-recovery-${recovery.status}`,
       graph,
-      recoveryPullRequest: { number: recovery.pull.number, status: recovery.status },
+      recoveryPullRequest: {
+        number: recovery.pull.number,
+        status: recovery.status,
+        syntheticMergeSha: recovery.syntheticMergeSha ?? null,
+      },
       proposal: null,
     };
   }
@@ -901,7 +944,11 @@ export async function runSweep({ git = new Git(), source, github }) {
     outcome: pull.action === 'created' ? 'proposal-created' : 'proposal-reused',
     graph,
     recoveredLine: recovery.line,
-    recoveryPullRequest: { number: recovery.pull.number, status: recovery.status },
+    recoveryPullRequest: {
+      number: recovery.pull.number,
+      status: recovery.status,
+      mergeCommitSha: recovery.pull.merge_commit_sha,
+    },
     proposal: {
       ref: proposalRef,
       sha: proposal,
@@ -909,6 +956,8 @@ export async function runSweep({ git = new Git(), source, github }) {
       pullAction: pull.action,
       pullNumber: pull.pull.number,
       pullUrl: pull.pull.html_url,
+      syntheticMergeSha: pull.pull.merge_commit_sha,
+      closedPullNumbers: pull.closedPullNumbers,
     },
   };
 }
@@ -920,7 +969,11 @@ export async function runRecoveryTerminal({ mode, git = new Git(), source, githu
 
 export function buildSummary(result) {
   const proposal = result.proposal
-    ? `- Proposal: \`${result.proposal.ref}\` = \`${result.proposal.sha}\`, PR [#${result.proposal.pullNumber}](${result.proposal.pullUrl})\n`
+    ? (
+        `- Proposal: \`${result.proposal.ref}\` = \`${result.proposal.sha}\`, active PR [#${result.proposal.pullNumber}](${result.proposal.pullUrl})\n` +
+        `- Active proposal synthetic merge SHA: \`${result.proposal.syntheticMergeSha ?? 'null'}\`\n` +
+        `- Retained closed proposal attempts: ${result.proposal.closedPullNumbers.length > 0 ? result.proposal.closedPullNumbers.map((number) => `#${number}`).join(', ') : 'none'}\n`
+      )
     : '- Proposal: suppressed; no proposal ref or PR write was authorized by this sweep\n';
   return (
     `## G1 recovery-terminal calibration\n\n` +
