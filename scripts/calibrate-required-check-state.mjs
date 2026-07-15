@@ -7,8 +7,8 @@ import { fileURLToPath } from 'node:url';
 export const REPOSITORY = 'fablebookjs/lab-01';
 export const NAMESPACE = 'refs/heads/calibration/g1/required-check';
 export const FILE_PATH = 'calibration/g1/required-check/state.txt';
-export const MODES = ['setup', 'advance-head', 'approve-head'];
-export const ROLES = ['base', 'a', 'b', 'head', 'approved'];
+export const MODES = ['setup', 'advance-head'];
+export const ROLES = ['base', 'a', 'b', 'head'];
 
 const REF_SET = new Set(ROLES.map((role) => `${NAMESPACE}/${role}`));
 const GRAPH_ROLES = ['base', 'a', 'b'];
@@ -238,17 +238,6 @@ export class Git {
     return parseRemoteAdvertisement(output, [ref])[ref];
   }
 
-  remoteCalibrationRefs(refs) {
-    const uniqueRefs = [...new Set(refs)];
-    if (uniqueRefs.length !== refs.length || uniqueRefs.length === 0) {
-      throw new Error('Remote calibration observation requires unique fixed refs');
-    }
-    for (const ref of uniqueRefs) assertCalibrationRef(ref);
-    this.assertTrustedRemote();
-    const output = this.text(['ls-remote', '--heads', this.remote, ...uniqueRefs]);
-    return parseRemoteAdvertisement(output, uniqueRefs);
-  }
-
   bindTrustedSource(source) {
     assertSha(source);
     this.trustedSource = source;
@@ -317,27 +306,6 @@ export function pushWithLease(git, ref, expected, next) {
       `--force-with-lease=${ref}:${expected ?? ''}`,
       git.remote,
       `${next}:${ref}`,
-    ],
-    { allowFailure: true },
-  );
-}
-
-export function pushAtomicApproval(git, graph) {
-  const headRef = calibrationRef('head');
-  const approvedRef = calibrationRef('approved');
-  for (const sha of [graph.a, graph.b]) assertSha(sha);
-  git.assertTrustedRemote({ requirePush: true });
-  return git.run(
-    [
-      'push',
-      '--porcelain',
-      '--atomic',
-      '--no-follow-tags',
-      `--force-with-lease=${headRef}:${graph.b}`,
-      `--force-with-lease=${approvedRef}:${graph.a}`,
-      git.remote,
-      `${graph.b}:${headRef}`,
-      `${graph.b}:${approvedRef}`,
     ],
     { allowFailure: true },
   );
@@ -466,46 +434,12 @@ function requireGraphRefs(git, graph, { create }) {
   return results;
 }
 
-function readState(git) {
-  const headRef = calibrationRef('head');
-  const approvedRef = calibrationRef('approved');
-  const observed = git.remoteCalibrationRefs([headRef, approvedRef]);
-  return { head: observed[headRef], approved: observed[approvedRef] };
-}
-
-function observeState(git, graph) {
-  const { head, approved } = readState(git);
+function observeHead(git, graph) {
+  const head = git.remoteRef(calibrationRef('head'));
   if (![graph.a, graph.b].includes(head)) {
     throw new Error(`Calibration head is ${head ?? 'absent'}, expected exact A or B`);
   }
-  if (![graph.a, graph.b].includes(approved)) {
-    throw new Error(`Calibration approval is ${approved ?? 'absent'}, expected exact A or B`);
-  }
-  if (head === graph.a && approved === graph.b) {
-    throw new Error('Calibration approval cannot advance to B before head');
-  }
-  return { head, approved };
-}
-
-function approveHead(git, graph) {
-  const before = observeState(git, graph);
-  if (before.head !== graph.b) throw new Error('Cannot approve B before calibration head is exact B');
-  if (before.approved === graph.b) return 'reused';
-  const push = pushAtomicApproval(git, graph);
-  const after = readState(git);
-  if (push.status !== 0) {
-    if (after.head === graph.b && after.approved === graph.b) return 'approved-lost-success';
-    throw new Error(
-      `Atomic approval was rejected; head=${after.head ?? 'absent'}, approved=${after.approved ?? 'absent'}: ` +
-        `${push.stderr.trim() || push.stdout.trim()}`,
-    );
-  }
-  if (after.head !== graph.b || after.approved !== graph.b) {
-    throw new Error(
-      `Atomic approval verification failed; head=${after.head ?? 'absent'}, approved=${after.approved ?? 'absent'}`,
-    );
-  }
-  return 'advanced';
+  return head;
 }
 
 export function runStateCalibration({ mode, git = new Git(), source }) {
@@ -520,32 +454,18 @@ export function runStateCalibration({ mode, git = new Git(), source }) {
 
   if (mode === 'setup') {
     const head = git.remoteRef(calibrationRef('head'));
-    const approved = git.remoteRef(calibrationRef('approved'));
     const headResult = head === null
       ? ensureFixedRef(git, calibrationRef('head'), graph.a)
       : [graph.a, graph.b].includes(head)
         ? 'reused'
         : (() => { throw new Error(`Unexpected retained head ${head}`); })();
-    const approvedResult = approved === null
-      ? ensureFixedRef(git, calibrationRef('approved'), graph.a)
-      : [graph.a, graph.b].includes(approved)
-        ? 'reused'
-        : (() => { throw new Error(`Unexpected retained approval ${approved}`); })();
-    transition = { head: headResult, approved: approvedResult };
-  } else if (mode === 'advance-head') {
-    const before = observeState(git, graph);
-    transition = {
-      head: advanceRef(git, calibrationRef('head'), graph.a, graph.b),
-      approved: before.approved === graph.a ? 'retained-a' : 'retained-b',
-    };
+    transition = { head: headResult };
   } else {
-    transition = {
-      head: 'retained-b',
-      approved: approveHead(git, graph),
-    };
+    observeHead(git, graph);
+    transition = { head: advanceRef(git, calibrationRef('head'), graph.a, graph.b) };
   }
 
-  const state = observeState(git, graph);
+  const state = { head: observeHead(git, graph) };
   git.assertTrustedSource();
   return { mode, graph, graphRefs, transition, state };
 }
@@ -558,7 +478,6 @@ function buildSummary(result) {
     `- A: \`${result.graph.a}\`\n` +
     `- B: \`${result.graph.b}\`\n` +
     `- Remote head: \`${result.state.head}\`\n` +
-    `- Remote approved: \`${result.state.approved}\`\n` +
     `- Permission used: \`contents: write\` only\n`
   );
 }

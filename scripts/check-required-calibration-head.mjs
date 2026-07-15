@@ -7,8 +7,9 @@ import {
   calibrationRef,
 } from './calibrate-required-check-state.mjs';
 
-export function evaluateRequiredHead({ git = new Git(), headSha }) {
+export function evaluateRequiredHead({ git = new Git(), headSha, authorizedSha }) {
   assertSha(headSha);
+  assertSha(authorizedSha);
   git.assertNoHostileEnvironment();
   git.assertTrustedRemote();
   const localHead = git.text(['rev-parse', 'HEAD']);
@@ -17,17 +18,14 @@ export function evaluateRequiredHead({ git = new Git(), headSha }) {
   }
 
   const headRef = calibrationRef('head');
-  const approvedRef = calibrationRef('approved');
-  const remote = git.remoteCalibrationRefs([headRef, approvedRef]);
-  const remoteHead = remote[headRef];
-  const remoteApproved = remote[approvedRef];
-  const authorized = remoteHead === headSha && remoteApproved === headSha;
+  const remoteHead = git.remoteRef(headRef);
+  const authorized = remoteHead === headSha && authorizedSha === headSha;
   const reason = remoteHead !== headSha
     ? 'dispatched-sha-is-not-current-remote-head'
-    : remoteApproved !== headSha
-      ? 'current-head-is-not-approved'
-      : 'current-head-is-exactly-approved';
-  return { authorized, reason, headSha, localHead, remoteHead, remoteApproved };
+    : authorizedSha !== headSha
+      ? 'dispatched-sha-is-not-authorized'
+      : 'current-head-matches-authorized-sha';
+  return { authorized, reason, headSha, authorizedSha, localHead, remoteHead };
 }
 
 export function buildCheckSummary(result) {
@@ -36,8 +34,8 @@ export function buildCheckSummary(result) {
     `- Result: \`${result.authorized ? 'authorized' : 'rejected'}\`\n` +
     `- Reason: \`${result.reason}\`\n` +
     `- Dispatched SHA: \`${result.headSha}\`\n` +
+    `- Authorized SHA input: \`${result.authorizedSha}\`\n` +
     `- Remote head: \`${result.remoteHead ?? 'absent'}\`\n` +
-    `- Remote approved: \`${result.remoteApproved ?? 'absent'}\`\n` +
     `- Permission used: \`contents: read\` only\n`
   );
 }
@@ -54,7 +52,9 @@ function assertLiveContext() {
 
 async function main() {
   assertLiveContext();
-  const result = evaluateRequiredHead({ headSha: process.env.GITHUB_SHA });
+  const authorizedIndex = process.argv.indexOf('--authorized-sha');
+  const authorizedSha = authorizedIndex === -1 ? null : process.argv[authorizedIndex + 1];
+  const result = evaluateRequiredHead({ headSha: process.env.GITHUB_SHA, authorizedSha });
   if (process.env.GITHUB_STEP_SUMMARY) {
     appendFileSync(process.env.GITHUB_STEP_SUMMARY, buildCheckSummary(result));
   }

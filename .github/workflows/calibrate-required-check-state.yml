@@ -10,7 +10,6 @@ on:
         options:
           - setup
           - advance-head
-          - approve-head
 
 permissions:
   contents: write

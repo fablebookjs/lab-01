@@ -2,6 +2,11 @@ name: Required check calibration
 
 on:
   workflow_dispatch:
+    inputs:
+      authorized_sha:
+        description: Exact full calibration head SHA to authorize
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -29,5 +34,7 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
-      - name: Require the exact current and approved head
-        run: node scripts/check-required-calibration-head.mjs
+      - name: Require the exact current explicitly authorized head
+        run: node scripts/check-required-calibration-head.mjs --authorized-sha "$AUTHORIZED_SHA"
+        env:
+          AUTHORIZED_SHA: ${{ inputs.authorized_sha }}

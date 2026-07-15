@@ -12,16 +12,12 @@ dispatches only from trusted `main`, and owns exactly these refs:
 - `calibration/g1/required-check/a`
 - `calibration/g1/required-check/b`
 - `calibration/g1/required-check/head`
-- `calibration/g1/required-check/approved`
 
-`setup` creates a deterministic `base -> A -> B` graph and initializes both
-`head` and `approved` to A. `advance-head` performs only the guarded A-to-B head
-transition. `approve-head` is allowed only from exact `(head=B, approved=A)` and
-uses one atomic push: a leased no-op `B:head` retains exact head B while a second
-lease advances `B:approved`. A rewind, deletion, or replacement of head rejects
-the entire push. Every creation and transition uses an explicit old-SHA lease,
-an explicit `SHA:ref` refspec, and `--no-follow-tags`. Reruns reuse an exact
-retained state or fail closed.
+`setup` creates a deterministic `base -> A -> B` graph and initializes `head` to
+A. `advance-head` performs the sole mutable transition, guarded A-to-B. Every
+creation and transition uses an explicit old-SHA lease, an explicit `SHA:ref`
+refspec, and `--no-follow-tags`. Reruns reuse an exact retained state or fail
+closed. There is no approval ref or approval write.
 
 Before every Git advertisement or write, both scripts reject inherited Git
 environment overrides, isolate global and system configuration, and audit the
@@ -33,8 +29,14 @@ overrides fail before network Git runs.
 
 The separate **Required check calibration** workflow has only `contents: read`,
 one stable job named **Required calibration head**, and can dispatch only on the
-fixed `head` branch. It succeeds only when its checked-out `GITHUB_SHA` equals
-both the remote `head` ref and the remote `approved` ref.
+fixed `head` branch. Every dispatch requires one full `authorized_sha` input. It
+succeeds only when `GITHUB_SHA`, checked-out `HEAD`, the current remote `head`,
+and `authorized_sha` are the same exact commit.
+
+The explicit workflow dispatch is the authorization and wake-up for this
+experiment. This slice proves GitHub's current-head required-check binding; it
+does not prove the identity, entitlement, or policy right of the maintainer who
+chooses `authorized_sha`.
 
 ## Authoritative live evidence contract
 
@@ -201,12 +203,12 @@ by `commits(last:1)` must have `oid=headRefOid`.
 
 The phase-specific acceptance tuples are:
 
-| Phase | PR head | Latest exact REST check on current head | GraphQL `(mergeable, mergeStateStatus, statusCheckRollup.state)` |
+| Phase | PR head / explicit input | Latest exact REST check on current head | GraphQL `(mergeable, mergeStateStatus, statusCheckRollup.state)` |
 | --- | --- | --- | --- |
-| `a-green` | exact A | `(A, completed, success, APP_ID, github-actions)` | `(MERGEABLE, CLEAN, SUCCESS)` |
-| `b-missing` | exact B | exact context absent on B; A success still present when A is queried | `(MERGEABLE, BLOCKED, null)` |
-| `b-failing` | exact B | `(B, completed, failure, APP_ID, github-actions)` | `(MERGEABLE, UNSTABLE, FAILURE)` |
-| `b-green` | exact B | latest exact B run is `(B, completed, success, APP_ID, github-actions)` | `(MERGEABLE, CLEAN, SUCCESS)` |
+| `a-green` | head A; `authorized_sha=A` | `(A, completed, success, APP_ID, github-actions)` | `(MERGEABLE, CLEAN, SUCCESS)` |
+| `b-missing` | head B; no B dispatch | exact context absent on B; A success still present when A is queried | `(MERGEABLE, BLOCKED, null)` |
+| `b-failing` | head B; `authorized_sha=A` | `(B, completed, failure, APP_ID, github-actions)` | `(MERGEABLE, UNSTABLE, FAILURE)` |
+| `b-green` | head B; `authorized_sha=B` | latest exact B run is `(B, completed, success, APP_ID, github-actions)` | `(MERGEABLE, CLEAN, SUCCESS)` |
 
 Any other tuple, timeout, pagination overflow, more than one protected check,
 changed PR number, or non-open/merged/draft PR is a failed calibration—not
@@ -236,7 +238,8 @@ evidence to reinterpret.
    ```sh
    gh workflow run calibrate-required-check.yml \
      --repo fablebookjs/lab-01 \
-     --ref calibration/g1/required-check/head
+     --ref calibration/g1/required-check/head \
+     -f authorized_sha="$A"
    ```
 
 4. Query exact A's check runs. Set `CONTEXT` from its exact name and `APP_ID` from
@@ -288,34 +291,38 @@ evidence to reinterpret.
    ```
 
    Confirm that A's successful check is still retained, the PR now has exact B,
-   `approved` remains exact A, and exact B has no check run with `CONTEXT` and
-   `APP_ID`. Poll until the exact `b-missing` tuple is present. With
-   `strict=false`, this isolates current-head check binding from base-update
-   strictness.
+   and exact B has no check run with `CONTEXT` and `APP_ID`. Poll until the exact
+   `b-missing` tuple is present. With `strict=false`, this isolates current-head
+   check binding from base-update strictness.
 
-6. Dispatch the same read-only check on `head` again. Its run SHA must be exact B
-   and the same job/context must fail with `current-head-is-not-approved`. This
-   is the explicit stale-green rejection observation: A remains green while B is
-   unauthorized. Poll until the exact `b-failing` tuple is present.
-
-7. Move only `approved` from A to B, then rerun the same check on exact B:
+6. Dispatch the same read-only check on exact B while explicitly authorizing A:
 
    ```sh
-   gh workflow run calibrate-required-check-state.yml \
-     --repo fablebookjs/lab-01 \
-     --ref main \
-     -f mode=approve-head
-
    gh workflow run calibrate-required-check.yml \
      --repo fablebookjs/lab-01 \
-     --ref calibration/g1/required-check/head
+     --ref calibration/g1/required-check/head \
+     -f authorized_sha="$A"
+   ```
+
+   Its run SHA must be exact B and the same job/context must fail with
+   `dispatched-sha-is-not-authorized`. This is the explicit stale-green rejection
+   observation: A remains green while B is unauthorized. Poll until the exact
+   `b-failing` tuple is present.
+
+7. Dispatch the same check on exact B while explicitly authorizing exact B:
+
+   ```sh
+   gh workflow run calibrate-required-check.yml \
+     --repo fablebookjs/lab-01 \
+     --ref calibration/g1/required-check/head \
+     -f authorized_sha="$B"
    ```
 
    Verify that the latest exact B run makes the same context/App pair green.
    Poll until the exact `b-green` tuple is present. Re-read the protection and
    invariant PR tuples, and verify the PR was never merged.
 
-8. Retain the PR, five refs, workflow runs, check records, and branch-protection
+8. Retain the PR, four refs, workflow runs, check records, and branch-protection
    evidence for issue #15. Cleanup or protection removal is a separate,
    explicitly authorized operation.
 
