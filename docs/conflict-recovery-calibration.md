@@ -5,13 +5,19 @@ The manual **Calibrate conflict recovery** workflow uses only the exact
 and complete late-work head `H` commits, proves `V` and `H` conflict at one fixed
 path, and retains immutable graph and backup refs.
 
-`inject-after-force` requires the fixed source to remain the current trusted-main
-SHA, then atomically asserts `backup = H` while moving `line` from `H` to `V` with
-exact leases. It records the verified post-state and intentionally fails before
-any PR operation. `resume` accepts only that exact backup and a line at `H` or
-`V`, performs the guarded atomic force only when needed, and creates or reuses
-one same-repository draft recovery PR from `backup` to `line`. Closed or duplicate
-matching PR history fails closed instead of creating another proposal.
+`inject-after-force` requires local `HEAD`, remote `main`, and the fixed source to
+remain the same trusted-main SHA, then atomically asserts `backup = H` while moving
+`line` from `H` to `V` with exact leases. It records the observed post-state,
+including abnormal backup drift, and intentionally fails before any PR operation.
+`resume` accepts only the exact backup and a line at `H` or `V`, performs the
+guarded atomic force only when needed, and creates or reuses one same-repository
+draft recovery PR from `backup` to `line`.
+
+Before its sole permitted PR POST, resume retains immutable `pr-attempt = V` in
+the same namespace. Once that marker exists, reruns are query-only until the
+all-state, fully paginated PR history exposes the canonical draft. Closed,
+merged, or duplicate matching history fails closed instead of creating another
+proposal.
 
 The retained draft documents the excluded late SHA, @ndelangen as the resolvable
 lab author, the need for another patch after the missed `1.0.1`, and the required

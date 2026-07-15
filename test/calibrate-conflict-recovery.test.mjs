@@ -116,7 +116,7 @@ function assertExactWorkflowAuthority(workflow) {
   );
   assert.equal(workflow.match(/^on:$/gm)?.length, 1);
   assert.equal(workflow.match(/^permissions:$/gm)?.length, 1);
-  assert.equal(workflow.match(/^[ \t]+permissions:$/gm), null);
+  assert.equal(workflow.match(/^[ \t]+(?:permissions|['"]permissions['"])[ \t]*:.*$/gm), null);
 }
 
 class RecordingGit extends Git {
@@ -132,7 +132,9 @@ class RecordingGit extends Git {
 }
 
 function assertSafePushInvocations(pushes) {
-  const allowed = new Set(['source', 'intent', 'm', 'v', 'h', 'backup', 'line'].map(conflictRef));
+  const allowed = new Set(
+    ['source', 'intent', 'm', 'v', 'h', 'backup', 'line', 'pr-attempt'].map(conflictRef),
+  );
   assert.ok(pushes.length > 0);
   for (const args of pushes) {
     assert.equal(args[0], 'push');
@@ -159,6 +161,8 @@ function pullFor(graph, input, number = 101) {
     html_url: `https://github.com/fablebookjs/lab-01/pull/${number}`,
     state: 'open',
     draft: true,
+    merged: false,
+    merged_at: null,
     title: input.title,
     body: input.body,
     base: {
@@ -182,9 +186,9 @@ class FakeGitHub {
     this.createCalls = [];
   }
 
-  async listPullRequestHistory(filter) {
+  async listPullRequestHistoryPage(filter) {
     this.listCalls.push(filter);
-    return structuredClone(this.pulls);
+    return filter.page === 1 ? structuredClone(this.pulls) : [];
   }
 
   async createPullRequest(input) {
@@ -202,7 +206,7 @@ test('inject-after-force creates the exact conflicting graph, backs up H first, 
   try {
     const git = new RecordingGit(gitOptions(f));
     const github = {
-      async listPullRequestHistory() {
+      async listPullRequestHistoryPage() {
         throw new Error('inject mode must not query pull requests');
       },
       async createPullRequest() {
@@ -262,6 +266,7 @@ test('inject-after-force creates the exact conflicting graph, backs up H first, 
       calibrationRefs.sort(),
       ['source', 'intent', 'm', 'v', 'h', 'backup', 'line'].map(conflictRef).sort(),
     );
+    assert.equal(remoteRef(f, conflictRef('pr-attempt')), null);
 
     const pushesBeforeRerun = git.pushes.length;
     const rerun = await runConflictRecovery({ mode: 'inject-after-force', git, source: f.source, github });
@@ -331,18 +336,85 @@ test('trusted-main source drift fails before any ref push or PR API call', async
     });
     const source2 = command(join(f.root, 'seed'), ['rev-parse', 'HEAD']);
     command(join(f.root, 'seed'), ['push', 'origin', 'main']);
-    command(f.runner, ['fetch', 'origin', 'main']);
+    assert.notEqual(source2, f.source);
 
     const git = new RecordingGit(gitOptions(f));
     const github = new FakeGitHub({});
     await assert.rejects(
-      runConflictRecovery({ mode: 'resume', git, source: source2, github }),
-      /Trusted main source drifted from fixed calibration source/,
+      runConflictRecovery({ mode: 'resume', git, source: f.source, github }),
+      /Remote refs\/heads\/main .* is not trusted source/,
     );
     assert.equal(git.pushes.length, 0);
     assert.equal(github.listCalls.length, 0);
     assert.equal(github.createCalls.length, 0);
     assert.equal(remoteRef(f, conflictRef('source')), f.source);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('a first inject from stale dispatched A fails after remote main advances B with zero writes', async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.root, 'seed', 'advanced-before-dispatch.txt'), 'remote B\n');
+    command(join(f.root, 'seed'), ['add', 'advanced-before-dispatch.txt']);
+    command(join(f.root, 'seed'), ['commit', '-m', 'advance before stale dispatch'], {
+      GIT_AUTHOR_DATE: '2026-07-15T11:40:00Z',
+      GIT_COMMITTER_DATE: '2026-07-15T11:40:00Z',
+    });
+    command(join(f.root, 'seed'), ['push', 'origin', 'main']);
+
+    const git = new RecordingGit(gitOptions(f));
+    const github = new FakeGitHub({});
+    await assert.rejects(
+      runConflictRecovery({ mode: 'inject-after-force', git, source: f.source, github }),
+      /Remote refs\/heads\/main .* is not trusted source/,
+    );
+    assert.equal(git.pushes.length, 0);
+    assert.equal(github.listCalls.length, 0);
+    assert.equal(github.createCalls.length, 0);
+    assert.equal(remoteRef(f, conflictRef('source')), null);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('remote main drift after marker creation fails before the first PR API call', async () => {
+  const f = fixture();
+  try {
+    const injected = await runConflictRecovery({
+      mode: 'inject-after-force',
+      git: new Git(gitOptions(f)),
+      source: f.source,
+    });
+    writeFileSync(join(f.root, 'seed', 'drift.txt'), 'remote main drift\n');
+    command(join(f.root, 'seed'), ['add', 'drift.txt']);
+    command(join(f.root, 'seed'), ['commit', '-m', 'prepare remote drift'], {
+      GIT_AUTHOR_DATE: '2026-07-15T11:45:00Z',
+      GIT_COMMITTER_DATE: '2026-07-15T11:45:00Z',
+    });
+
+    class DriftBeforeApiGit extends Git {
+      drifted = false;
+
+      assertTrustedSource() {
+        if (!this.drifted && remoteRef(f, conflictRef('pr-attempt')) === injected.graph.v) {
+          this.drifted = true;
+          command(join(f.root, 'seed'), ['push', 'origin', 'main']);
+        }
+        return super.assertTrustedSource();
+      }
+    }
+
+    const git = new DriftBeforeApiGit(gitOptions(f));
+    const github = new FakeGitHub(injected.graph);
+    await assert.rejects(
+      runConflictRecovery({ mode: 'resume', git, source: f.source, github }),
+      /Remote refs\/heads\/main .* is not trusted source/,
+    );
+    assert.equal(remoteRef(f, conflictRef('pr-attempt')), injected.graph.v);
+    assert.equal(github.listCalls.length, 0);
+    assert.equal(github.createCalls.length, 0);
   } finally {
     f.cleanup();
   }
@@ -399,6 +471,16 @@ test('resume forces an H line only after verifying the backup, creates one draft
     assert.equal(first.pullRequest.draft, true);
     assert.equal(remoteRef(f, first.lineRef), first.graph.v);
     assert.equal(remoteRef(f, first.backupRef), first.graph.h);
+    assert.equal(remoteRef(f, conflictRef('pr-attempt')), first.graph.v);
+    const retainedCalibrationRefs = command(f.runner, ['ls-remote', '--heads', f.remote])
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => line.split(/\s+/)[1])
+      .filter((ref) => ref.startsWith(`${NAMESPACE}/`));
+    assert.deepEqual(
+      retainedCalibrationRefs.sort(),
+      ['source', 'intent', 'm', 'v', 'h', 'backup', 'line', 'pr-attempt'].map(conflictRef).sort(),
+    );
     assert.equal(github.createCalls.length, 1);
     assert.deepEqual(github.createCalls[0], {
       title: 'Recover conflict calibration work after 1.0.1',
@@ -573,13 +655,87 @@ test('post-force backup drift fails before PR creation even though line reached 
         source: f.source,
         github,
       }),
-      /Remote recovery backup is null, expected/,
+      /Remote recovery backup is absent, expected/,
     );
     assert.equal(remoteRef(f, injected.lineRef), injected.graph.v);
     assert.equal(remoteRef(f, injected.backupRef), null);
     assert.equal(github.createCalls.length, 0);
   } finally {
     f.cleanup();
+  }
+});
+
+test('inject retains truthful structured evidence when backup drifts after line reaches V', async () => {
+  for (const mutation of ['delete', 'rewrite']) {
+    const f = fixture();
+    const evidenceRoot = mkdtempSync(join(tmpdir(), 'lab-01-abnormal-injection-evidence-'));
+    try {
+      class PostAtomicInjectionDriftGit extends Git {
+        drifted = false;
+
+        run(args, options) {
+          const result = super.run(args, options);
+          if (!this.drifted && args[0] === 'push' && args.includes('--atomic') && result.status === 0) {
+            this.drifted = true;
+            const backupRef = conflictRef('backup');
+            const refspec = mutation === 'delete' ? `:${backupRef}` : `${this.trustedSource}:${backupRef}`;
+            command(f.runner, ['push', '--force', f.remote, refspec]);
+          }
+          return result;
+        }
+      }
+
+      const github = {
+        async listPullRequestHistoryPage() {
+          throw new Error('inject safety evidence must precede every PR API');
+        },
+        async createPullRequest() {
+          throw new Error('inject safety evidence must never create a PR');
+        },
+      };
+      const result = await runConflictRecovery({
+        mode: 'inject-after-force',
+        git: new PostAtomicInjectionDriftGit(gitOptions(f)),
+        source: f.source,
+        github,
+      });
+      assert.equal(result.outcome, 'safety-failure-after-durable-force-before-pr');
+      assert.equal(result.intentionalFailure, true);
+      assert.equal(result.failurePoint, 'after-durable-force-before-pr');
+      assert.equal(result.finalLine, result.graph.v);
+      assert.equal(result.backupVerified, false);
+      assert.equal(
+        result.remoteBackup,
+        mutation === 'delete' ? null : f.source,
+      );
+
+      const summaryPath = join(evidenceRoot, 'summary.md');
+      const outputPath = join(evidenceRoot, 'output.txt');
+      writeFileSync(summaryPath, '');
+      writeFileSync(outputPath, '');
+      assert.equal(finalizeResult(result, { summaryPath, outputPath, writeStdout() {} }), 78);
+      assert.match(readFileSync(summaryPath, 'utf8'), /safety-failure-after-durable-force-before-pr/);
+      assert.match(readFileSync(summaryPath, 'utf8'), /Backup verified as exact complete H: `false`/);
+      assert.match(readFileSync(outputPath, 'utf8'), /backup_verified=false/);
+      assert.match(readFileSync(outputPath, 'utf8'), /failure_point=after-durable-force-before-pr/);
+      assert.match(readFileSync(outputPath, 'utf8'), new RegExp(`line_sha=${result.graph.v}`));
+
+      const resumeGithub = new FakeGitHub(result.graph);
+      await assert.rejects(
+        runConflictRecovery({
+          mode: 'resume',
+          git: new Git(gitOptions(f)),
+          source: f.source,
+          github: resumeGithub,
+        }),
+        /Fixed recovery backup .* expected complete H/,
+      );
+      assert.equal(resumeGithub.listCalls.length, 0);
+      assert.equal(resumeGithub.createCalls.length, 0);
+    } finally {
+      f.cleanup();
+      rmSync(evidenceRoot, { recursive: true, force: true });
+    }
   }
 });
 
@@ -646,8 +802,8 @@ test('closed, duplicate, protected, aliased, and immutable-field PR history fail
     const closed = { ...pullFor(injected.graph, input, 100), state: 'closed' };
     let createCalls = 0;
     const history = (pulls) => ({
-      async listPullRequestHistory() {
-        return structuredClone(pulls);
+      async listPullRequestHistoryPage({ page }) {
+        return page === 1 ? structuredClone(pulls) : [];
       },
       async createPullRequest() {
         createCalls += 1;
@@ -689,6 +845,12 @@ test('closed, duplicate, protected, aliased, and immutable-field PR history fail
       { field: 'head repo', pull: { ...open, head: { ...open.head, repo: { full_name: 'other/repo' } } }, error: /head is not the same/ },
       { field: 'draft', pull: { ...open, draft: false }, error: /not one open draft/ },
       { field: 'state', pull: { ...open, state: 'closed' }, error: /not one open draft/ },
+      { field: 'merged boolean', pull: { ...open, merged: true }, error: /contradictory merged state/ },
+      {
+        field: 'merged timestamp',
+        pull: { ...open, merged_at: '2026-07-15T15:00:00Z' },
+        error: /contradictory merged state/,
+      },
     ];
     for (const drift of immutableDrift) {
       await assert.rejects(
@@ -707,6 +869,126 @@ test('closed, duplicate, protected, aliased, and immutable-field PR history fail
   }
 });
 
+test('wrong or disappearing PR-attempt markers fail closed without a second POST', async () => {
+  {
+    const f = fixture();
+    try {
+      const git = new Git(gitOptions(f));
+      const injected = await runConflictRecovery({ mode: 'inject-after-force', git, source: f.source });
+      command(f.runner, ['push', '--force', f.remote, `${injected.graph.m}:${conflictRef('pr-attempt')}`]);
+      const github = new FakeGitHub(injected.graph);
+      await assert.rejects(
+        runConflictRecovery({ mode: 'resume', git, source: f.source, github }),
+        /PR-attempt marker .* expected exact V/,
+      );
+      assert.equal(github.listCalls.length, 0);
+      assert.equal(github.createCalls.length, 0);
+    } finally {
+      f.cleanup();
+    }
+  }
+
+  {
+    const f = fixture();
+    try {
+      const git = new Git(gitOptions(f));
+      const injected = await runConflictRecovery({ mode: 'inject-after-force', git, source: f.source });
+      const github = {
+        listCalls: 0,
+        createCalls: 0,
+        async listPullRequestHistoryPage() {
+          this.listCalls += 1;
+          return [];
+        },
+        async createPullRequest(input) {
+          this.createCalls += 1;
+          command(f.runner, ['push', '--force', f.remote, `:${conflictRef('pr-attempt')}`]);
+          return pullFor(injected.graph, input);
+        },
+        async waitForRetry() {},
+      };
+      await assert.rejects(
+        runConflictRecovery({ mode: 'resume', git, source: f.source, github }),
+        /PR-attempt marker .* absent, expected exact V/,
+      );
+      assert.equal(github.createCalls, 1);
+      assert.equal(remoteRef(f, conflictRef('pr-attempt')), null);
+      assert.equal(remoteRef(f, injected.lineRef), injected.graph.v);
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test('all-state history pagination reaches page 2 and rejects later closed duplicates without POST', async () => {
+  const f = fixture();
+  try {
+    const git = new Git(gitOptions(f));
+    const injected = await runConflictRecovery({ mode: 'inject-after-force', git, source: f.source });
+    const input = {
+      title: 'Recover conflict calibration work after 1.0.1',
+      body: recoveryPullRequestBody(injected.graph),
+      base: 'calibration/g1/conflict-recovery/line',
+      head: 'calibration/g1/conflict-recovery/backup',
+      draft: true,
+    };
+    const firstPage = Array.from({ length: 100 }, (_, index) =>
+      pullFor(injected.graph, input, 1000 + index),
+    );
+    const laterClosed = { ...pullFor(injected.graph, input, 2000), state: 'closed' };
+    const github = {
+      calls: [],
+      createCalls: 0,
+      async listPullRequestHistoryPage(query) {
+        this.calls.push(query);
+        if (query.page === 1) return structuredClone(firstPage);
+        if (query.page === 2) return [structuredClone(laterClosed)];
+        return [];
+      },
+      async createPullRequest() {
+        this.createCalls += 1;
+        throw new Error('pagination history must prevent POST');
+      },
+    };
+    await assert.rejects(
+      runConflictRecovery({ mode: 'resume', git, source: f.source, github }),
+      /More than one historical recovery PR/,
+    );
+    assert.deepEqual(
+      github.calls.map((call) => call.page),
+      [1, 2],
+    );
+    assert.ok(
+      github.calls.every(
+        (call) =>
+          call.base === 'calibration/g1/conflict-recovery/line' &&
+          call.head === 'fablebookjs:calibration/g1/conflict-recovery/backup',
+      ),
+    );
+    assert.equal(github.createCalls, 0);
+
+    const endless = {
+      pages: [],
+      createCalls: 0,
+      async listPullRequestHistoryPage(query) {
+        this.pages.push(query.page);
+        return structuredClone(firstPage);
+      },
+      async createPullRequest() {
+        this.createCalls += 1;
+      },
+    };
+    await assert.rejects(
+      runConflictRecovery({ mode: 'resume', git, source: f.source, github: endless }),
+      /history exceeded the fixed 10-page limit/,
+    );
+    assert.deepEqual(endless.pages, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert.equal(endless.createCalls, 0);
+  } finally {
+    f.cleanup();
+  }
+});
+
 test('post-create history retries are bounded, delayed visibility converges, and permanent absence fails', async () => {
   const f = fixture();
   try {
@@ -716,7 +998,7 @@ test('post-create history retries are bounded, delayed visibility converges, and
       historyCalls: 0,
       waits: [],
       pull: null,
-      async listPullRequestHistory() {
+      async listPullRequestHistoryPage() {
         this.historyCalls += 1;
         return this.pull && this.historyCalls >= 4 ? [structuredClone(this.pull)] : [];
       },
@@ -733,10 +1015,12 @@ test('post-create history retries are bounded, delayed visibility converges, and
     assert.equal(delayed.historyCalls, 4);
     assert.deepEqual(delayed.waits, [100, 200]);
 
+    command(f.runner, ['push', '--force', f.remote, `:${conflictRef('pr-attempt')}`]);
+
     const absent = {
       historyCalls: 0,
       waits: [],
-      async listPullRequestHistory() {
+      async listPullRequestHistoryPage() {
         this.historyCalls += 1;
         return [];
       },
@@ -758,7 +1042,7 @@ test('post-create history retries are bounded, delayed visibility converges, and
   }
 });
 
-test('a lost-success PR creation is reused on rerun and all history queries use state=all', async () => {
+test('ambiguous PR creation never POSTs twice while visibility remains stale, then reuses later', async () => {
   const f = fixture();
   try {
     const git = new Git(gitOptions(f));
@@ -766,19 +1050,27 @@ test('a lost-success PR creation is reused on rerun and all history queries use 
     const github = {
       pulls: [],
       createCalls: 0,
-      async listPullRequestHistory() {
-        return structuredClone(this.pulls);
+      visible: false,
+      async listPullRequestHistoryPage() {
+        return this.visible ? structuredClone(this.pulls) : [];
       },
       async createPullRequest(input) {
         this.createCalls += 1;
         this.pulls = [pullFor(injected.graph, input)];
         throw new Error('connection lost after GitHub created the PR');
       },
+      async waitForRetry() {},
     };
     await assert.rejects(
       runConflictRecovery({ mode: 'resume', git, source: f.source, github }),
-      /connection lost after GitHub created the PR/,
+      /POST was ambiguous and no canonical PR became visible/,
     );
+    await assert.rejects(
+      runConflictRecovery({ mode: 'resume', git, source: f.source, github }),
+      /marker exists but no matching PR is visible/,
+    );
+    assert.equal(github.createCalls, 1);
+    github.visible = true;
     const rerun = await runConflictRecovery({ mode: 'resume', git, source: f.source, github });
     assert.equal(rerun.outcome, 'recovery-pr-reused');
     assert.equal(rerun.pullRequest.number, 101);
@@ -786,15 +1078,18 @@ test('a lost-success PR creation is reused on rerun and all history queries use 
 
     const requestProbe = Object.create(GitHub.prototype);
     requestProbe.request = async (path) => path;
-    const path = await requestProbe.listPullRequestHistory({ base: 'base', head: 'owner:head' });
+    const path = await requestProbe.listPullRequestHistoryPage({ base: 'base', head: 'owner:head', page: 2 });
     assert.match(path, /state=all/);
     assert.doesNotMatch(path, /state=open/);
+    assert.match(path, /base=base/);
+    assert.match(path, /head=owner%3Ahead/);
+    assert.match(path, /page=2/);
   } finally {
     f.cleanup();
   }
 });
 
-test('all Git write helpers reject every ref outside the seven exact names before invoking Git', () => {
+test('all Git write helpers reject every ref outside the eight exact names before invoking Git', () => {
   let calls = 0;
   const git = {
     run() {
@@ -941,6 +1236,39 @@ test('hostile Git environment, pushurl, and URL rewrites fail before push while 
   }
 });
 
+test('attacker-controlled GIT_EXEC_PATH fails before any Git subprocess or destination write', async () => {
+  const f = fixture();
+  const previous = process.env.GIT_EXEC_PATH;
+  let git;
+  try {
+    class CountingGit extends Git {
+      calls = 0;
+
+      run(args, options) {
+        this.calls += 1;
+        return super.run(args, options);
+      }
+    }
+
+    process.env.GIT_EXEC_PATH = join(f.root, 'attacker-controlled-git-helpers');
+    git = new CountingGit(gitOptions(f));
+    await assert.rejects(
+      runConflictRecovery({ mode: 'inject-after-force', git, source: f.source }),
+      /Hostile inherited Git environment: GIT_EXEC_PATH/,
+    );
+    assert.equal(git.calls, 0);
+  } finally {
+    if (previous === undefined) delete process.env.GIT_EXEC_PATH;
+    else process.env.GIT_EXEC_PATH = previous;
+  }
+  try {
+    assert.equal(git.calls, 0);
+    assert.equal(remoteRef(f, conflictRef('source')), null);
+  } finally {
+    f.cleanup();
+  }
+});
+
 test('intentional failure writes structured evidence and job summary before returning nonzero', async () => {
   const f = fixture();
   const evidenceRoot = mkdtempSync(join(tmpdir(), 'lab-01-conflict-evidence-'));
@@ -992,6 +1320,18 @@ test('workflow is manual, trusted-main-only, fixed-concurrency, and minimally pe
   assert.throws(() =>
     assertExactWorkflowAuthority(workflow.replace('  timeout-minutes: 10', '  timeout-minutes: 10\n    permissions:\n      contents: write')),
   );
+  assert.throws(() =>
+    assertExactWorkflowAuthority(workflow.replace('  timeout-minutes: 10', '  timeout-minutes: 10\n    permissions: read-all')),
+  );
+  assert.throws(() =>
+    assertExactWorkflowAuthority(workflow.replace('  timeout-minutes: 10', '  timeout-minutes: 10\n    permissions: { statuses: write }')),
+  );
+  assert.throws(() =>
+    assertExactWorkflowAuthority(workflow.replace('  timeout-minutes: 10', '  timeout-minutes: 10\n    "permissions": read-all')),
+  );
+  assert.throws(() =>
+    assertExactWorkflowAuthority(workflow.replace('workflow_dispatch:', 'workflow_dispatch:\n  schedule:\n    - cron: "0 0 * * *"')),
+  );
   assert.match(workflow, /group: calibration-g1-conflict-recovery\n/);
   assert.match(workflow, /test "\$GITHUB_REF" = "refs\/heads\/main"/);
   assert.match(workflow, /actions\/checkout@v7/);
@@ -999,6 +1339,9 @@ test('workflow is manual, trusted-main-only, fixed-concurrency, and minimally pe
   assert.match(workflow, /ref: \$\{\{ github\.sha \}\}/);
   assert.match(workflow, /continue-on-error: true/);
   assert.match(workflow, /steps\.calibrate\.outputs\.failure_point/);
+  assert.match(workflow, /steps\.calibrate\.outputs\.expected_backup_sha/);
+  assert.match(workflow, /steps\.calibrate\.outputs\.backup_verified/);
+  assert.match(workflow, /test "\$BACKUP_SHA" = "\$EXPECTED_BACKUP_SHA"/);
   assert.match(workflow, /exit 1/);
   assert.doesNotMatch(workflow, /issues:|packages:|actions:|id-token:|secrets\.GITHUB_TOKEN/);
   assert.doesNotMatch(workflow, /releases\/v1\.0|staged\/v1\.0/);

@@ -52,13 +52,21 @@ jobs:
           STEP_OUTCOME: ${{ steps.calibrate.outcome }}
           FAILURE_POINT: ${{ steps.calibrate.outputs.failure_point }}
           BACKUP_SHA: ${{ steps.calibrate.outputs.backup_sha }}
+          EXPECTED_BACKUP_SHA: ${{ steps.calibrate.outputs.expected_backup_sha }}
+          BACKUP_VERIFIED: ${{ steps.calibrate.outputs.backup_verified }}
           LINE_SHA: ${{ steps.calibrate.outputs.line_sha }}
         run: |
           if test "$MODE" = "inject-after-force"; then
             test "$STEP_OUTCOME" = "failure"
             test "$FAILURE_POINT" = "after-durable-force-before-pr"
             test -n "$BACKUP_SHA"
+            test -n "$EXPECTED_BACKUP_SHA"
             test -n "$LINE_SHA"
+            if test "$BACKUP_VERIFIED" = "true"; then
+              test "$BACKUP_SHA" = "$EXPECTED_BACKUP_SHA"
+            else
+              test "$BACKUP_VERIFIED" = "false"
+            fi
             echo "Intentional failure retained after durable force and before PR creation" >&2
             exit 1
           fi

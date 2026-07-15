@@ -10,7 +10,7 @@ export const FILE_PATH = 'calibration/g1/conflict-recovery/recovery.txt';
 export const MODES = ['inject-after-force', 'resume'];
 export const INTENTIONAL_FAILURE_EXIT_CODE = 78;
 
-const ROLES = ['source', 'intent', 'm', 'v', 'h', 'backup', 'line'];
+const ROLES = ['source', 'intent', 'm', 'v', 'h', 'backup', 'line', 'pr-attempt'];
 const FIXED_GRAPH_ROLES = ['source', 'intent', 'm', 'v', 'h'];
 const REF_SET = new Set(ROLES.map((role) => `${NAMESPACE}/${role}`));
 const PR_TITLE = 'Recover conflict calibration work after 1.0.1';
@@ -20,6 +20,8 @@ const LIVE_REMOTE_URLS = [
 ];
 const POST_CREATE_HISTORY_ATTEMPTS = 4;
 const POST_CREATE_RETRY_MS = 100;
+const MAX_HISTORY_PAGES = 10;
+const HISTORY_PAGE_SIZE = 100;
 
 const HOSTILE_GIT_ENVIRONMENT = [
   /^GIT_ALTERNATE_OBJECT_DIRECTORIES$/,
@@ -35,6 +37,7 @@ const HOSTILE_GIT_ENVIRONMENT = [
   /^GIT_CONFIG_VALUE_\d+$/,
   /^GIT_DIR$/,
   /^GIT_DISCOVERY_ACROSS_FILESYSTEM$/,
+  /^GIT_EXEC_PATH$/,
   /^GIT_GRAFT_FILE$/,
   /^GIT_INDEX_FILE$/,
   /^GIT_NAMESPACE$/,
@@ -58,6 +61,7 @@ export class Git {
     this.cwd = cwd;
     this.remote = remote;
     this.acceptedRemoteUrls = new Set(acceptedRemoteUrls);
+    this.trustedSource = null;
   }
 
   run(args, { env = {}, input, allowFailure = false } = {}) {
@@ -91,6 +95,40 @@ export class Git {
     );
   }
 
+  remoteMain() {
+    const ref = 'refs/heads/main';
+    const output = this.text(['ls-remote', '--heads', 'origin', ref]);
+    const lines = output.split('\n').filter(Boolean);
+    if (lines.length !== 1) throw new Error(`Expected one remote ${ref} value, observed ${lines.length}`);
+    const [sha, observedRef] = lines[0].split(/\s+/);
+    if (observedRef !== ref || !/^[0-9a-f]{40}$/.test(sha)) {
+      throw new Error(`Malformed remote ${ref} value`);
+    }
+    return sha;
+  }
+
+  bindTrustedSource(source) {
+    assertSha(source);
+    this.trustedSource = source;
+    this.assertTrustedSource();
+  }
+
+  assertTrustedSource() {
+    if (this.trustedSource === null) throw new Error('Trusted source has not been bound');
+    if (process.env.GITHUB_ACTIONS === 'true' && process.env.GITHUB_SHA !== this.trustedSource) {
+      throw new Error(`GITHUB_SHA ${process.env.GITHUB_SHA} is not trusted source ${this.trustedSource}`);
+    }
+    const localHead = this.text(['rev-parse', 'HEAD']);
+    if (localHead !== this.trustedSource) {
+      throw new Error(`Local HEAD ${localHead} is not trusted source ${this.trustedSource}`);
+    }
+    const remote = this.remoteMain();
+    if (remote !== this.trustedSource) {
+      throw new Error(`Remote refs/heads/main ${remote} is not trusted source ${this.trustedSource}`);
+    }
+    return this.trustedSource;
+  }
+
   assertTrustedPushDestination() {
     const hostile = this.hostileEnvironmentKeys();
     if (hostile.length > 0) {
@@ -120,6 +158,7 @@ export class Git {
     if (effectivePushUrls.length !== 1 || !this.acceptedRemoteUrls.has(effectivePushUrls[0])) {
       throw new Error(`Untrusted effective origin push URL(s): ${effectivePushUrls.join(', ') || 'none'}`);
     }
+    if (this.trustedSource !== null) this.assertTrustedSource();
     return { fetchUrl: fetchUrls[0], pushUrl: effectivePushUrls[0] };
   }
 }
@@ -155,8 +194,14 @@ export class GitHub {
     return payload;
   }
 
-  listPullRequestHistory({ base, head }) {
-    const query = new URLSearchParams({ state: 'all', base, head, per_page: '100' });
+  listPullRequestHistoryPage({ base, head, page }) {
+    const query = new URLSearchParams({
+      state: 'all',
+      base,
+      head,
+      per_page: String(HISTORY_PAGE_SIZE),
+      page: String(page),
+    });
     return this.request(`/pulls?${query}`);
   }
 
@@ -391,24 +436,34 @@ function ensureOrRequireBackup(git, graph, { createIfAbsent }) {
 }
 
 function verifyRemoteBackup(git, graph) {
+  const observation = observeRemoteBackup(git, graph);
+  if (!observation.backupVerified) {
+    throw new Error(
+      `Remote recovery backup is ${observation.remoteBackup ?? 'absent'}, expected ${graph.h}`,
+    );
+  }
+  return observation;
+}
+
+function observeRemoteBackup(git, graph) {
   const backupRef = conflictRef('backup');
   const remoteBackup = remoteHead(git, backupRef);
-  if (remoteBackup !== graph.h) throw new Error(`Remote recovery backup is ${remoteBackup}, expected ${graph.h}`);
   const lateCommits = [graph.h];
-  for (const late of lateCommits) {
-    const reachable = git.run(['merge-base', '--is-ancestor', late, remoteBackup], { allowFailure: true });
-    if (reachable.status !== 0) {
-      throw new Error(`Late commit ${late} is not reachable from remote-backed H ${remoteBackup}`);
+  let backupVerified = remoteBackup === graph.h;
+  if (backupVerified) {
+    for (const late of lateCommits) {
+      const reachable = git.run(['merge-base', '--is-ancestor', late, remoteBackup], { allowFailure: true });
+      if (reachable.status !== 0) backupVerified = false;
     }
   }
-  return { remoteBackup, lateCommits };
+  return { remoteBackup, lateCommits, backupVerified };
 }
 
 function forceLineToSnapshot(git, graph) {
   const lineRef = conflictRef('line');
   const observed = remoteHead(git, lineRef);
   if (observed === graph.v) {
-    const backup = verifyRemoteBackup(git, graph);
+    const backup = observeRemoteBackup(git, graph);
     return { result: 'reused-release-snapshot', finalHead: graph.v, backup };
   }
   if (observed !== graph.h) {
@@ -417,13 +472,14 @@ function forceLineToSnapshot(git, graph) {
   verifyRemoteBackup(git, graph);
   const push = pushAtomicRecovery(git, graph);
   if (push.status !== 0) {
-    const observedBackup = remoteHead(git, conflictRef('backup'));
+    const backup = observeRemoteBackup(git, graph);
+    const observedBackup = backup.remoteBackup;
     const observedLine = remoteHead(git, lineRef);
-    if (observedBackup === graph.h && observedLine === graph.v) {
+    if (observedLine === graph.v) {
       return {
         result: 'forced-h-to-v-lost-success',
         finalHead: observedLine,
-        backup: verifyRemoteBackup(git, graph),
+        backup,
       };
     }
     if (
@@ -440,7 +496,7 @@ function forceLineToSnapshot(git, graph) {
   }
   const finalHead = remoteHead(git, lineRef);
   if (finalHead !== graph.v) throw new Error(`Remote line ${finalHead} is not exact V ${graph.v}`);
-  const backup = verifyRemoteBackup(git, graph);
+  const backup = observeRemoteBackup(git, graph);
   return { result: 'forced-h-to-v', finalHead, backup };
 }
 
@@ -471,6 +527,7 @@ function verifyRecoveryPullRequest(pr, graph, { requireEditableFields = false } 
   const canonicalUrl = `https://github.com/${REPOSITORY}/pull/${pr.number}`;
   if (pr.html_url !== canonicalUrl) throw new Error(`Recovery PR URL is not canonical for #${pr.number}`);
   if (pr.state !== 'open' || pr.draft !== true) throw new Error('Recovery PR is not one open draft');
+  if (pr.merged === true || pr.merged_at != null) throw new Error('Recovery PR has contradictory merged state');
   if (requireEditableFields && (pr.title !== PR_TITLE || pr.body !== recoveryPullRequestBody(graph))) {
     throw new Error('Created recovery PR title or body does not match the fixed payload');
   }
@@ -483,30 +540,53 @@ function verifyRecoveryPullRequest(pr, graph, { requireEditableFields = false } 
   return pr;
 }
 
-async function ensureRecoveryPullRequest(github, graph) {
-  if (!github) throw new Error('A GitHub client is required only for resume mode');
-  const base = conflictRef('line').replace('refs/heads/', '');
-  const head = conflictRef('backup').replace('refs/heads/', '');
-  const qualifiedHead = `fablebookjs:${head}`;
-  let pulls = await github.listPullRequestHistory({ base, head: qualifiedHead });
-  if (!Array.isArray(pulls)) throw new Error('GitHub did not return a pull request list');
-  if (pulls.length > 1) throw new Error('More than one historical recovery PR exists for the fixed refs');
-  if (pulls.length === 1) {
-    return { action: 'reused', pull: verifyRecoveryPullRequest(pulls[0], graph) };
+function verifyPrAttemptMarker(git, graph) {
+  const ref = conflictRef('pr-attempt');
+  const observed = remoteHead(git, ref);
+  if (observed !== graph.v) {
+    throw new Error(`Recovery PR-attempt marker ${ref} is ${observed ?? 'absent'}, expected exact V ${graph.v}`);
   }
+  return observed;
+}
 
-  const created = await github.createPullRequest({
-    title: PR_TITLE,
-    body: recoveryPullRequestBody(graph),
-    base,
-    head,
-    draft: true,
-  });
-  verifyRecoveryPullRequest(created, graph, { requireEditableFields: true });
+function ensurePrAttemptMarker(git, graph) {
+  const ref = conflictRef('pr-attempt');
+  const observed = remoteHead(git, ref);
+  if (observed === graph.v) return { created: false, sha: graph.v };
+  if (observed !== null) {
+    throw new Error(`Recovery PR-attempt marker ${ref} is ${observed}, expected exact V ${graph.v}`);
+  }
+  const result = ensureFixedRef(git, ref, graph.v);
+  verifyPrAttemptMarker(git, graph);
+  return { created: result === 'created', sha: graph.v, result };
+}
+
+async function listCompletePullRequestHistory(github, git, graph, { base, head }) {
+  const pulls = [];
+  for (let page = 1; page <= MAX_HISTORY_PAGES; page += 1) {
+    git.assertTrustedSource();
+    verifyPrAttemptMarker(git, graph);
+    const values = await github.listPullRequestHistoryPage({ base, head, page });
+    git.assertTrustedSource();
+    verifyPrAttemptMarker(git, graph);
+    if (!Array.isArray(values)) throw new Error('GitHub did not return a pull request history page');
+    if (values.length > HISTORY_PAGE_SIZE) throw new Error(`GitHub history page ${page} exceeded its fixed size`);
+    pulls.push(...values);
+    if (values.length < HISTORY_PAGE_SIZE) return pulls;
+  }
+  throw new Error(`Recovery PR history exceeded the fixed ${MAX_HISTORY_PAGES}-page limit`);
+}
+
+function selectRecoveryPullRequest(pulls, graph) {
+  if (pulls.length > 1) throw new Error('More than one historical recovery PR exists for the fixed refs');
+  return pulls.length === 1 ? verifyRecoveryPullRequest(pulls[0], graph) : null;
+}
+
+async function pollRecoveryPullRequestHistory(github, git, graph, query) {
+  let pulls = [];
   for (let attempt = 1; attempt <= POST_CREATE_HISTORY_ATTEMPTS; attempt += 1) {
-    pulls = await github.listPullRequestHistory({ base, head: qualifiedHead });
-    if (!Array.isArray(pulls)) throw new Error('GitHub did not return a pull request list');
-    if (pulls.length > 0) break;
+    pulls = await listCompletePullRequestHistory(github, git, graph, query);
+    if (pulls.length > 0) return pulls;
     if (attempt < POST_CREATE_HISTORY_ATTEMPTS) {
       const wait =
         github.waitForRetry?.bind(github) ??
@@ -514,10 +594,53 @@ async function ensureRecoveryPullRequest(github, graph) {
       await wait(POST_CREATE_RETRY_MS * attempt);
     }
   }
-  if (pulls.length !== 1) {
+  return pulls;
+}
+
+async function ensureRecoveryPullRequest(github, git, graph) {
+  if (!github) throw new Error('A GitHub client is required only for resume mode');
+  const base = conflictRef('line').replace('refs/heads/', '');
+  const head = conflictRef('backup').replace('refs/heads/', '');
+  const qualifiedHead = `fablebookjs:${head}`;
+  const query = { base, head: qualifiedHead };
+  git.assertTrustedSource();
+  const marker = ensurePrAttemptMarker(git, graph);
+  let pulls = marker.created
+    ? await listCompletePullRequestHistory(github, git, graph, query)
+    : await pollRecoveryPullRequestHistory(github, git, graph, query);
+  const existing = selectRecoveryPullRequest(pulls, graph);
+  if (existing) return { action: 'reused', pull: existing };
+  if (!marker.created) {
+    throw new Error('Recovery PR-attempt marker exists but no matching PR is visible; refusing another POST');
+  }
+
+  let created;
+  try {
+    git.assertTrustedSource();
+    verifyPrAttemptMarker(git, graph);
+    created = await github.createPullRequest({
+      title: PR_TITLE,
+      body: recoveryPullRequestBody(graph),
+      base,
+      head,
+      draft: true,
+    });
+    git.assertTrustedSource();
+    verifyPrAttemptMarker(git, graph);
+  } catch (error) {
+    pulls = await pollRecoveryPullRequestHistory(github, git, graph, query);
+    const recovered = selectRecoveryPullRequest(pulls, graph);
+    if (recovered) return { action: 'reused-after-ambiguous-create', pull: recovered };
+    throw new Error(`Recovery PR POST was ambiguous and no canonical PR became visible: ${error.message}`, {
+      cause: error,
+    });
+  }
+  verifyRecoveryPullRequest(created, graph, { requireEditableFields: true });
+  pulls = await pollRecoveryPullRequestHistory(github, git, graph, query);
+  if (pulls.length === 0) {
     throw new Error('Recovery PR creation did not converge to exactly one all-state historical PR');
   }
-  const verified = verifyRecoveryPullRequest(pulls[0], graph);
+  const verified = selectRecoveryPullRequest(pulls, graph);
   if (verified.number !== created.number) throw new Error('Recovery PR identity changed after creation');
   return { action: 'created', pull: verified };
 }
@@ -526,12 +649,13 @@ export async function runConflictRecovery({ mode, git = new Git(), source, githu
   assertMode(mode);
   assertSha(source);
   git.assertTrustedPushDestination();
+  git.bindTrustedSource(source);
   const prepared = prepareFixedGraph(git, source);
   const createEvidenceRefs = mode === 'inject-after-force';
   const line = requireCompatibleLine(git, prepared.graph, { createIfAbsent: createEvidenceRefs });
   const backup = ensureOrRequireBackup(git, prepared.graph, { createIfAbsent: createEvidenceRefs });
   const forced = forceLineToSnapshot(git, prepared.graph);
-  const finalBackup = verifyRemoteBackup(git, prepared.graph);
+  const finalBackup = observeRemoteBackup(git, prepared.graph);
 
   const result = {
     mode,
@@ -545,8 +669,25 @@ export async function runConflictRecovery({ mode, git = new Git(), source, githu
     backupRef: conflictRef('backup'),
     backupResult: backup.result,
     remoteBackup: finalBackup.remoteBackup,
+    backupVerified: finalBackup.backupVerified,
     lateCommits: finalBackup.lateCommits,
+    safetyFailure: finalBackup.backupVerified ? null : 'remote-backup-is-not-exact-complete-h',
   };
+
+  if (!finalBackup.backupVerified) {
+    if (mode !== 'inject-after-force' || forced.finalHead !== prepared.graph.v) {
+      throw new Error(
+        `Remote recovery backup is ${finalBackup.remoteBackup ?? 'absent'}, expected ${prepared.graph.h}`,
+      );
+    }
+    return {
+      ...result,
+      outcome: 'safety-failure-after-durable-force-before-pr',
+      intentionalFailure: true,
+      failurePoint: 'after-durable-force-before-pr',
+      pullRequest: null,
+    };
+  }
 
   if (mode === 'inject-after-force') {
     return {
@@ -558,7 +699,8 @@ export async function runConflictRecovery({ mode, git = new Git(), source, githu
     };
   }
 
-  const pr = await ensureRecoveryPullRequest(github, prepared.graph);
+  git.assertTrustedSource();
+  const pr = await ensureRecoveryPullRequest(github, git, prepared.graph);
   return {
     ...result,
     outcome: pr.action === 'created' ? 'recovery-pr-created' : 'recovery-pr-reused',
@@ -585,9 +727,12 @@ export function buildSummary(result) {
     `- Mode: \`${result.mode}\`\n` +
     `- Outcome: \`${result.outcome}\`\n` +
     `- Intentional failure point: \`${result.failurePoint ?? 'none'}\`\n` +
-    `- Remote backup: \`${result.backupRef}\` = \`${result.remoteBackup}\`\n` +
+    `- Observed remote backup: \`${result.backupRef}\` = \`${result.remoteBackup ?? 'absent'}\`\n` +
+    `- Backup verified as exact complete H: \`${result.backupVerified}\`\n` +
+    `- Safety failure: \`${result.safetyFailure ?? 'none'}\`\n` +
     `- Final calibration line: \`${result.lineRef}\` = \`${result.finalLine}\`\n` +
-    `- Excluded late SHA(s), all reachable from remote backup: ${result.lateCommits.map((sha) => `\`${sha}\``).join(', ')}\n` +
+    `- Expected excluded late SHA(s): ${result.lateCommits.map((sha) => `\`${sha}\``).join(', ')}\n` +
+    `- Late SHA reachability verified from backup: \`${result.backupVerified}\`\n` +
     `- Proven conflict: \`${result.conflict.kind}\` at \`${result.conflict.path}\`\n` +
     `- Event: \`${process.env.GITHUB_EVENT_NAME}\`\n` +
     `- Actor: \`${process.env.GITHUB_ACTOR}\`\n` +
@@ -614,7 +759,9 @@ export function finalizeResult(
       `evidence<<CONFLICT_RECOVERY_EVIDENCE\n${json}\nCONFLICT_RECOVERY_EVIDENCE\n` +
         `failure_point=${result.failurePoint ?? ''}\n` +
         `backup_ref=${result.backupRef}\n` +
-        `backup_sha=${result.remoteBackup}\n` +
+        `backup_sha=${result.remoteBackup ?? 'absent'}\n` +
+        `expected_backup_sha=${result.graph.h}\n` +
+        `backup_verified=${result.backupVerified}\n` +
         `line_ref=${result.lineRef}\n` +
         `line_sha=${result.finalLine}\n` +
         `pr_number=${result.pullRequest?.number ?? ''}\n`,
