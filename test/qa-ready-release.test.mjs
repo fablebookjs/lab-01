@@ -363,6 +363,9 @@ test('workflow materializes staged authority through checkout without an anonymo
   assert.match(workflow, /base\.ref == 'releases\/v1\.0'/);
   assert.match(workflow, /--authority github-current/);
   assert.match(workflow, /GITHUB_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.doesNotMatch(workflow, /- synchronize/);
+  assert.match(workflow, /ready-release-qa-.*github\.sha/);
+  assert.match(workflow, /uses: actions\/upload-artifact@v6/);
   assert.doesNotMatch(workflow, /git fetch|staged_sha:|source_sha:/);
 });
 

@@ -120,18 +120,22 @@ persist checkout credentials, and performs no GitHub or public npm write. All wo
 storage, generated credentials/configuration, packages, and consumer files are
 temporary; only sanitized evidence is retained.
 
-## Not yet live or implemented
+## Live QA and remaining gate
 
-Ready-state exact-version QA is implemented and tested locally. Automatic
-`ready_for_review` and `synchronize` QA becomes live when this workflow is
-integrated into the PR base, `releases/v1.0`; it has not yet produced
-GitHub-current evidence. Its manual `workflow_dispatch` recovery trigger still
-requires the workflow on the default branch.
+Ready-state exact-version QA is live. A human `ready_for_review` event runs it
+for that exact staged head. A staged update made with the built-in token creates
+an approval-required synchronize run, so release-PR maintenance explicitly
+dispatches the fixed `ready-release-qa.yml` workflow at `staged/v1.0` after the
+new head and PR body converge. `workflow_dispatch` is the documented GitHub
+exception that creates a run from a built-in-token request. The first
+GitHub-current proof is
+[run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684);
+every refreshed ready head needs its own successful proof.
 
-Close-and-regenerate is also implemented and tested locally, but its
-`pull_request_target` workflow must be installed on the default branch and its
-write authority calibrated before closing the current PR. Do not close the PR
-for a lifecycle demonstration until that controlled installation is complete.
+Close-and-regenerate is installed on the default branch. The current remaining
+gate is organization policy: Fablebook must allow Actions-created PRs before
+the built-in token can create a replacement. Do not close the release PR for
+that demonstration until this setting is enabled and read back.
 
 Public package publication, branch reconciliation, tagging `v1.0.1`, and
 creating a GitHub Release are intentionally **NOT YET IMPLEMENTED**. This slice
