@@ -88,11 +88,13 @@ class RecordingGit extends Git {
     super(options);
     this.pushes = [];
     this.advertisements = [];
+    this.networkEnvironments = [];
   }
 
   run(args, options) {
     if (args[0] === 'push') this.pushes.push([...args]);
     if (args[0] === 'ls-remote') this.advertisements.push([...args]);
+    if (options?.network) this.networkEnvironments.push(this.controlledNetworkEnvironment());
     return super.run(args, options);
   }
 }
@@ -168,12 +170,12 @@ const EXPECTED_STATE_WORKFLOW = {
         {
           name: 'Check out trusted main code',
           uses: 'actions/checkout@v7',
-          with: { 'fetch-depth': 0, 'persist-credentials': true, ref: '${{ github.sha }}' },
+          with: { 'fetch-depth': 0, 'persist-credentials': false, ref: '${{ github.sha }}' },
         },
         {
           name: 'Maintain the fixed required-check graph',
           run: 'node scripts/calibrate-required-check-state.mjs --mode "$MODE"',
-          env: { MODE: '${{ inputs.mode }}' },
+          env: { MODE: '${{ inputs.mode }}', GITHUB_TOKEN: '${{ github.token }}' },
         },
       ],
     },
@@ -579,6 +581,7 @@ test('hostile Git environment and every local transport or credential override f
       ['http.sslCAInfo', join(f.root, 'attacker-ca.pem')],
       ['http.sslCert', join(f.root, 'attacker-cert.pem')],
       ['http.lowSpeedLimit', '1'],
+      ['http.https://github.com/.extraheader', 'AUTHORIZATION: basic inherited'],
       ['credential.helper', `!touch ${join(f.root, 'credential-helper-ran')}`],
       ['remote.origin.proxy', 'http://127.0.0.1:9'],
       ['remote.origin.uploadpack', join(f.root, 'attacker-upload-pack')],
@@ -605,19 +608,6 @@ test('hostile Git environment and every local transport or credential override f
     }
     assert.equal(existsSync(join(f.root, 'credential-helper-ran')), false);
 
-    command(f.runner, ['config', 'http.https://github.com/.extraheader', 'AUTHORIZATION: basic first']);
-    command(f.runner, [
-      'config',
-      'http.https://github.com/fablebookjs/lab-01.extraheader',
-      'AUTHORIZATION: basic second',
-    ]);
-    const duplicateAuth = new RecordingGit(gitOptions(f));
-    assert.throws(
-      () => runStateCalibration({ mode: 'setup', git: duplicateAuth, source: f.source }),
-      /Only one scoped checkout authentication entry is allowed/,
-    );
-    assert.equal(duplicateAuth.advertisements.length, 0);
-    assert.equal(duplicateAuth.pushes.length, 0);
   } finally {
     f.cleanup();
   }
@@ -696,19 +686,101 @@ test('global config is isolated and system or command-scope config overrides are
   }
 });
 
-test('push.followTags cannot escape the namespace and checkout auth remains intact', () => {
+test('live state mutation requires GITHUB_TOKEN before any advertisement or write', () => {
   const f = fixture();
   try {
-    command(f.runner, ['config', 'http.https://github.com/.extraheader', 'AUTHORIZATION: basic retained']);
+    const git = new RecordingGit({
+      ...gitOptions(f),
+      liveNetworkWrite: true,
+      token: undefined,
+    });
+    assert.throws(
+      () => runStateCalibration({ mode: 'setup', git, source: f.source }),
+      /GITHUB_TOKEN is required for live calibration writes/,
+    );
+    assert.equal(git.advertisements.length, 0);
+    assert.equal(git.pushes.length, 0);
+    assert.equal(remoteRef(f, calibrationRef('base')), null);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('checkout-v7 includeIf remains rejected, then controlled live auth succeeds without token leakage', () => {
+  const f = fixture();
+  const includePath = join(f.root, 'checkout-v7-auth.config');
+  const includeKey = 'includeIf.gitdir:/home/runner/work/lab-01/lab-01/.git.path';
+  const token = 'test-token-that-must-not-leak';
+  try {
+    writeFileSync(
+      includePath,
+      '[http "https://github.com/"]\n\textraheader = AUTHORIZATION: basic inherited\n',
+    );
+    command(f.runner, ['config', includeKey, includePath]);
+    const rejected = new RecordingGit({
+      ...gitOptions(f),
+      liveNetworkWrite: true,
+      token,
+    });
+    assert.throws(
+      () => runStateCalibration({ mode: 'setup', git: rejected, source: f.source }),
+      /Unsafe repository Git config: includeif\.gitdir:.*\.git\.path/,
+    );
+    assert.equal(rejected.advertisements.length, 0);
+    assert.equal(rejected.pushes.length, 0);
+    assert.equal(remoteRef(f, calibrationRef('base')), null);
+    command(f.runner, ['config', '--unset-all', includeKey]);
+
     command(f.runner, ['config', 'push.followTags', 'true']);
     command(f.runner, ['tag', '-a', 'must-not-follow', f.source, '-m', 'must not follow']);
-    const git = new RecordingGit(gitOptions(f));
-    runStateCalibration({ mode: 'setup', git, source: f.source });
+    const git = new RecordingGit({
+      ...gitOptions(f),
+      liveNetworkWrite: true,
+      token,
+    });
+    const result = runStateCalibration({ mode: 'setup', git, source: f.source });
     assertSafePushes(git.pushes);
     assert.equal(remoteRef(f, 'refs/tags/must-not-follow'), null);
+    const encoded = Buffer.from(`x-access-token:${token}`).toString('base64');
+    assert.deepEqual(git.controlledNetworkEnvironment(), {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+      GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${encoded}`,
+    });
+    assert.ok(git.networkEnvironments.length > 0);
+    for (const environment of git.networkEnvironments) {
+      assert.deepEqual(environment, git.controlledNetworkEnvironment());
+    }
+    checkout(f, result.graph.a);
+    const readOnly = new RecordingGit({
+      ...gitOptions(f),
+      liveNetworkWrite: true,
+      token: undefined,
+    });
     assert.equal(
-      command(f.runner, ['config', '--get', 'http.https://github.com/.extraheader']),
-      'AUTHORIZATION: basic retained',
+      evaluateRequiredHead({
+        git: readOnly,
+        headSha: result.graph.a,
+        authorizedSha: result.graph.a,
+      }).authorized,
+      true,
+    );
+    assert.ok(readOnly.networkEnvironments.every((environment) => Object.keys(environment).length === 0));
+    checkoutMain(f);
+    assert.equal(git.token, null);
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(token));
+    assert.doesNotMatch(JSON.stringify(git.pushes), new RegExp(`${token}|${encoded}`));
+    let failure;
+    try {
+      git.run(['definitely-not-a-git-command'], { network: true, requireAuthentication: true });
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure instanceof Error);
+    assert.doesNotMatch(failure.message, new RegExp(`${token}|${encoded}|AUTHORIZATION`, 'i'));
+    assert.doesNotMatch(
+      command(f.runner, ['config', '--local', '--name-only', '--get-regexp', '.*']),
+      /^(?:http|include)/m,
     );
   } finally {
     f.cleanup();
@@ -741,7 +813,8 @@ test('workflows have exact manual triggers, isolated permissions, and one stable
       '      - { name: Unsafe API, run: "gh api repos/fablebookjs/lab-01/branches/main/protection" }\n' +
         '      - name: Maintain the fixed required-check graph',
     ),
-    stateYaml.replace('persist-credentials: true', 'persist-credentials: false'),
+    stateYaml.replace('persist-credentials: false', 'persist-credentials: true'),
+    stateYaml.replace('GITHUB_TOKEN: ${{ github.token }}', 'GITHUB_TOKEN: ${{ secrets.CALIBRATION_TOKEN }}'),
     stateYaml.replace('fetch-depth: 0', 'fetch-depth: 1'),
     stateYaml.replace('cancel-in-progress: false', 'cancel-in-progress: true'),
     stateYaml.replace('node scripts/calibrate-required-check-state.mjs --mode "$MODE"', 'git push origin HEAD:main'),
@@ -795,6 +868,8 @@ test('scripts and documentation retain the release boundary and do not claim liv
   }
   assert.equal(stateScript.match(/spawnSync\('git'/g)?.length, 1);
   assert.equal(checkScript.match(/spawnSync\(/g), null);
+  assert.match(stateScript, /key !== 'GITHUB_TOKEN'/);
+  assert.doesNotMatch(stateScript, /push.*GITHUB_TOKEN|AUTHORIZATION.*args/);
   assert.doesNotMatch(stateScript, /approved|approve-head/i);
   assert.doesNotMatch(checkScript, /approved|approve-head/i);
   assert.match(docs, /does not\s+claim that behavior has been proved until the complete live sequence/);
@@ -821,4 +896,10 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.match(docs, /authorized_sha=A/);
   assert.match(docs, /authorized_sha=B/);
   assert.match(docs, /does not prove the identity, entitlement, or policy right/);
+  assert.match(docs, /actions\/runs\/29437465131/);
+  assert.match(docs, /includeif\.gitdir:.*lab-01.*\.git\.path/s);
+  assert.match(docs, /stopped before creating any required-check ref/);
+  assert.match(docs, /No successful rerun is claimed here/);
+  assert.match(docs, /persist-credentials: false/);
+  assert.match(docs, /GIT_CONFIG_COUNT/);
 });

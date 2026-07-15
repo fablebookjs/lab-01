@@ -21,11 +21,29 @@ closed. There is no approval ref or approval write.
 
 Before every Git advertisement or write, both scripts reject inherited Git
 environment overrides, isolate global and system configuration, and audit the
-repository configuration against a fixed allowlist. The only HTTP configuration
-accepted is one exact GitHub-scoped Actions `AUTHORIZATION: basic ...`
-extra-header; proxy, TLS, CA, certificate, low-speed, credential-helper,
-URL-rewrite, upload-pack, receive-pack, and other transport/authentication
-overrides fail before network Git runs.
+repository configuration against a credential-free fixed allowlist. Local
+`include`/`includeIf`, HTTP headers, proxy, TLS, CA, certificate, low-speed,
+credential-helper, URL-rewrite, upload-pack, receive-pack, and other
+transport/authentication overrides fail before network Git runs.
+
+Both workflows check out with `persist-credentials: false`. The write-capable
+state step receives only `${{ github.token }}` as `GITHUB_TOKEN`; the script
+requires it before any live advertisement or write, removes it from every child
+environment, and internally supplies one exact
+`http.https://github.com/.extraheader` through controlled `GIT_CONFIG_COUNT`,
+`GIT_CONFIG_KEY_0`, and `GIT_CONFIG_VALUE_0` child variables. The token and
+encoded header never appear in arguments, output, summaries, or errors. The
+read-only check remains credential-free because `fablebookjs/lab-01` is public.
+
+The first live `setup` dispatch was retained as a safe failure:
+[run 29437465131](https://github.com/fablebookjs/lab-01/actions/runs/29437465131)
+checked out trusted main `d44db671e7f2c70e4ad2dc4b78589af74da77786`
+but stopped before creating any required-check ref with
+`Unsafe repository Git config:
+includeif.gitdir:/home/runner/work/lab-01/lab-01/.git.path`. Checkout v7 had
+persisted its credential through that local include. This revision keeps
+includes forbidden and instead uses the explicit controlled credential path
+above. No successful rerun is claimed here.
 
 The separate **Required check calibration** workflow has only `contents: read`,
 one stable job named **Required calibration head**, and can dispatch only on the
