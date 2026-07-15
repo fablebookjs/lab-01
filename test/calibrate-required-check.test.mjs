@@ -37,21 +37,23 @@ const V1_NAMESPACE = 'refs/heads/calibration/g1/required-check';
 const V2_NAMESPACE = 'refs/heads/calibration/g1/required-check-pr';
 const BRANCH_NAMESPACE = 'calibration/g1/required-check-current';
 const HUMAN_EDITED_RUN_SELECTOR = `
-[.workflow_runs[] | . as $run |
- select(([$before[0].workflow_runs[].id] | index($run.id)) == null) |
+[.workflow_runs[] |
  select(.event == "pull_request" and
-        .actor.login == "ndelangen" and
         .path == ".github/workflows/calibrate-required-check.yml" and
         .head_branch == $head_ref and
         .head_sha == $head and
-        .status == "completed" and
-        .conclusion == $conclusion and
         (.pull_requests | length) == 1 and
         .pull_requests[0].number == $number and
         .pull_requests[0].base.ref == $base and
         .pull_requests[0].head.ref == $head_ref and
         .pull_requests[0].head.sha == $head)] as $runs |
-select(($runs | length) == 1) | $runs[0]
+select(($runs | length) == 1) |
+$runs[0] as $run |
+select(([$before[0].workflow_runs[].id] | index($run.id)) == null) |
+select($run.actor.login == "ndelangen" and
+       $run.status == "completed" and
+       $run.conclusion == $conclusion) |
+$run
 `.trim();
 const CHECKER_EVIDENCE_SELECTOR = `
 .action == "edited" and
@@ -102,12 +104,14 @@ const SAME_NAME_CHECK_SELECTOR = `
 const EXACT_CHECK_SELECTOR = `
 [.[].check_runs[] |
  select(.head_sha == $head and
-        .name == $context and
-        .app.id == $app_id and
-        .status == "completed" and
-        .conclusion == $conclusion and
-        (.details_url | contains($run_path)))] as $checks |
-select(($checks | length) == 1) | $checks[0]
+        .name == $context)] as $checks |
+select(($checks | length) == 1) |
+$checks[0] as $check |
+select($check.app.id == $app_id and
+       $check.status == "completed" and
+       $check.conclusion == $conclusion and
+       ($check.details_url | contains($run_path))) |
+$check
 `.trim();
 
 function command(cwd, args, env = {}) {
@@ -1576,6 +1580,28 @@ test('v3 jq evidence requires no B context before edit and one human B/B success
     conclusion: 'success',
   });
   assert.notEqual(extraMatch.status, 0);
+  for (const { name, run } of [
+    {
+      name: 'valid plus wrong-actor exact run',
+      run: { ...successfulRun, id: 104, actor: { login: 'github-actions[bot]' } },
+    },
+    {
+      name: 'valid plus failing exact run',
+      run: { ...successfulRun, id: 105, conclusion: 'failure' },
+    },
+    {
+      name: 'valid plus pending exact run',
+      run: { ...successfulRun, id: 106, status: 'in_progress', conclusion: null },
+    },
+  ]) {
+    const mixedResult = runHumanEditedRunSelector({
+      before,
+      after: { workflow_runs: [oldRun, successfulRun, run] },
+      head: b,
+      conclusion: 'success',
+    });
+    assert.notEqual(mixedResult.status, 0, name);
+  }
 
   const priorBody = authorizedBody(a);
   const currentBody = authorizedBody(b);
@@ -1721,6 +1747,33 @@ test('v3 jq evidence requires no B context before edit and one human B/B success
     ).status,
     0,
   );
+  for (const { name, check } of [
+    {
+      name: 'valid plus unlinked success',
+      check: {
+        ...bSuccessCheck,
+        details_url: 'https://github.com/fablebookjs/lab-01/actions/runs/202/job/502',
+      },
+    },
+    {
+      name: 'valid plus failure',
+      check: { ...bSuccessCheck, conclusion: 'failure' },
+    },
+    {
+      name: 'valid plus pending',
+      check: { ...bSuccessCheck, status: 'in_progress', conclusion: null },
+    },
+    {
+      name: 'valid plus wrong-App same-name check',
+      check: { ...bSuccessCheck, app: { id: 99999 } },
+    },
+  ]) {
+    const mixedResult = runExactCheckSelector(
+      [{ check_runs: [bSuccessCheck, check] }],
+      { head: b, context, appId, conclusion: 'success', runId: 101 },
+    );
+    assert.notEqual(mixedResult.status, 0, name);
+  }
 
   const beforeEditPolicy = {
     repository: {
@@ -1949,8 +2002,27 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.match(docs, /\.pull_requests\[0\]\.number == \$number/);
   assert.match(docs, /\.pull_requests\[0\]\.base\.ref == \$base/);
   assert.match(docs, /\.pull_requests\[0\]\.head\.sha == \$head/);
-  assert.match(docs, /\(\.details_url \| contains\(\$run_path\)\)/);
+  assert.match(docs, /\(\$check\.details_url \| contains\(\$run_path\)\)/);
   assert.match(docs, /select\(\(\$checks \| length\) == 1\)/);
+  assert.equal(docs.match(/-f exact-run\.jq/g)?.length, 2);
+  assert.equal(docs.match(/-f exact-check\.jq/g)?.length, 2);
+  assert.equal(docs.match(/\.actor\.login == "ndelangen"/g)?.length, 1);
+  const exactRunSelector = docs.match(
+    /tee exact-run\.jq >\/dev\/null <<'JQ'\n([\s\S]*?)\nJQ/,
+  )?.[1];
+  assert.ok(exactRunSelector);
+  assert.ok(
+    exactRunSelector.indexOf('select(($runs | length) == 1)') <
+      exactRunSelector.indexOf('$run.actor.login == "ndelangen"'),
+  );
+  const exactCheckSelector = docs.match(
+    /tee exact-check\.jq >\/dev\/null <<'JQ'\n([\s\S]*?)\nJQ/,
+  )?.[1];
+  assert.ok(exactCheckSelector);
+  assert.ok(
+    exactCheckSelector.indexOf('select(($checks | length) == 1)') <
+      exactCheckSelector.indexOf('$check.app.id == $app_id'),
+  );
   assert.match(docs, /same-name CheckRun on B—including one from App `99999`—fails/);
   assert.match(docs, /b-before-body\.sha256/);
   assert.match(docs, /priorAuthorizedSha/);

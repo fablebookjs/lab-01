@@ -219,32 +219,36 @@ tee exact-protection.jq >/dev/null <<'JQ'
 JQ
 
 tee exact-run.jq >/dev/null <<'JQ'
-[.workflow_runs[] | . as $run |
- select(([$before[0].workflow_runs[].id] | index($run.id)) == null) |
+[.workflow_runs[] |
  select(.event == "pull_request" and
-        .actor.login == "ndelangen" and
         .path == ".github/workflows/calibrate-required-check.yml" and
         .head_branch == $head_ref and
         .head_sha == $head and
-        .status == "completed" and
-        .conclusion == $conclusion and
         (.pull_requests | length) == 1 and
         .pull_requests[0].number == $number and
         .pull_requests[0].base.ref == $base and
         .pull_requests[0].head.ref == $head_ref and
         .pull_requests[0].head.sha == $head)] as $runs |
-select(($runs | length) == 1) | $runs[0]
+select(($runs | length) == 1) |
+$runs[0] as $run |
+select(([$before[0].workflow_runs[].id] | index($run.id)) == null) |
+select($run.actor.login == "ndelangen" and
+       $run.status == "completed" and
+       $run.conclusion == $conclusion) |
+$run
 JQ
 
 tee exact-check.jq >/dev/null <<'JQ'
 [.[].check_runs[] |
  select(.head_sha == $head and
-        .name == $context and
-        .app.id == $app_id and
-        .status == "completed" and
-        .conclusion == $conclusion and
-        (.details_url | contains($run_path)))] as $checks |
-select(($checks | length) == 1) | $checks[0]
+        .name == $context)] as $checks |
+select(($checks | length) == 1) |
+$checks[0] as $check |
+select($check.app.id == $app_id and
+       $check.status == "completed" and
+       $check.conclusion == $conclusion and
+       ($check.details_url | contains($run_path))) |
+$check
 JQ
 ```
 
@@ -425,7 +429,7 @@ HEAD=calibration/g1/required-check-current/head
 
    The state run is the exact transition evidence. Because the required workflow
    has no `synchronize` trigger, it must not create a B required check. Retain all
-   B CheckRuns and require zero exact context/App matches:
+   B CheckRuns and require zero same-name matches across every App:
 
    ```sh
    gh api --paginate \
@@ -537,17 +541,12 @@ HEAD=calibration/g1/required-check-current/head
 
    jq -ce \
      --slurpfile before b-after-edit-runs-before.json \
+     --argjson number "$PR" \
+     --arg base "$BASE" \
+     --arg head_ref "$HEAD" \
      --arg head "$B" \
-     '[.workflow_runs[] | . as $run |
-       select(([$before[0].workflow_runs[].id] | index($run.id)) == null) |
-       select(.event == "pull_request" and
-              .actor.login == "ndelangen" and
-              .path == ".github/workflows/calibrate-required-check.yml" and
-              .head_branch == "calibration/g1/required-check-current/head" and
-              .head_sha == $head and
-              .status == "completed" and
-              .conclusion == "success")] as $runs |
-      select(($runs | length) == 1) | $runs[0]' \
+     --arg conclusion success \
+     -f exact-run.jq \
      b-after-edit-runs-after.json \
      > b-after-edit-run.json
 
