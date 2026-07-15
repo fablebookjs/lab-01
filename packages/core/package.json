@@ -2,5 +2,13 @@
   "name": "@fablebook/lab-01-core",
   "version": "1.0.0",
   "type": "module",
-  "exports": "./src/index.js"
+  "exports": "./src/index.js",
+  "files": [
+    "src"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fablebookjs/lab-01.git",
+    "directory": "packages/core"
+  }
 }

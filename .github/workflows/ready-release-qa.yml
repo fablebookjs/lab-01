@@ -42,6 +42,17 @@ jobs:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || 'staged/v1.0' }}
 
+      - name: Install the snapshot-compatible Node toolchain
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Pin npm used for candidate tarball identities
+        run: |
+          npm install --global npm@11.18.0 --ignore-scripts --no-audit --no-fund
+          test "$(npm --version)" = "11.18.0"
+
       - name: Bootstrap the pinned trusted QA tooling
         run: |
           test -z "$(find . -name .npmrc -print -quit)"

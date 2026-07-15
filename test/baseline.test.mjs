@@ -25,6 +25,25 @@ test(`package manifests and the add-on edge use exact ${expectedPackageVersion}`
   assert.equal(addon.dependencies['@fablebook/lab-01-core'], expectedPackageVersion);
 });
 
+test('publishable package manifests have an exact minimal public source contract', async () => {
+  const core = await readJson(new URL('../packages/core/package.json', import.meta.url));
+  const addon = await readJson(new URL('../packages/addon/package.json', import.meta.url));
+
+  for (const [manifest, directory] of [
+    [core, 'packages/core'],
+    [addon, 'packages/addon'],
+  ]) {
+    assert.deepEqual(manifest.files, ['src']);
+    assert.deepEqual(manifest.repository, {
+      type: 'git',
+      url: 'git+https://github.com/fablebookjs/lab-01.git',
+      directory,
+    });
+    assert.equal(manifest.private, undefined);
+    assert.equal(manifest.publishConfig, undefined);
+  }
+});
+
 test('the checked-in isolated consumer stays pinned to the 1.0.0 baseline', async () => {
   const consumer = await readJson(new URL('../consumer/package.json', import.meta.url));
 

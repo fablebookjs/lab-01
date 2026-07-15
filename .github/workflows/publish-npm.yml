@@ -1,0 +1,65 @@
+name: Publish npm package
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Fixed package to publish or verify from V
+        required: true
+        type: choice
+        options:
+          - core
+          - addon
+
+permissions: {}
+
+concurrency:
+  group: publish-npm-v1.0.1
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'fablebookjs/lab-01' && github.ref == 'refs/heads/releases/v1.0'
+    runs-on: ubuntu-24.04
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out exact V without persisted GitHub credentials
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+          ref: release-snapshots/v1.0.1
+
+      - name: Install the pinned Node and npm toolchain
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Pin the trusted-publishing npm CLI
+        run: |
+          test -z "${NPM_TOKEN-}"
+          test -z "${NODE_AUTH_TOKEN-}"
+          npm install --global npm@11.18.0 --ignore-scripts --no-audit --no-fund
+          test "$(npm --version)" = "11.18.0"
+
+      - name: Publish or reuse only the selected exact package
+        env:
+          PACKAGE_CHOICE: ${{ inputs.package }}
+        run: >-
+          node scripts/publish-npm.mjs
+          --repository fablebookjs/lab-01
+          --package "$PACKAGE_CHOICE"
+          --evidence "$RUNNER_TEMP/publish-npm.json"
+
+      - name: Retain sanitized publication evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: publish-npm-${{ inputs.package }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/publish-npm.json
+          if-no-files-found: error
+          retention-days: 30

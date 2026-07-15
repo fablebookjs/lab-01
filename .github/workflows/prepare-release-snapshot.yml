@@ -1,0 +1,80 @@
+name: Prepare release snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_pr:
+        description: Exact merged staged release PR number
+        required: true
+        type: string
+      qa_run:
+        description: Exact successful current ready-QA run ID
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: prepare-release-snapshot-v1.0.1
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'fablebookjs/lab-01' && github.ref == 'refs/heads/releases/v1.0'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Check out the fixed release line with full graph authority
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          ref: releases/v1.0
+
+      - name: Install the pinned Node and npm toolchain
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Pin npm used to reproduce QA tarballs
+        run: |
+          npm install --global npm@11.18.0 --ignore-scripts --no-audit --no-fund
+          test "$(npm --version)" = "11.18.0"
+
+      - name: Download only the specified QA run evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QA_RUN: ${{ inputs.qa_run }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/qa"
+          gh run download "$QA_RUN" \
+            --repo fablebookjs/lab-01 \
+            --pattern 'ready-release-qa-*' \
+            --dir "$RUNNER_TEMP/qa"
+          test "$(find "$RUNNER_TEMP/qa" -name ready-release-qa.json -type f | wc -l)" = 1
+          find "$RUNNER_TEMP/qa" -name ready-release-qa.json -type f -print > "$RUNNER_TEMP/qa-evidence-path"
+
+      - name: Create or reuse exact deterministic V
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_PR: ${{ inputs.release_pr }}
+          QA_RUN: ${{ inputs.qa_run }}
+        run: >-
+          node scripts/prepare-release-snapshot.mjs
+          --repository fablebookjs/lab-01
+          --release-pr "$RELEASE_PR"
+          --qa-run "$QA_RUN"
+          --qa-evidence "$(cat "$RUNNER_TEMP/qa-evidence-path")"
+          --evidence "$RUNNER_TEMP/prepare-release-snapshot.json"
+
+      - name: Retain sanitized snapshot evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: prepare-release-snapshot-${{ inputs.qa_run }}
+          path: ${{ runner.temp }}/prepare-release-snapshot.json
+          if-no-files-found: error
+          retention-days: 30

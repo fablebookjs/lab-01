@@ -1,7 +1,8 @@
 # Fablebook `lab-01`
 
 `lab-01` is a disposable, synthetic monorepo for proving a visible release-PR
-contract without touching Storybook resources or publishing real packages.
+contract without touching Storybook resources. The bounded G1 proof uses only
+the two public synthetic packages named below.
 
 The `1.0.0` baseline contains:
 
@@ -46,11 +47,25 @@ refreshed by the built-in token, release-PR maintenance explicitly dispatches
 QA for the new staged head because the resulting synchronize run otherwise
 requires human approval. The first GitHub-current proof is
 [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684).
-Close-and-regenerate is installed, but the Fablebook organization policy must
-allow Actions-created PRs before its replacement creation can be calibrated.
+Close-and-regenerate is live; its first replacement proof created PR #12 and
+converged on that same replacement during a duplicate attempt.
 
 The pinned Verdaccio toolchain is bootstrapped separately from the candidate.
 Candidate, publish, and consumer npm subprocesses receive closed environments,
 isolated home/config/cache paths, and both default and `@fablebook` registries
 pinned to the generated loopback origin. Candidate installation omits the
 development-only QA toolchain and cannot use public npm.
+
+The issue #19 preparation adds two deliberately separate public-release
+surfaces. `Prepare release snapshot` may create only the deterministic
+`release-snapshots/v1.0.1` ref after validating merged release intent `M` and a
+specified exact ready-QA run. `Publish npm package` is the one stable OIDC
+publisher identity. It can publish or reuse only `core` first and then `addon`
+from that exact snapshot. It cannot move the release line, tag, create a GitHub
+Release, or create the next proposal.
+
+This preparation is not permission to merge the current draft PR or publish.
+The exact `1.0.0` packages must first be published interactively, the two npm
+trusted publishers and `npm-publish` GitHub environment must be configured by a
+human, and PR #12 must be refreshed and receive current-head QA after these
+manifest changes.

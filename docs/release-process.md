@@ -56,9 +56,10 @@ expected-old guarded empty intent, and created [draft PR #12](https://github.com
 Attempt 2 of the same run returned `replacement-exists`; exactly one matching
 open release PR remained.
 
-In the future contract, merging the current validated release PR is explicit
-authorization to publish its exact source. **Do not merge today's PR:** no
-publication or reconciliation automation exists in this slice.
+Merging the current validated release PR is explicit authorization to publish
+its exact source. **Do not merge today's draft PR:** the public `1.0.0`
+baseline, npm trusted-publisher settings, GitHub environment, and fresh QA for
+the manifest-hardened head are still external gates.
 
 ## Ready-state exact-version QA
 
@@ -138,8 +139,74 @@ Close-and-regenerate is live. [Run 29414470336](https://github.com/fablebookjs/l
 created the clean draft replacement, and its duplicate attempt converged on the
 same PR without another ref or PR write.
 
-Public package publication, branch reconciliation, tagging `v1.0.1`, and
-creating a GitHub Release are intentionally **NOT YET IMPLEMENTED**. This slice
-does not publish to public npm, create a `v1.0.1` tag or GitHub Release, or
-mutate any Storybook resource. The draft maintainer does not execute
-pull-request-head code.
+Branch reconciliation, tagging `v1.0.1`, and creating a GitHub Release remain
+intentionally **OUTSIDE THIS PREPARATION SLICE**. The draft maintainer does not
+execute pull-request-head code, and no workflow may mutate a Storybook
+resource.
+
+## Offline trusted-publishing preparation
+
+Both publishable package manifests carry the same exact Git repository URL,
+their monorepo directory, and the minimal `src` files allowlist. They contain no
+`publishConfig`, registry, provenance, or authentication override. The add-on
+continues to use an exact core dependency, which the version transform changes
+from `1.0.0` to `1.0.1` together with the four allowlisted manifest/lock files.
+
+Snapshot preparation and npm publication are separate workflows:
+
+1. `.github/workflows/prepare-release-snapshot.yml` is manually dispatched on
+   `releases/v1.0` with an exact merged release-PR number and successful
+   ready-QA run ID. Those inputs are expectations, not authority. The script
+   re-reads the PR, run, artifact list, release line, and snapshot ref.
+2. The merged PR must be the same-repository `staged/v1.0` to
+   `releases/v1.0` proposal. Its merge `M` has ordered parents `[S, I]`; `I` is
+   the one-parent empty structured intent for `S`; and `M` has the sealed source
+   tree. Squash, rebase, wrong-parent, wrong-tree, stale-QA, duplicate artifact,
+   and ambiguous state fail closed.
+3. The specified QA artifact is untrusted input. Snapshot preparation
+   independently reproduces the exact four-file transform, Git tree, content
+   hash, package file lists, SHA-512 integrity, and SHA-1 shasum using Node
+   `24.18.0` and npm `11.18.0`. Every identity must equal the QA evidence.
+4. `V` is a deterministic single-parent commit over `M`. Its structured
+   metadata binds line, version, `M`, QA run, staged/source SHAs, and both
+   package hashes. Only `refs/heads/release-snapshots/v1.0.1` may be created,
+   using an exact absent-ref lease. The exact existing `V` is reused; any other
+   value stops. This ref is a durable locator for `V`, not a second release
+   line. `releases/v1.0` must be byte-for-byte unchanged across the run.
+5. Snapshot evidence schema 1 records the authority SHAs, run/artifact,
+   transform identities, `V`, both package file/hash identities, ref result,
+   and the unchanged release-line boundary. It contains no credential.
+
+`.github/workflows/publish-npm.yml` is the single stable npm trusted-publisher
+identity for both packages. It has only a top-level manual dispatch with the
+fixed choice `core` or `addon`, runs on GitHub-hosted `ubuntu-24.04`, and grants
+its job only `contents: read` and `id-token: write`. Checkout and setup-node are
+pinned by full v6 commit SHA. The job uses environment `npm-publish`, Node
+`24.18.0`, and exact npm `11.18.0`.
+
+For this single-operator G1 laboratory, `npm-publish` is an exact OIDC subject
+and requires no second-person reviewer. It may have zero required reviewers;
+the explicit manual dispatch is the operator authorization. Do not infer that
+policy for production. The environment contains no npm secret. On npmjs.com,
+both packages must configure `fablebookjs` / `lab-01` / `publish-npm.yml` /
+`npm-publish` with **npm publish only**. Staged publishing is not part of G1.
+
+The publisher rejects `NPM_TOKEN` and `NODE_AUTH_TOKEN`, inherits neither, and
+creates closed temporary user/global npm configuration with only the exact
+public registry and provenance enabled. It revalidates `V`, `M`, `S`, `I`, the
+current release line, manifests, package file allowlists, and both packed
+hashes before reading npm. An existing package is reusable only when repository,
+integrity, shasum, and downloaded tarball bytes equal `V`; mismatch is a
+permanent stop. Add-on publication requires exact matching public core
+`1.0.1`. A lost publish response is accepted only after exact registry
+read-back.
+
+Publisher evidence schema 1 binds the run choice, `S`/`I`/`M`/`V`, QA run,
+package file/hash identities, before/after npm state, downloaded registry
+identity, and unchanged release line. It explicitly records that no traditional
+token, reconciliation, tag, or GitHub Release mutation occurred.
+
+The accepted issue #14 state contract requires publication to complete before
+normal reconciliation or conflict recovery begins. Consequently this slice
+never reconciles the release line while either package is absent and never
+creates `v1.0.1`, a GitHub Release, or a `1.0.2` proposal.

@@ -3,6 +3,14 @@
   "version": "1.0.0",
   "type": "module",
   "exports": "./src/index.js",
+  "files": [
+    "src"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fablebookjs/lab-01.git",
+    "directory": "packages/addon"
+  },
   "dependencies": {
     "@fablebook/lab-01-core": "1.0.0"
   }
