@@ -30,3 +30,15 @@ synthetic candidates to loopback Verdaccio, installs them into a temporary
 non-workspace consumer, records sanitized identity and integrity evidence, and
 then removes the worktree, registry process, and registry storage. It does not
 publish to public npm or mutate GitHub state.
+
+The checked-in workflow first uses `actions/checkout` read authority to
+materialize the exact staged commit with full history, then rederives the one
+current ready PR and both current refs through the read-only GitHub API. A
+manual dispatch supplies no SHA authority. Local proofs must instead pass
+`--authority local`; their evidence is explicitly non-GitHub-current.
+
+The pinned Verdaccio toolchain is bootstrapped separately from the candidate.
+Candidate, publish, and consumer npm subprocesses receive closed environments,
+isolated home/config/cache paths, and both default and `@fablebook` registries
+pinned to the generated loopback origin. Candidate installation omits the
+development-only QA toolchain and cannot use public npm.

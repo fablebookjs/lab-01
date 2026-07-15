@@ -15,7 +15,7 @@ import {
 } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
-import { promisify } from 'node:util';
+import { isDeepStrictEqual, promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
 import { validateIntent } from './maintain-release-draft.mjs';
@@ -23,6 +23,8 @@ import { validateIntent } from './maintain-release-draft.mjs';
 export const REPOSITORY = 'fablebookjs/lab-01';
 export const RELEASE_VERSION = '1.0.1';
 export const VERDACCIO_VERSION = '6.8.0';
+export const RELEASE_LINE = 'releases/v1.0';
+export const STAGED_LINE = 'staged/v1.0';
 export const PACKAGE_SPECS = Object.freeze([
   Object.freeze({ name: '@fablebook/lab-01-core', directory: 'packages/core' }),
   Object.freeze({ name: '@fablebook/lab-01-addon', directory: 'packages/addon' }),
@@ -36,6 +38,8 @@ export const TRANSFORMED_FILES = Object.freeze([
 
 const BASE_VERSION = '1.0.0';
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const SHASUM_PATTERN = /^[0-9a-f]{40}$/;
 const INTEGRITY_PATTERN = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
 const execFileAsync = promisify(execFile);
 
@@ -192,39 +196,286 @@ export async function transformCandidate(candidateDirectory) {
   ]);
 }
 
-export function validateEvidenceBinding(evidence, expected) {
-  if (evidence?.schemaVersion !== 1 || evidence.repository !== REPOSITORY) {
-    fail('QA evidence has an unexpected schema or repository');
-  }
-  for (const field of ['stagedSha', 'sourceSha', 'sourceTree', 'transformedTree']) {
-    if (evidence.release?.[field] !== expected[field]) {
-      fail(`QA evidence ${field} does not match the expected release identity`);
-    }
-  }
-  if (evidence.release.version !== RELEASE_VERSION) fail('QA evidence has an unexpected version');
-  if (evidence.release.transformedContentSha256 !== expected.transformedContentSha256) {
-    fail('QA evidence transformed content does not match the expected release identity');
-  }
-  const packages = evidence.registry?.packages;
+export function localAuthority() {
+  return {
+    mode: 'local',
+    githubCurrent: false,
+    repository: REPOSITORY,
+    event: 'local',
+    refs: null,
+    pullRequest: null,
+  };
+}
+
+function transformationContract() {
+  return {
+    files: [...TRANSFORMED_FILES],
+    packageNames: PACKAGE_SPECS.map(({ name }) => name),
+    addonCoreDependency: RELEASE_VERSION,
+  };
+}
+
+function cleanupContract() {
+  return {
+    result: 'passed',
+    registryStopped: true,
+    temporaryWorktreeRemoved: true,
+    registryStateRemoved: true,
+    credentialStateRemoved: true,
+    consumerStateRemoved: true,
+    npmCacheRemoved: true,
+  };
+}
+
+function expectedStepShape(steps) {
+  const prefix = [
+    ['candidate:install', 'npm ci --omit=dev --offline (loopback registry)'],
+    ['candidate:test', 'LAB_01_EXPECTED_PACKAGE_VERSION=1.0.1 npm test'],
+  ];
+  const suffix = [
+    [`pack:${PACKAGE_SPECS[0].name}`, `npm pack ./${PACKAGE_SPECS[0].directory}`],
+    [`pack:${PACKAGE_SPECS[1].name}`, `npm pack ./${PACKAGE_SPECS[1].directory}`],
+    [`publish:${PACKAGE_SPECS[0].name}`, 'npm publish (loopback registry)'],
+    [`publish:${PACKAGE_SPECS[1].name}`, 'npm publish (loopback registry)'],
+    ['consumer:install', 'npm install (loopback registry)'],
+    ['consumer:test', 'npm test'],
+  ];
+  const buildNames = [
+    '@fablebook/lab-01',
+    ...PACKAGE_SPECS.map(({ name }) => name),
+  ].map((name) => `build:${name}`);
+  const buildSteps = Array.isArray(steps) ? steps.slice(prefix.length, -suffix.length) : [];
+  const commands = [...prefix, ...buildSteps.map(({ name }) => [name, 'npm run build']), ...suffix];
   if (
-    !Array.isArray(packages) ||
-    packages.length !== PACKAGE_SPECS.length ||
-    packages.some(
-      (pkg, index) =>
-        pkg.name !== PACKAGE_SPECS[index].name ||
-        pkg.version !== RELEASE_VERSION ||
-        !INTEGRITY_PATTERN.test(pkg.integrity ?? ''),
+    !Array.isArray(steps) ||
+    buildSteps.length > buildNames.length ||
+    buildSteps.some(
+      (step, index) =>
+        !buildNames.includes(step?.name) ||
+        (index > 0 && buildNames.indexOf(step.name) <= buildNames.indexOf(buildSteps[index - 1].name)),
+    ) ||
+    steps.length !== commands.length ||
+    steps.some(
+      (step, index) =>
+        step?.name !== commands[index][0] ||
+        step.command !== commands[index][1] ||
+        !Number.isInteger(step.durationMs) ||
+        step.durationMs < 0 ||
+        Object.keys(step).sort().join('\n') !== ['command', 'durationMs', 'name'].join('\n'),
     )
   ) {
-    fail('QA evidence does not contain exactly the allowlisted package integrities');
+    fail('QA evidence steps do not match the exact lab command contract');
   }
-  assertLoopbackRegistry(evidence.registry.origin);
+}
+
+function assertAuthorityContract(authority, stagedSha, sourceSha) {
+  if (authority?.mode === 'local') {
+    if (!isDeepStrictEqual(authority, localAuthority())) {
+      fail('local QA authority has unexpected or GitHub-current fields');
+    }
+    return;
+  }
   if (
-    evidence.consumer?.result !== 'passed' ||
-    evidence.consumer?.workspaceResolution !== false ||
-    evidence.cleanup?.result !== 'passed'
+    authority?.mode !== 'github-current' ||
+    authority.githubCurrent !== true ||
+    authority.repository !== REPOSITORY ||
+    !['pull_request', 'workflow_dispatch'].includes(authority.event) ||
+    authority.refs?.staged?.name !== STAGED_LINE ||
+    authority.refs.staged.sha !== stagedSha ||
+    authority.refs?.source?.name !== RELEASE_LINE ||
+    authority.refs.source.sha !== sourceSha ||
+    authority.pullRequest?.state !== 'open' ||
+    authority.pullRequest.draft !== false ||
+    !Number.isInteger(authority.pullRequest.number) ||
+    authority.pullRequest.number < 1 ||
+    authority.pullRequest.head?.repository !== REPOSITORY ||
+    authority.pullRequest.head.ref !== STAGED_LINE ||
+    authority.pullRequest.head.sha !== stagedSha ||
+    authority.pullRequest.base?.repository !== REPOSITORY ||
+    authority.pullRequest.base.ref !== RELEASE_LINE ||
+    authority.pullRequest.base.sha !== sourceSha
   ) {
-    fail('QA evidence does not prove isolated consumption and cleanup');
+    fail('GitHub QA authority is not the exact current release PR and refs');
+  }
+  const expectedKeys = ['event', 'githubCurrent', 'mode', 'pullRequest', 'refs', 'repository'];
+  if (Object.keys(authority).sort().join('\n') !== expectedKeys.sort().join('\n')) {
+    fail('GitHub QA authority has unexpected fields');
+  }
+  if (
+    Object.keys(authority.refs).sort().join('\n') !== ['source', 'staged'].join('\n') ||
+    Object.keys(authority.refs.staged).sort().join('\n') !== ['name', 'sha'].join('\n') ||
+    Object.keys(authority.refs.source).sort().join('\n') !== ['name', 'sha'].join('\n') ||
+    Object.keys(authority.pullRequest).sort().join('\n') !==
+      ['base', 'draft', 'head', 'number', 'state'].join('\n') ||
+    Object.keys(authority.pullRequest.head).sort().join('\n') !==
+      ['ref', 'repository', 'sha'].join('\n') ||
+    Object.keys(authority.pullRequest.base).sort().join('\n') !==
+      ['ref', 'repository', 'sha'].join('\n')
+  ) {
+    fail('GitHub QA authority has unexpected nested fields');
+  }
+}
+
+export function buildExpectedEvidenceContract({
+  authority,
+  stagedSha,
+  sourceSha,
+  sourceTree,
+  transformedTree,
+  transformedContentSha256,
+  registryOrigin,
+  packages,
+  steps,
+}) {
+  return {
+    schemaVersion: 2,
+    repository: REPOSITORY,
+    authority: clone(authority),
+    release: {
+      version: RELEASE_VERSION,
+      stagedSha,
+      sourceSha,
+      sourceTree,
+      transformedTree,
+      transformedContentSha256,
+    },
+    transformation: transformationContract(),
+    registry: {
+      implementation: { name: 'verdaccio', version: VERDACCIO_VERSION },
+      origin: registryOrigin,
+      loopbackOnly: true,
+      noUplinks: true,
+      authenticatedPublish: true,
+      allowedPackages: PACKAGE_SPECS.map(({ name }) => name),
+      packages: clone(packages),
+    },
+    consumer: {
+      name: '@fablebook/lab-01-consumer-qa',
+      location: 'temporary-outside-repository',
+      directoryOutsideRepository: true,
+      dependencies: Object.fromEntries(PACKAGE_SPECS.map(({ name }) => [name, RELEASE_VERSION])),
+      registryOrigin,
+      lockfileResolution: 'registry-only',
+      workspaceResolution: false,
+      result: 'passed',
+    },
+    steps: clone(steps),
+    cleanup: cleanupContract(),
+  };
+}
+
+function assertEvidenceContract(contract) {
+  if (contract?.schemaVersion !== 2 || contract.repository !== REPOSITORY) {
+    fail('QA evidence has an unexpected schema or repository');
+  }
+  const release = contract.release;
+  for (const field of ['stagedSha', 'sourceSha', 'sourceTree', 'transformedTree']) {
+    assertSha(release?.[field], `evidence ${field}`);
+  }
+  if (release.version !== RELEASE_VERSION || !SHA256_PATTERN.test(release.transformedContentSha256 ?? '')) {
+    fail('QA evidence release identity is malformed');
+  }
+  if (
+    Object.keys(release).sort().join('\n') !==
+    [
+      'sourceSha',
+      'sourceTree',
+      'stagedSha',
+      'transformedContentSha256',
+      'transformedTree',
+      'version',
+    ].join('\n')
+  ) {
+    fail('QA evidence release identity has unexpected fields');
+  }
+  assertAuthorityContract(contract.authority, release.stagedSha, release.sourceSha);
+  if (!isDeepStrictEqual(contract.transformation, transformationContract())) {
+    fail('QA evidence transformation contract is not exact');
+  }
+  const registry = assertLoopbackRegistry(contract.registry?.origin);
+  if (
+    !isDeepStrictEqual(contract.registry.implementation, {
+      name: 'verdaccio',
+      version: VERDACCIO_VERSION,
+    }) ||
+    contract.registry.loopbackOnly !== true ||
+    contract.registry.noUplinks !== true ||
+    contract.registry.authenticatedPublish !== true ||
+    !isDeepStrictEqual(
+      contract.registry.allowedPackages,
+      PACKAGE_SPECS.map(({ name }) => name),
+    ) ||
+    !Array.isArray(contract.registry.packages) ||
+    contract.registry.packages.length !== PACKAGE_SPECS.length ||
+    Object.keys(contract.registry).sort().join('\n') !==
+      [
+        'allowedPackages',
+        'authenticatedPublish',
+        'implementation',
+        'loopbackOnly',
+        'noUplinks',
+        'origin',
+        'packages',
+      ].join('\n')
+  ) {
+    fail('QA evidence registry contract is not exact');
+  }
+  for (const [index, pkg] of contract.registry.packages.entries()) {
+    const spec = PACKAGE_SPECS[index];
+    const expectedMetadata = new URL(`/${encodeURIComponent(spec.name)}/${RELEASE_VERSION}`, registry);
+    const archiveName = `${spec.name.slice(spec.name.indexOf('/') + 1)}-${RELEASE_VERSION}.tgz`;
+    const expectedTarball = new URL(`/${spec.name}/-/${archiveName}`, registry);
+    if (
+      pkg?.name !== spec.name ||
+      pkg.version !== RELEASE_VERSION ||
+      !INTEGRITY_PATTERN.test(pkg.integrity ?? '') ||
+      !SHASUM_PATTERN.test(pkg.shasum ?? '') ||
+      pkg.metadataUrl !== expectedMetadata.href ||
+      pkg.tarballUrl !== expectedTarball.href ||
+      Object.keys(pkg).sort().join('\n') !==
+        ['integrity', 'metadataUrl', 'name', 'shasum', 'tarballUrl', 'version'].sort().join('\n')
+    ) {
+      fail(`QA evidence package contract is invalid for ${spec.name}`);
+    }
+  }
+  const expectedConsumer = {
+    name: '@fablebook/lab-01-consumer-qa',
+    location: 'temporary-outside-repository',
+    directoryOutsideRepository: true,
+    dependencies: Object.fromEntries(PACKAGE_SPECS.map(({ name }) => [name, RELEASE_VERSION])),
+    registryOrigin: registry.href,
+    lockfileResolution: 'registry-only',
+    workspaceResolution: false,
+    result: 'passed',
+  };
+  if (!isDeepStrictEqual(contract.consumer, expectedConsumer)) {
+    fail('QA evidence consumer contract is not exact');
+  }
+  expectedStepShape(contract.steps);
+  if (!isDeepStrictEqual(contract.cleanup, cleanupContract())) {
+    fail('QA evidence cleanup contract is not exact');
+  }
+  const topLevelKeys = [
+    'authority',
+    'cleanup',
+    'consumer',
+    'registry',
+    'release',
+    'repository',
+    'schemaVersion',
+    'steps',
+    'transformation',
+  ];
+  if (Object.keys(contract).sort().join('\n') !== topLevelKeys.sort().join('\n')) {
+    fail('QA evidence has unexpected top-level fields');
+  }
+}
+
+export function validateEvidenceBinding(evidence, expected) {
+  assertEvidenceContract(expected);
+  assertEvidenceContract(evidence);
+  if (!isDeepStrictEqual(evidence, expected)) {
+    fail('QA evidence does not exactly match independently derived runtime facts');
   }
 }
 
@@ -274,6 +525,73 @@ export async function withTemporaryDirectory(prefix, callback) {
   }
 }
 
+function closedSubprocessEnvironment(tempRoot, additions = {}) {
+  if (!process.env.PATH) fail('PATH is required to run the pinned local QA tooling');
+  const home = join(tempRoot, 'isolated-home');
+  const temporary = join(tempRoot, 'subprocess-tmp');
+  return {
+    PATH: process.env.PATH,
+    HOME: home,
+    USERPROFILE: home,
+    TMPDIR: temporary,
+    TMP: temporary,
+    TEMP: temporary,
+    CI: 'true',
+    NO_COLOR: '1',
+    ...additions,
+  };
+}
+
+export async function createIsolatedNpmEnvironment({
+  tempRoot,
+  name,
+  registryOrigin,
+  token,
+  workspaces,
+  additions = {},
+}) {
+  assertLoopbackRegistry(registryOrigin);
+  if (!/^[a-z][a-z0-9-]+$/.test(name)) fail('isolated npm environment name is invalid');
+  for (const key of Object.keys(additions)) {
+    if (/(?:npm|registry|proxy|token|auth|userconfig|globalconfig)/i.test(key)) {
+      fail(`refusing unsafe npm environment addition: ${key}`);
+    }
+  }
+  const configDirectory = join(tempRoot, 'npm-config', name);
+  const cache = join(tempRoot, 'npm-cache', name);
+  await Promise.all([
+    mkdir(configDirectory, { recursive: true }),
+    mkdir(cache, { recursive: true }),
+    mkdir(join(tempRoot, 'isolated-home'), { recursive: true }),
+    mkdir(join(tempRoot, 'subprocess-tmp'), { recursive: true }),
+  ]);
+  const userConfig = join(configDirectory, 'user.npmrc');
+  const globalConfig = join(configDirectory, 'global.npmrc');
+  const registry = new URL(registryOrigin);
+  const lines = [
+    `registry=${registry.href}`,
+    `@fablebook:registry=${registry.href}`,
+    'audit=false',
+    'fund=false',
+    'update-notifier=false',
+    'fetch-retries=0',
+  ];
+  if (token) lines.push(`//127.0.0.1:${registry.port}/:_authToken=${token}`);
+  await Promise.all([writeFile(userConfig, `${lines.join('\n')}\n`), writeFile(globalConfig, '')]);
+  return closedSubprocessEnvironment(tempRoot, {
+    NPM_CONFIG_USERCONFIG: userConfig,
+    NPM_CONFIG_GLOBALCONFIG: globalConfig,
+    NPM_CONFIG_CACHE: cache,
+    NPM_CONFIG_REGISTRY: registry.href,
+    NPM_CONFIG_AUDIT: 'false',
+    NPM_CONFIG_FUND: 'false',
+    NPM_CONFIG_UPDATE_NOTIFIER: 'false',
+    NPM_CONFIG_FETCH_RETRIES: '0',
+    ...(workspaces === undefined ? {} : { NPM_CONFIG_WORKSPACES: String(workspaces) }),
+    ...additions,
+  });
+}
+
 function validateRepository(repoRoot, repository) {
   if (repository !== REPOSITORY) fail(`refusing QA outside ${REPOSITORY}`);
   const remote = git(repoRoot, 'remote', 'get-url', 'origin');
@@ -284,6 +602,127 @@ function validateRepository(repoRoot, repository) {
     'ssh://git@github.com/fablebookjs/lab-01.git',
   ]);
   if (!accepted.has(remote)) fail(`origin is not the allowlisted ${REPOSITORY} repository`);
+}
+
+function pullShape(pull) {
+  return {
+    number: pull.number,
+    state: pull.state,
+    draft: pull.draft,
+    head: {
+      repository: pull.head?.repo?.full_name,
+      ref: pull.head?.ref,
+      sha: pull.head?.sha,
+    },
+    base: {
+      repository: pull.base?.repo?.full_name,
+      ref: pull.base?.ref,
+      sha: pull.base?.sha,
+    },
+  };
+}
+
+function isAuthoritativePull(pull) {
+  return (
+    pull.state === 'open' &&
+    pull.draft === false &&
+    pull.head?.repo?.full_name === REPOSITORY &&
+    pull.head?.ref === STAGED_LINE &&
+    pull.base?.repo?.full_name === REPOSITORY &&
+    pull.base?.ref === RELEASE_LINE
+  );
+}
+
+export function validateGitHubAuthoritySnapshot({
+  eventName,
+  event,
+  stagedRefSha,
+  sourceRefSha,
+  pulls,
+  localHead,
+}) {
+  assertSha(stagedRefSha, 'current staged ref SHA');
+  assertSha(sourceRefSha, 'current release ref SHA');
+  assertSha(localHead, 'checked-out staged SHA');
+  if (event?.repository?.full_name !== REPOSITORY) fail('GitHub event repository is not the laboratory');
+  if (localHead !== stagedRefSha) fail('checked-out staged SHA is not the current staged ref');
+  const matching = pulls.filter(isAuthoritativePull);
+  if (matching.length !== 1) {
+    fail(`expected exactly one current authoritative ready release PR, found ${matching.length}`);
+  }
+  const pull = matching[0];
+  if (pull.head.sha !== stagedRefSha || pull.base.sha !== sourceRefSha) {
+    fail('authoritative PR head/base do not equal the current staged/release refs');
+  }
+  if (eventName === 'pull_request') {
+    if (!['ready_for_review', 'synchronize'].includes(event.action)) {
+      fail('pull_request event is not an allowed ready-QA wake-up');
+    }
+    const eventPull = event.pull_request;
+    if (
+      eventPull?.number !== pull.number ||
+      eventPull.state !== 'open' ||
+      eventPull.draft !== false ||
+      eventPull.head?.repo?.full_name !== REPOSITORY ||
+      eventPull.head.ref !== STAGED_LINE ||
+      eventPull.head.sha !== stagedRefSha ||
+      eventPull.base?.repo?.full_name !== REPOSITORY ||
+      eventPull.base.ref !== RELEASE_LINE ||
+      eventPull.base.sha !== sourceRefSha
+    ) {
+      fail('pull_request event does not equal the current authoritative release PR');
+    }
+  } else if (eventName !== 'workflow_dispatch') {
+    fail('GitHub event is not an allowed ready-QA wake-up');
+  }
+  return {
+    mode: 'github-current',
+    githubCurrent: true,
+    repository: REPOSITORY,
+    event: eventName,
+    refs: {
+      staged: { name: STAGED_LINE, sha: stagedRefSha },
+      source: { name: RELEASE_LINE, sha: sourceRefSha },
+    },
+    pullRequest: pullShape(pull),
+  };
+}
+
+async function githubGet(path, token) {
+  const response = await fetch(`https://api.github.com${path}`, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) fail(`read-only GitHub API GET ${path} failed with ${response.status}`);
+  return body;
+}
+
+async function resolveGitHubAuthority({ repoRoot, eventName, eventPath, token }) {
+  if (!token) fail('read-only GITHUB_TOKEN is required for GitHub-current QA authority');
+  const event = await readJson(eventPath);
+  const [stagedRef, sourceRef, pulls] = await Promise.all([
+    githubGet(`/repos/${REPOSITORY}/git/ref/heads/${STAGED_LINE}`, token),
+    githubGet(`/repos/${REPOSITORY}/git/ref/heads/${RELEASE_LINE}`, token),
+    githubGet(
+      `/repos/${REPOSITORY}/pulls?state=open&base=${encodeURIComponent(RELEASE_LINE)}&per_page=100`,
+      token,
+    ),
+  ]);
+  const stagedRefSha = stagedRef?.object?.sha;
+  const sourceRefSha = sourceRef?.object?.sha;
+  const authority = validateGitHubAuthoritySnapshot({
+    eventName,
+    event,
+    stagedRefSha,
+    sourceRefSha,
+    pulls,
+    localHead: git(repoRoot, 'rev-parse', 'HEAD'),
+  });
+  return { authority, stagedSha: stagedRefSha, sourceSha: sourceRefSha };
 }
 
 function validateStagedIntent(repoRoot, stagedSha, sourceSha) {
@@ -440,12 +879,19 @@ async function packCandidate(candidateDirectory, packDirectory, steps, env) {
     ) {
       fail(`npm pack produced an unexpected ${spec.name} candidate`);
     }
+    const tarballPath = join(packDirectory, output[0].filename);
+    const packedBytes = await readFile(tarballPath);
+    const integrity = `sha512-${createHash('sha512').update(packedBytes).digest('base64')}`;
+    const shasum = createHash('sha1').update(packedBytes).digest('hex');
+    if (output[0].integrity !== integrity || output[0].shasum !== shasum) {
+      fail(`npm pack hashes do not match the packed bytes for ${spec.name}`);
+    }
     packages.push({
       name: spec.name,
       version: RELEASE_VERSION,
-      integrity: output[0].integrity,
-      shasum: output[0].shasum,
-      tarballPath: join(packDirectory, output[0].filename),
+      integrity,
+      shasum,
+      tarballPath,
     });
   }
   return packages;
@@ -465,7 +911,9 @@ async function verifyRegistryPackage(origin, candidate) {
     fail(`registry metadata for ${candidate.name} does not match the packed candidate`);
   }
   const tarballUrl = new URL(metadata.dist.tarball);
-  if (tarballUrl.origin !== new URL(origin).origin) {
+  const archiveName = `${candidate.name.slice(candidate.name.indexOf('/') + 1)}-${RELEASE_VERSION}.tgz`;
+  const expectedTarballUrl = new URL(`/${candidate.name}/-/${archiveName}`, origin);
+  if (tarballUrl.href !== expectedTarballUrl.href) {
     fail(`registry tarball for ${candidate.name} escaped the loopback registry`);
   }
   const tarballResponse = await fetch(tarballUrl);
@@ -511,20 +959,24 @@ async function proveConsumer(tempRoot, registryOrigin, registryPackages, steps, 
     writeJson(join(consumerDirectory, 'package.json'), consumerManifest),
     copyFile(join(repoRoot, 'consumer/consumer.test.mjs'), join(consumerDirectory, 'consumer.test.mjs')),
   ]);
-  const npmEnvironment = {
-    ...process.env,
-    npm_config_registry: registryOrigin,
-    npm_config_cache: join(tempRoot, 'npm-cache'),
-    npm_config_userconfig: join(tempRoot, 'npmrc'),
-    npm_config_workspaces: 'false',
-  };
-  await writeFile(
-    npmEnvironment.npm_config_userconfig,
-    `registry=${registryOrigin}\naudit=false\nfund=false\nupdate-notifier=false\n`,
-  );
+  const npmEnvironment = await createIsolatedNpmEnvironment({
+    tempRoot,
+    name: 'consumer',
+    registryOrigin,
+    workspaces: false,
+  });
   const installed = await command(
     'npm',
-    ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--fetch-retries=0'],
+    [
+      'install',
+      '--ignore-scripts',
+      '--no-audit',
+      '--no-fund',
+      '--fetch-retries=0',
+      '--workspaces=false',
+      '--registry',
+      registryOrigin,
+    ],
     { cwd: consumerDirectory, env: npmEnvironment },
   );
   steps.push({ name: 'consumer:install', command: 'npm install (loopback registry)', durationMs: installed.durationMs });
@@ -543,22 +995,35 @@ async function proveConsumer(tempRoot, registryOrigin, registryPackages, steps, 
   }
 }
 
-export async function runReadyReleaseQa({ repository, stagedSha, sourceSha, repoRoot }) {
+export async function runReadyReleaseQa({
+  repository,
+  stagedSha,
+  sourceSha,
+  repoRoot,
+  authority,
+  testHooks = {},
+}) {
   validateRepository(repoRoot, repository);
+  assertAuthorityContract(authority, stagedSha, sourceSha);
   const sourceTree = validateStagedIntent(repoRoot, stagedSha, sourceSha);
+  const npmConfigurationPaths = git(repoRoot, 'ls-tree', '-r', '--name-only', sourceSha)
+    .split('\n')
+    .filter((path) => /(?:^|\/)\.npmrc$/i.test(path));
+  if (npmConfigurationPaths.length > 0) {
+    fail(`candidate source contains prohibited npm configuration: ${npmConfigurationPaths.join(', ')}`);
+  }
   const tempRoot = await mkdtemp(join(tmpdir(), 'fablebook-lab-01-ready-qa-'));
   const candidateDirectory = join(tempRoot, 'candidate');
   const packDirectory = join(tempRoot, 'packs');
   const storageDirectory = join(tempRoot, 'verdaccio-storage');
   const steps = [];
-  const qaNpmEnvironment = {
-    ...process.env,
-    npm_config_cache: join(tempRoot, 'npm-cache'),
-    npm_config_userconfig: join(tempRoot, 'npm-tooling.npmrc'),
-  };
   let worktreeAdded = false;
   let verdaccio;
   let evidence;
+  let transformedTree;
+  let transformedContentSha256;
+  let registryOrigin;
+  let registryPackages;
   try {
     git(repoRoot, 'worktree', 'add', '--detach', candidateDirectory, sourceSha);
     worktreeAdded = true;
@@ -573,41 +1038,29 @@ export async function runReadyReleaseQa({ repository, stagedSha, sourceSha, repo
     if (stagedFiles.join('\n') !== TRANSFORMED_FILES.join('\n')) {
       fail('candidate index does not contain exactly the allowlisted transformation');
     }
-    const transformedTree = git(candidateDirectory, 'write-tree');
-    const transformedContentSha256 = await transformedContentIdentity(candidateDirectory);
+    transformedTree = git(candidateDirectory, 'write-tree');
+    transformedContentSha256 = await transformedContentIdentity(candidateDirectory);
 
-    await writeFile(qaNpmEnvironment.npm_config_userconfig, 'audit=false\nfund=false\nupdate-notifier=false\n');
-    const installed = await command(
-      'npm',
-      ['ci', '--ignore-scripts', '--no-audit', '--no-fund'],
-      { cwd: candidateDirectory, env: qaNpmEnvironment },
-    );
-    steps.push({ name: 'candidate:install', command: 'npm ci', durationMs: installed.durationMs });
-    const tested = await command('npm', ['test'], {
-      cwd: candidateDirectory,
-      env: { ...qaNpmEnvironment, LAB_01_EXPECTED_PACKAGE_VERSION: RELEASE_VERSION },
-    });
-    steps.push({
-      name: 'candidate:test',
-      command: 'LAB_01_EXPECTED_PACKAGE_VERSION=1.0.1 npm test',
-      durationMs: tested.durationMs,
-    });
-    await buildIfPresent(candidateDirectory, steps, qaNpmEnvironment);
-
-    await mkdir(packDirectory);
-    const packedPackages = await packCandidate(candidateDirectory, packDirectory, steps, qaNpmEnvironment);
-    await mkdir(storageDirectory);
+    await Promise.all([
+      mkdir(packDirectory),
+      mkdir(storageDirectory),
+      mkdir(join(tempRoot, 'isolated-home')),
+      mkdir(join(tempRoot, 'subprocess-tmp')),
+    ]);
     const configPath = join(tempRoot, 'verdaccio.yaml');
     await writeFile(configPath, verdaccioConfig(storageDirectory, join(tempRoot, 'htpasswd')));
     const port = await reserveLoopbackPort();
-    const registryOrigin = `http://127.0.0.1:${port}/`;
+    registryOrigin = `http://127.0.0.1:${port}/`;
     assertLoopbackRegistry(registryOrigin);
     const logs = [];
     const verdaccioBinary = join(repoRoot, 'node_modules/.bin/verdaccio');
     await access(verdaccioBinary);
     verdaccio = spawn(verdaccioBinary, ['--config', configPath, '--listen', `127.0.0.1:${port}`], {
       cwd: tempRoot,
-      env: { ...process.env, NODE_ENV: 'production', VERDACCIO_HANDLE_KILL_SIGNALS: 'true' },
+      env: closedSubprocessEnvironment(tempRoot, {
+        NODE_ENV: 'production',
+        VERDACCIO_HANDLE_KILL_SIGNALS: 'true',
+      }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     for (const stream of [verdaccio.stdout, verdaccio.stderr]) {
@@ -617,20 +1070,66 @@ export async function runReadyReleaseQa({ repository, stagedSha, sourceSha, repo
       });
     }
     await waitForRegistry(registryOrigin, verdaccio, logs);
-    const registryToken = await createRegistryToken(registryOrigin);
+    if (testHooks.afterRegistryReady) await testHooks.afterRegistryReady();
 
-    const npmEnvironment = {
-      ...process.env,
-      npm_config_registry: registryOrigin,
-      npm_config_cache: join(tempRoot, 'npm-cache'),
-      npm_config_userconfig: join(tempRoot, 'npmrc'),
-    };
-    await writeFile(
-      npmEnvironment.npm_config_userconfig,
-      `registry=${registryOrigin}\n//127.0.0.1:${port}/:_authToken=${registryToken}\naudit=false\nfund=false\nupdate-notifier=false\n`,
+    const candidateNpmEnvironment = await createIsolatedNpmEnvironment({
+      tempRoot,
+      name: 'candidate',
+      registryOrigin,
+    });
+    const installed = await command(
+      'npm',
+      [
+        'ci',
+        '--omit=dev',
+        '--offline',
+        '--ignore-scripts',
+        '--no-audit',
+        '--no-fund',
+        '--fetch-retries=0',
+        '--workspaces=true',
+        '--registry',
+        registryOrigin,
+      ],
+      { cwd: candidateDirectory, env: candidateNpmEnvironment },
     );
+    steps.push({
+      name: 'candidate:install',
+      command: 'npm ci --omit=dev --offline (loopback registry)',
+      durationMs: installed.durationMs,
+    });
+    const tested = await command('npm', ['test'], {
+      cwd: candidateDirectory,
+      env: {
+        ...candidateNpmEnvironment,
+        LAB_01_EXPECTED_PACKAGE_VERSION: RELEASE_VERSION,
+        LAB_01_QA_CANDIDATE: '1',
+      },
+    });
+    steps.push({
+      name: 'candidate:test',
+      command: 'LAB_01_EXPECTED_PACKAGE_VERSION=1.0.1 npm test',
+      durationMs: tested.durationMs,
+    });
+    await buildIfPresent(candidateDirectory, steps, candidateNpmEnvironment);
+
+    const packedPackages = await packCandidate(
+      candidateDirectory,
+      packDirectory,
+      steps,
+      candidateNpmEnvironment,
+    );
+    const registryToken = await createRegistryToken(registryOrigin);
+    const publisherNpmEnvironment = await createIsolatedNpmEnvironment({
+      tempRoot,
+      name: 'publisher',
+      registryOrigin,
+      token: registryToken,
+    });
     for (const pkg of packedPackages) {
-      if (!PACKAGE_SPECS.some(({ name }) => name === pkg.name)) fail('refusing to publish a non-allowlisted package');
+      if (!PACKAGE_SPECS.some(({ name }) => name === pkg.name)) {
+        fail('refusing to publish a non-allowlisted package');
+      }
       const published = await command(
         'npm',
         [
@@ -643,17 +1142,24 @@ export async function runReadyReleaseQa({ repository, stagedSha, sourceSha, repo
           '--ignore-scripts',
           '--provenance=false',
         ],
-        { cwd: tempRoot, env: npmEnvironment },
+        { cwd: tempRoot, env: publisherNpmEnvironment },
       );
-      steps.push({ name: `publish:${pkg.name}`, command: 'npm publish (loopback registry)', durationMs: published.durationMs });
+      steps.push({
+        name: `publish:${pkg.name}`,
+        command: 'npm publish (loopback registry)',
+        durationMs: published.durationMs,
+      });
     }
-    const registryPackages = [];
-    for (const pkg of packedPackages) registryPackages.push(await verifyRegistryPackage(registryOrigin, pkg));
+    registryPackages = [];
+    for (const pkg of packedPackages) {
+      registryPackages.push(await verifyRegistryPackage(registryOrigin, pkg));
+    }
     await proveConsumer(tempRoot, registryOrigin, registryPackages, steps, repoRoot);
 
     evidence = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       repository: REPOSITORY,
+      authority: clone(authority),
       release: {
         version: RELEASE_VERSION,
         stagedSha,
@@ -662,24 +1168,27 @@ export async function runReadyReleaseQa({ repository, stagedSha, sourceSha, repo
         transformedTree,
         transformedContentSha256,
       },
-      transformation: {
-        files: [...TRANSFORMED_FILES],
-        packageNames: PACKAGE_SPECS.map(({ name }) => name),
-        addonCoreDependency: RELEASE_VERSION,
-      },
+      transformation: transformationContract(),
       registry: {
-        implementation: `verdaccio@${VERDACCIO_VERSION}`,
+        implementation: { name: 'verdaccio', version: VERDACCIO_VERSION },
         origin: registryOrigin,
         loopbackOnly: true,
-        packages: registryPackages,
+        noUplinks: true,
+        authenticatedPublish: true,
+        allowedPackages: PACKAGE_SPECS.map(({ name }) => name),
+        packages: clone(registryPackages),
       },
       consumer: {
-        dependencies: Object.fromEntries(PACKAGE_SPECS.map(({ name }) => [name, RELEASE_VERSION])),
+        name: '@fablebook/lab-01-consumer-qa',
+        location: 'temporary-outside-repository',
         directoryOutsideRepository: true,
+        dependencies: Object.fromEntries(PACKAGE_SPECS.map(({ name }) => [name, RELEASE_VERSION])),
+        registryOrigin,
+        lockfileResolution: 'registry-only',
         workspaceResolution: false,
         result: 'passed',
       },
-      steps,
+      steps: clone(steps),
     };
   } finally {
     const cleanupErrors = [];
@@ -712,13 +1221,19 @@ export async function runReadyReleaseQa({ repository, stagedSha, sourceSha, repo
   if (git(repoRoot, 'worktree', 'list', '--porcelain').includes(candidateDirectory)) {
     fail('temporary candidate worktree survived cleanup');
   }
-  evidence.cleanup = {
-    result: 'passed',
-    registryStopped: true,
-    temporaryWorktreeRemoved: true,
-    registryStateRemoved: true,
-  };
-  validateEvidenceBinding(evidence, evidence.release);
+  evidence.cleanup = cleanupContract();
+  const expectedEvidence = buildExpectedEvidenceContract({
+    authority,
+    stagedSha,
+    sourceSha,
+    sourceTree,
+    transformedTree,
+    transformedContentSha256,
+    registryOrigin,
+    packages: registryPackages,
+    steps,
+  });
+  validateEvidenceBinding(evidence, expectedEvidence);
   return evidence;
 }
 
@@ -727,13 +1242,42 @@ function parseArguments(argv) {
   for (let index = 0; index < argv.length; index += 2) {
     const key = argv[index];
     const value = argv[index + 1];
-    if (!['--repository', '--staged-sha', '--source-sha', '--evidence'].includes(key) || !value) {
+    if (
+      ![
+        '--authority',
+        '--repository',
+        '--staged-sha',
+        '--source-sha',
+        '--event-name',
+        '--event-path',
+        '--evidence',
+      ].includes(key) ||
+      !value ||
+      values[key.slice(2)]
+    ) {
       fail(`unknown or incomplete argument: ${key ?? '<missing>'}`);
     }
     values[key.slice(2)] = value;
   }
-  for (const key of ['repository', 'staged-sha', 'source-sha', 'evidence']) {
+  for (const key of ['authority', 'repository', 'evidence']) {
     if (!values[key]) fail(`--${key} is required`);
+  }
+  if (values.authority === 'local') {
+    for (const key of ['staged-sha', 'source-sha']) {
+      if (!values[key]) fail(`--${key} is required for explicit local authority`);
+    }
+    if (values['event-name'] || values['event-path']) {
+      fail('local authority cannot accept GitHub event inputs');
+    }
+  } else if (values.authority === 'github-current') {
+    for (const key of ['event-name', 'event-path']) {
+      if (!values[key]) fail(`--${key} is required for GitHub-current authority`);
+    }
+    if (values['staged-sha'] || values['source-sha']) {
+      fail('GitHub-current authority derives SHAs and cannot accept caller-supplied SHAs');
+    }
+  } else {
+    fail('--authority must be exactly local or github-current');
   }
   return values;
 }
@@ -741,11 +1285,25 @@ function parseArguments(argv) {
 export async function main(argv = process.argv.slice(2)) {
   const args = parseArguments(argv);
   const repoRoot = git(process.cwd(), 'rev-parse', '--show-toplevel');
+  const resolved =
+    args.authority === 'local'
+      ? {
+          authority: localAuthority(),
+          stagedSha: args['staged-sha'],
+          sourceSha: args['source-sha'],
+        }
+      : await resolveGitHubAuthority({
+          repoRoot,
+          eventName: args['event-name'],
+          eventPath: args['event-path'],
+          token: process.env.GITHUB_TOKEN,
+        });
   const evidence = await runReadyReleaseQa({
     repository: args.repository,
-    stagedSha: args['staged-sha'],
-    sourceSha: args['source-sha'],
+    stagedSha: resolved.stagedSha,
+    sourceSha: resolved.sourceSha,
     repoRoot,
+    authority: resolved.authority,
   });
   const output = resolve(args.evidence);
   await mkdir(dirname(output), { recursive: true });

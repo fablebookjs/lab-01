@@ -7,6 +7,7 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
+    "test:qa:e2e": "node --test test/qa-ready-release.e2e.mjs",
     "qa:ready": "node scripts/qa-ready-release.mjs"
   },
   "devDependencies": {
