@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -12,6 +12,7 @@ import {
   assertCalibrationRef,
   calibrationRef,
   createGraph,
+  parseRemoteAdvertisement,
   pushWithLease,
   runStateCalibration,
   verifyGraph,
@@ -86,10 +87,12 @@ class RecordingGit extends Git {
   constructor(options) {
     super(options);
     this.pushes = [];
+    this.advertisements = [];
   }
 
   run(args, options) {
     if (args[0] === 'push') this.pushes.push([...args]);
+    if (args[0] === 'ls-remote') this.advertisements.push([...args]);
     return super.run(args, options);
   }
 }
@@ -105,32 +108,122 @@ function assertSafePushes(pushes) {
     const remoteIndex = args.indexOf('origin');
     assert.ok(remoteIndex > 0);
     const leases = args.filter((arg) => arg.startsWith('--force-with-lease='));
-    assert.equal(leases.length, 1);
+    const atomic = args.includes('--atomic');
+    assert.equal(leases.length, atomic ? 2 : 1);
     const refspecs = args.slice(remoteIndex + 1);
-    assert.equal(refspecs.length, 1);
-    const [source, destination, extra] = refspecs[0].split(':');
-    assert.match(source, /^[0-9a-f]{40}$/);
-    assert.ok(allowed.has(destination));
-    assert.equal(extra, undefined);
-    assert.ok(leases[0].startsWith(`--force-with-lease=${destination}:`));
+    assert.equal(refspecs.length, atomic ? 2 : 1);
+    for (const refspec of refspecs) {
+      const [source, destination, extra] = refspec.split(':');
+      assert.match(source, /^[0-9a-f]{40}$/);
+      assert.ok(allowed.has(destination));
+      assert.equal(extra, undefined);
+      assert.ok(leases.some((lease) => lease.startsWith(`--force-with-lease=${destination}:`)));
+    }
+    if (atomic) {
+      assert.deepEqual(
+        refspecs.map((refspec) => refspec.split(':')[1]).sort(),
+        [calibrationRef('approved'), calibrationRef('head')].sort(),
+      );
+    }
   }
 }
 
 function parseWorkflowYaml(yaml) {
   const ruby = [
     'document = Psych.safe_load(STDIN.read, permitted_classes: [], permitted_symbols: [], aliases: false)',
+    'raise "ambiguous on keys" if document.key?("on") && document.key?(true)',
     'trigger = document.key?("on") ? document["on"] : document[true]',
-    'puts JSON.generate({"on" => trigger, "permissions" => document["permissions"], "jobs" => document["jobs"]})',
+    'document["on"] = trigger',
+    'document.delete(true)',
+    'puts JSON.generate(document)',
   ].join('; ');
   return JSON.parse(
     execFileSync('ruby', ['-rpsych', '-rjson', '-e', ruby], { input: yaml, encoding: 'utf8' }),
   );
 }
 
-function assertNoJobPermissionOverrides(parsed) {
-  for (const [name, job] of Object.entries(parsed.jobs)) {
-    assert.ok(!Object.hasOwn(job, 'permissions'), `job ${name} must not override permissions`);
-  }
+const EXPECTED_STATE_WORKFLOW = {
+  name: 'Calibrate required-check state',
+  on: {
+    workflow_dispatch: {
+      inputs: {
+        mode: {
+          description: 'Fixed required-check state transition',
+          required: true,
+          type: 'choice',
+          options: ['setup', 'advance-head', 'approve-head'],
+        },
+      },
+    },
+  },
+  permissions: { contents: 'write' },
+  concurrency: { group: 'calibration-g1-required-check-state', 'cancel-in-progress': false },
+  jobs: {
+    'maintain-state': {
+      name: 'Maintain required-check calibration state',
+      'runs-on': 'ubuntu-latest',
+      'timeout-minutes': 10,
+      steps: [
+        {
+          name: 'Assert the fixed laboratory target',
+          run:
+            'test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01"\n' +
+            'test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n' +
+            'test "$GITHUB_REF" = "refs/heads/main"\n',
+        },
+        {
+          name: 'Check out trusted main code',
+          uses: 'actions/checkout@v7',
+          with: { 'fetch-depth': 0, 'persist-credentials': true, ref: '${{ github.sha }}' },
+        },
+        {
+          name: 'Maintain the fixed required-check graph',
+          run: 'node scripts/calibrate-required-check-state.mjs --mode "$MODE"',
+          env: { MODE: '${{ inputs.mode }}' },
+        },
+      ],
+    },
+  },
+};
+
+const EXPECTED_CHECK_WORKFLOW = {
+  name: 'Required check calibration',
+  on: { workflow_dispatch: null },
+  permissions: { contents: 'read' },
+  concurrency: {
+    group: 'calibration-g1-required-check-${{ github.sha }}',
+    'cancel-in-progress': false,
+  },
+  jobs: {
+    'current-head-authorization': {
+      name: 'Required calibration head',
+      'runs-on': 'ubuntu-latest',
+      'timeout-minutes': 5,
+      steps: [
+        {
+          name: 'Assert the fixed calibration head',
+          run:
+            'test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01"\n' +
+            'test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n' +
+            'test "$GITHUB_REF" = "refs/heads/calibration/g1/required-check/head"\n',
+        },
+        {
+          name: 'Check out the exact dispatched calibration head',
+          uses: 'actions/checkout@v7',
+          with: { 'fetch-depth': 1, 'persist-credentials': false, ref: '${{ github.sha }}' },
+        },
+        {
+          name: 'Require the exact current and approved head',
+          run: 'node scripts/check-required-calibration-head.mjs',
+        },
+      ],
+    },
+  },
+};
+
+function assertExactWorkflows(stateYaml, checkYaml) {
+  assert.deepEqual(parseWorkflowYaml(stateYaml), EXPECTED_STATE_WORKFLOW);
+  assert.deepEqual(parseWorkflowYaml(checkYaml), EXPECTED_CHECK_WORKFLOW);
 }
 
 test('setup creates only the deterministic five-ref graph and preserves all retained evidence', () => {
@@ -237,6 +330,174 @@ test('advance and approve reruns converge without rewrites or backwards transiti
     const setupRerun = runStateCalibration({ mode: 'setup', git, source: f.source });
     assert.deepEqual(setupRerun.state, { head: setup.graph.b, approved: setup.graph.b });
     assert.equal(git.pushes.length, approvePushes);
+    assertSafePushes(git.pushes);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('approval atomically retains exact head B while advancing only approved A to B', () => {
+  const f = fixture();
+  try {
+    const git = new RecordingGit(gitOptions(f));
+    const setup = runStateCalibration({ mode: 'setup', git, source: f.source });
+    runStateCalibration({ mode: 'advance-head', git, source: f.source });
+    const before = git.pushes.length;
+    const result = runStateCalibration({ mode: 'approve-head', git, source: f.source });
+    assert.equal(result.transition.approved, 'advanced');
+    assert.equal(git.pushes.length, before + 1);
+    const approval = git.pushes.at(-1);
+    assert.ok(approval.includes('--atomic'));
+    assert.ok(approval.includes(`--force-with-lease=${calibrationRef('head')}:${setup.graph.b}`));
+    assert.ok(approval.includes(`--force-with-lease=${calibrationRef('approved')}:${setup.graph.a}`));
+    assert.deepEqual(approval.slice(approval.indexOf('origin') + 1), [
+      `${setup.graph.b}:${calibrationRef('head')}`,
+      `${setup.graph.b}:${calibrationRef('approved')}`,
+    ]);
+    assertSafePushes([approval]);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('approval head rewind, deletion, and unexpected replacement races reject without advancing approval', () => {
+  for (const race of ['rewind', 'delete', 'replace']) {
+    const f = fixture();
+    try {
+      const setupGit = new Git(gitOptions(f));
+      const setup = runStateCalibration({ mode: 'setup', git: setupGit, source: f.source });
+      runStateCalibration({ mode: 'advance-head', git: setupGit, source: f.source });
+      const unexpected = command(f.runner, [
+        'commit-tree',
+        `${f.source}^{tree}`,
+        '-p',
+        f.source,
+        '-m',
+        `approval ${race} winner`,
+      ], {
+        GIT_AUTHOR_NAME: 'Approval Race',
+        GIT_AUTHOR_EMAIL: 'approval-race@example.invalid',
+        GIT_AUTHOR_DATE: '2026-07-15T16:10:00Z',
+        GIT_COMMITTER_NAME: 'Approval Race',
+        GIT_COMMITTER_EMAIL: 'approval-race@example.invalid',
+        GIT_COMMITTER_DATE: '2026-07-15T16:10:00Z',
+      });
+
+      class ApprovalRaceGit extends RecordingGit {
+        raced = false;
+
+        run(args, options) {
+          if (!this.raced && args[0] === 'push' && args.includes('--atomic')) {
+            this.raced = true;
+            const source = race === 'rewind' ? setup.graph.a : race === 'replace' ? unexpected : '';
+            command(f.runner, ['push', '--force', f.remote, `${source}:${calibrationRef('head')}`]);
+          }
+          return super.run(args, options);
+        }
+      }
+
+      const git = new ApprovalRaceGit(gitOptions(f));
+      assert.throws(
+        () => runStateCalibration({ mode: 'approve-head', git, source: f.source }),
+        /Atomic approval was rejected/,
+        race,
+      );
+      const expectedHead = race === 'rewind' ? setup.graph.a : race === 'replace' ? unexpected : null;
+      assert.equal(remoteRef(f, calibrationRef('head')), expectedHead, race);
+      assert.equal(remoteRef(f, calibrationRef('approved')), setup.graph.a, race);
+      assert.equal(git.pushes.length, 1, race);
+      assertSafePushes(git.pushes);
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test('ambiguous approval failure converges by exact coupled-state readback and rerun is query-only', () => {
+  const f = fixture();
+  try {
+    const setupGit = new Git(gitOptions(f));
+    const setup = runStateCalibration({ mode: 'setup', git: setupGit, source: f.source });
+    runStateCalibration({ mode: 'advance-head', git: setupGit, source: f.source });
+
+    class LostApprovalSuccessGit extends RecordingGit {
+      injected = false;
+
+      run(args, options) {
+        if (!this.injected && args[0] === 'push' && args.includes('--atomic')) {
+          this.injected = true;
+          command(f.runner, [
+            'push',
+            '--force',
+            f.remote,
+            `${setup.graph.b}:${calibrationRef('approved')}`,
+          ]);
+          this.pushes.push([...args]);
+          return { status: 1, stdout: '', stderr: 'simulated lost success response' };
+        }
+        return super.run(args, options);
+      }
+    }
+
+    const git = new LostApprovalSuccessGit(gitOptions(f));
+    const first = runStateCalibration({ mode: 'approve-head', git, source: f.source });
+    assert.equal(first.transition.approved, 'approved-lost-success');
+    assert.deepEqual(first.state, { head: setup.graph.b, approved: setup.graph.b });
+    const pushes = git.pushes.length;
+    const rerun = runStateCalibration({ mode: 'approve-head', git, source: f.source });
+    assert.equal(rerun.transition.approved, 'reused');
+    assert.equal(git.pushes.length, pushes);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('a competing incompatible approval rejects the atomic transition without moving head', () => {
+  const f = fixture();
+  try {
+    const setupGit = new Git(gitOptions(f));
+    const setup = runStateCalibration({ mode: 'setup', git: setupGit, source: f.source });
+    runStateCalibration({ mode: 'advance-head', git: setupGit, source: f.source });
+    const unexpected = command(f.runner, [
+      'commit-tree',
+      `${f.source}^{tree}`,
+      '-p',
+      f.source,
+      '-m',
+      'competing approval',
+    ], {
+      GIT_AUTHOR_NAME: 'Competing Approval',
+      GIT_AUTHOR_EMAIL: 'competing-approval@example.invalid',
+      GIT_AUTHOR_DATE: '2026-07-15T16:15:00Z',
+      GIT_COMMITTER_NAME: 'Competing Approval',
+      GIT_COMMITTER_EMAIL: 'competing-approval@example.invalid',
+      GIT_COMMITTER_DATE: '2026-07-15T16:15:00Z',
+    });
+
+    class CompetingApprovalGit extends RecordingGit {
+      injected = false;
+
+      run(args, options) {
+        if (!this.injected && args[0] === 'push' && args.includes('--atomic')) {
+          this.injected = true;
+          command(f.runner, [
+            'push',
+            '--force',
+            f.remote,
+            `${unexpected}:${calibrationRef('approved')}`,
+          ]);
+        }
+        return super.run(args, options);
+      }
+    }
+
+    const git = new CompetingApprovalGit(gitOptions(f));
+    assert.throws(
+      () => runStateCalibration({ mode: 'approve-head', git, source: f.source }),
+      /Atomic approval was rejected/,
+    );
+    assert.equal(remoteRef(f, calibrationRef('head')), setup.graph.b);
+    assert.equal(remoteRef(f, calibrationRef('approved')), unexpected);
     assertSafePushes(git.pushes);
   } finally {
     f.cleanup();
@@ -369,7 +630,35 @@ test('every write helper rejects refs outside the exact five-name set before Git
   assert.equal(calls, 0);
 });
 
-test('hostile Git environment, pushurl, and URL rewrites fail before calibration writes', () => {
+test('one strict advertisement parser rejects malformed, duplicate, missing, and unknown records', () => {
+  const main = 'refs/heads/main';
+  const head = calibrationRef('head');
+  const sha = '1'.repeat(40);
+  assert.deepEqual(parseRemoteAdvertisement(`${sha}\t${main}\n`, [main]), { [main]: sha });
+  assert.deepEqual(parseRemoteAdvertisement('', [main]), { [main]: null });
+  for (const output of [
+    `${sha}\t${main}\textra\n`,
+    `${sha} ${main}\n`,
+    `${sha}\t${main}\n${sha}\t${main}\n`,
+    `${sha}\t${head}\n`,
+    `${'z'.repeat(40)}\t${main}\n`,
+    `${sha}\t${main} trailing\n`,
+  ]) {
+    assert.throws(() => parseRemoteAdvertisement(output, [main]), /Malformed|Duplicate|Unexpected/);
+  }
+  assert.throws(() => parseRemoteAdvertisement('', [main, main]), /unique requested refs/);
+
+  class ForgedMainAdvertisementGit extends Git {
+    assertTrustedRemote() {}
+    text(args) {
+      if (args[0] === 'ls-remote') return `${sha}\t${main}\tattacker-extra`;
+      throw new Error(`Unexpected command: ${args.join(' ')}`);
+    }
+  }
+  assert.throws(() => new ForgedMainAdvertisementGit().remoteMain(), /Malformed remote advertisement/);
+});
+
+test('hostile Git environment and every local transport or credential override fail before advertisement', () => {
   const f = fixture();
   const outside = join(f.root, 'outside.git');
   try {
@@ -404,9 +693,10 @@ test('hostile Git environment, pushurl, and URL rewrites fail before calibration
     const pushUrlGit = new RecordingGit(gitOptions(f));
     assert.throws(
       () => runStateCalibration({ mode: 'setup', git: pushUrlGit, source: f.source }),
-      /Explicit remote\.origin\.pushurl is forbidden/,
+      /Unsafe repository Git config: remote\.origin\.pushurl/,
     );
     assert.equal(pushUrlGit.pushes.length, 0);
+    assert.equal(pushUrlGit.advertisements.length, 0);
     command(f.runner, ['config', '--unset-all', 'remote.origin.pushurl']);
 
     const rewriteKey = `url.${outside}.pushInsteadOf`;
@@ -414,9 +704,119 @@ test('hostile Git environment, pushurl, and URL rewrites fail before calibration
     const rewriteGit = new RecordingGit(gitOptions(f));
     assert.throws(
       () => runStateCalibration({ mode: 'setup', git: rewriteGit, source: f.source }),
-      /Configured Git URL rewrites are forbidden/,
+      /Unsafe repository Git config: url\./,
     );
     assert.equal(rewriteGit.pushes.length, 0);
+    assert.equal(rewriteGit.advertisements.length, 0);
+    command(f.runner, ['config', '--unset-all', rewriteKey]);
+
+    for (const [key, value] of [
+      ['http.proxy', 'http://127.0.0.1:9'],
+      ['http.sslVerify', 'false'],
+      ['http.sslCAInfo', join(f.root, 'attacker-ca.pem')],
+      ['http.sslCert', join(f.root, 'attacker-cert.pem')],
+      ['http.lowSpeedLimit', '1'],
+      ['credential.helper', `!touch ${join(f.root, 'credential-helper-ran')}`],
+      ['remote.origin.proxy', 'http://127.0.0.1:9'],
+      ['remote.origin.uploadpack', join(f.root, 'attacker-upload-pack')],
+      ['remote.origin.receivepack', join(f.root, 'attacker-receive-pack')],
+      ['core.gitProxy', join(f.root, 'attacker-git-proxy')],
+    ]) {
+      command(f.runner, ['config', key, value]);
+      const stateGit = new RecordingGit(gitOptions(f));
+      assert.throws(
+        () => runStateCalibration({ mode: 'setup', git: stateGit, source: f.source }),
+        new RegExp(`Unsafe repository Git config: ${key.replaceAll('.', '\\.')}`, 'i'),
+        key,
+      );
+      assert.equal(stateGit.advertisements.length, 0, key);
+      assert.equal(stateGit.pushes.length, 0, key);
+      const checkGit = new RecordingGit(gitOptions(f));
+      assert.throws(
+        () => evaluateRequiredHead({ git: checkGit, headSha: f.source }),
+        /Unsafe repository Git config/,
+        key,
+      );
+      assert.equal(checkGit.advertisements.length, 0, key);
+      command(f.runner, ['config', '--unset-all', key]);
+    }
+    assert.equal(existsSync(join(f.root, 'credential-helper-ran')), false);
+
+    command(f.runner, ['config', 'http.https://github.com/.extraheader', 'AUTHORIZATION: basic first']);
+    command(f.runner, [
+      'config',
+      'http.https://github.com/fablebookjs/lab-01.extraheader',
+      'AUTHORIZATION: basic second',
+    ]);
+    const duplicateAuth = new RecordingGit(gitOptions(f));
+    assert.throws(
+      () => runStateCalibration({ mode: 'setup', git: duplicateAuth, source: f.source }),
+      /Only one scoped checkout authentication entry is allowed/,
+    );
+    assert.equal(duplicateAuth.advertisements.length, 0);
+    assert.equal(duplicateAuth.pushes.length, 0);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('global config is isolated and system or command-scope config overrides are rejected before Git', () => {
+  const f = fixture();
+  const globalHome = join(f.root, 'global-home');
+  const systemConfig = join(f.root, 'system.gitconfig');
+  const marker = join(f.root, 'global-credential-helper-ran');
+  mkdirSync(globalHome);
+  try {
+    command(f.root, ['config', '--global', 'http.proxy', 'http://127.0.0.1:9'], { HOME: globalHome });
+    command(f.root, ['config', '--global', 'http.sslVerify', 'false'], { HOME: globalHome });
+    command(f.root, ['config', '--global', 'credential.helper', `!touch ${marker}`], { HOME: globalHome });
+    const previousHome = process.env.HOME;
+    process.env.HOME = globalHome;
+    try {
+      const git = new RecordingGit(gitOptions(f));
+      const globalProbe = git.run(['config', '--global', '--get', 'http.proxy'], { allowFailure: true });
+      assert.equal(globalProbe.status, 1);
+      const setup = runStateCalibration({ mode: 'setup', git, source: f.source });
+      assert.ok(git.advertisements.length > 0);
+      checkout(f, setup.graph.a);
+      const checkGit = new RecordingGit(gitOptions(f));
+      assert.equal(evaluateRequiredHead({ git: checkGit, headSha: setup.graph.a }).authorized, true);
+      assert.ok(checkGit.advertisements.length > 0);
+      checkoutMain(f);
+      assert.equal(existsSync(marker), false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+
+    writeFileSync(systemConfig, '[http]\n\tproxy = http://127.0.0.1:9\n\tsslVerify = false\n');
+    for (const [key, value] of [
+      ['GIT_CONFIG_SYSTEM', systemConfig],
+      ['GIT_CONFIG_GLOBAL', join(globalHome, '.gitconfig')],
+      ['GIT_CONFIG_COUNT', '0'],
+      ['GIT_CONFIG_PARAMETERS', "'http.proxy'='http://127.0.0.1:9'"],
+    ]) {
+      const previous = process.env[key];
+      process.env[key] = value;
+      const git = new RecordingGit(gitOptions(f));
+      try {
+        assert.throws(
+          () => runStateCalibration({ mode: 'setup', git, source: f.source }),
+          new RegExp(`Hostile inherited Git environment: ${key}`),
+        );
+        assert.equal(git.advertisements.length, 0, key);
+        assert.equal(git.pushes.length, 0, key);
+        const checkGit = new RecordingGit(gitOptions(f));
+        assert.throws(
+          () => evaluateRequiredHead({ git: checkGit, headSha: f.source }),
+          new RegExp(`Hostile inherited Git environment: ${key}`),
+        );
+        assert.equal(checkGit.advertisements.length, 0, key);
+      } finally {
+        if (previous === undefined) delete process.env[key];
+        else process.env[key] = previous;
+      }
+    }
   } finally {
     f.cleanup();
   }
@@ -450,35 +850,52 @@ test('workflows have exact manual triggers, isolated permissions, and one stable
     new URL('../.github/workflows/calibrate-required-check.yml', import.meta.url),
     'utf8',
   );
-  const state = parseWorkflowYaml(stateYaml);
-  const check = parseWorkflowYaml(checkYaml);
-  assert.deepEqual(state.on, {
-    workflow_dispatch: {
-      inputs: {
-        mode: {
-          description: 'Fixed required-check state transition',
-          required: true,
-          type: 'choice',
-          options: ['setup', 'advance-head', 'approve-head'],
-        },
-      },
-    },
-  });
-  assert.deepEqual(state.permissions, { contents: 'write' });
-  assertNoJobPermissionOverrides(state);
-  assert.deepEqual(check.on, { workflow_dispatch: null });
-  assert.deepEqual(check.permissions, { contents: 'read' });
-  assertNoJobPermissionOverrides(check);
-  assert.deepEqual(Object.keys(check.jobs), ['current-head-authorization']);
-  assert.equal(check.jobs['current-head-authorization'].name, 'Required calibration head');
-  assert.match(stateYaml, /test "\$GITHUB_REF" = "refs\/heads\/main"/);
-  assert.match(checkYaml, /test "\$GITHUB_REF" = "refs\/heads\/calibration\/g1\/required-check\/head"/);
-  assert.match(stateYaml, /persist-credentials: true/);
-  assert.match(checkYaml, /persist-credentials: false/);
-  assert.match(stateYaml, /ref: \$\{\{ github\.sha \}\}/);
-  assert.match(checkYaml, /ref: \$\{\{ github\.sha \}\}/);
-  assert.doesNotMatch(stateYaml, /pull_request:|push:|schedule:|pull-requests:|statuses:|actions:|id-token:/);
-  assert.doesNotMatch(checkYaml, /pull_request:|push:|schedule:|contents: write|pull-requests:|statuses:|actions:|id-token:/);
+  assertExactWorkflows(stateYaml, checkYaml);
+
+  const stateMutants = [
+    stateYaml.replace('on:\n', '"on": { workflow_dispatch: null }\non:\n'),
+    stateYaml.replace('  workflow_dispatch:', '  workflow_dispatch:\n  pull_request:'),
+    stateYaml.replace('permissions:\n  contents: write', 'permissions: { contents: write, pull-requests: write }'),
+    stateYaml.replace('    runs-on: ubuntu-latest', '    permissions: read-all\n    runs-on: ubuntu-latest'),
+    stateYaml.replace('    runs-on: ubuntu-latest', '    "permissions": { contents: write }\n    runs-on: ubuntu-latest'),
+    stateYaml.replace(
+      'jobs:\n',
+      'jobs:\n  injected: { runs-on: ubuntu-latest, steps: [{ run: "gh api repos/fablebookjs/lab-01/pulls" }] }\n',
+    ),
+    stateYaml.replace(
+      '      - name: Maintain the fixed required-check graph',
+      '      - { name: Unsafe API, run: "gh api repos/fablebookjs/lab-01/branches/main/protection" }\n' +
+        '      - name: Maintain the fixed required-check graph',
+    ),
+    stateYaml.replace('persist-credentials: true', 'persist-credentials: false'),
+    stateYaml.replace('fetch-depth: 0', 'fetch-depth: 1'),
+    stateYaml.replace('cancel-in-progress: false', 'cancel-in-progress: true'),
+    stateYaml.replace('node scripts/calibrate-required-check-state.mjs --mode "$MODE"', 'git push origin HEAD:main'),
+  ];
+  for (const mutant of stateMutants) {
+    assert.throws(() => assertExactWorkflows(mutant, checkYaml));
+  }
+
+  const checkMutants = [
+    checkYaml.replace('  workflow_dispatch:', '  workflow_dispatch:\n  push:'),
+    checkYaml.replace('permissions:\n  contents: read', 'permissions: { contents: write }'),
+    checkYaml.replace('    runs-on: ubuntu-latest', '    permissions: { statuses: write }\n    runs-on: ubuntu-latest'),
+    checkYaml.replace(
+      'jobs:\n',
+      'jobs:\n  injected: { runs-on: ubuntu-latest, steps: [{ run: "curl https://api.github.com" }] }\n',
+    ),
+    checkYaml.replace(
+      '      - name: Require the exact current and approved head',
+      '      - { name: Unsafe merge, run: "gh pr merge --merge" }\n' +
+        '      - name: Require the exact current and approved head',
+    ),
+    checkYaml.replace('persist-credentials: false', 'persist-credentials: true'),
+    checkYaml.replace('Required calibration head', 'Different context'),
+    checkYaml.replace('cancel-in-progress: false', 'cancel-in-progress: true'),
+  ];
+  for (const mutant of checkMutants) {
+    assert.throws(() => assertExactWorkflows(stateYaml, mutant));
+  }
 });
 
 test('scripts and documentation retain the release boundary and do not claim live proof', () => {
@@ -493,12 +910,33 @@ test('scripts and documentation retain the release boundary and do not claim liv
   const docs = readFileSync(new URL('../docs/required-check-calibration.md', import.meta.url), 'utf8');
   for (const script of [stateScript, checkScript]) {
     assert.doesNotMatch(script, /releases\/v1\.0|staged\/v1\.0|\/pulls|refs\/tags|\bnpm\b|storybook/i);
+    assert.doesNotMatch(
+      script,
+      /api\.github\.com|\bgh\s+api\b|\bgh\s+pr\b|\bcurl\b|\/branches\/.*\/protection|\/merge(?:s|d)?\b/i,
+    );
+    assert.doesNotMatch(script, /\bfetch\s*\(|https?\.request\s*\(|spawnSync\((?!'git')/);
   }
+  assert.equal(stateScript.match(/spawnSync\('git'/g)?.length, 1);
+  assert.equal(checkScript.match(/spawnSync\(/g), null);
   assert.match(docs, /does not\s+claim that behavior has been proved until the complete live sequence/);
-  assert.match(docs, /`strict` to `false`/);
-  assert.match(docs, /`enforce_admins` to `true`/);
-  assert.match(docs, /Never merge the calibration PR/);
+  assert.match(docs, /required_status_checks\.strict=false/);
+  assert.match(docs, /enforce_admins\.enabled=true/);
+  assert.match(docs, /required_status_checks\.checks=\[\{context: CONTEXT, app_id: APP_ID\}\]/);
+  assert.match(docs, /headRefOid/);
+  assert.match(docs, /statusCheckRollup/);
+  assert.match(docs, /mergeStateStatus/);
+  assert.match(docs, /`\(MERGEABLE, CLEAN, SUCCESS\)`/);
+  assert.match(docs, /`\(MERGEABLE, BLOCKED, null\)`/);
+  assert.match(docs, /`\(MERGEABLE, UNSTABLE, FAILURE\)`/);
+  assert.match(docs, /app\.slug.*`github-actions`/s);
+  assert.match(docs, /--paginate \\\n  --slurp/);
+  assert.match(docs, /filter=all&per_page=100/);
+  assert.match(docs, /sort_by\(\.id\) \| last \| select\(\. != null\)/);
+  assert.match(docs, /\.required_status_checks\.checks \| length/);
+  assert.match(docs, /every five seconds, for at most five minutes/);
+  assert.match(docs, /number=PR, state=OPEN, isDraft=false, merged=false, mergedAt=null/);
+  assert.match(docs, /Never merge, close, or draft this PR/);
   assert.match(docs, /release PR #12/);
   assert.match(docs, /conflict-recovery PR #16/);
-  assert.match(docs, /same required context green/);
+  assert.match(docs, /same context\/App pair green/);
 });

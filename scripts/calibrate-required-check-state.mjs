@@ -18,6 +18,27 @@ const LIVE_REMOTE_URLS = [
 ];
 const A_CONTENT = 'required-check calibration A\n';
 const B_CONTENT = 'required-check calibration B\n';
+const NULL_DEVICE = '/dev/null';
+const SAFE_LOCAL_CONFIG = new Set([
+  'core.repositoryformatversion',
+  'core.filemode',
+  'core.bare',
+  'core.logallrefupdates',
+  'core.ignorecase',
+  'core.precomposeunicode',
+  'core.symlinks',
+  'gc.auto',
+  'push.followtags',
+  'remote.origin.url',
+  'remote.origin.fetch',
+  'user.name',
+  'user.email',
+]);
+const SAFE_AUTH_CONFIG = new Set([
+  'http.https://github.com/.extraheader',
+  'http.https://github.com/fablebookjs/lab-01.extraheader',
+  'http.https://github.com/fablebookjs/lab-01.git.extraheader',
+]);
 
 const HOSTILE_GIT_ENVIRONMENT = [
   /^GIT_ALTERNATE_OBJECT_DIRECTORIES$/,
@@ -48,10 +69,12 @@ const HOSTILE_GIT_ENVIRONMENT = [
   /^GIT_SSH(?:_COMMAND|_VARIANT)?$/,
   /^GIT_TERMINAL_PROMPT$/,
   /^GIT_WORK_TREE$/,
+  /^GCM_/,
   /^SSH_ASKPASS(?:_REQUIRE)?$/,
   /^(?:HTTP|HTTPS|ALL|NO)_PROXY$/i,
   /^SSL_CERT_(?:FILE|DIR)$/,
-  /^CURL_CA_BUNDLE$/,
+  /^CURL_/,
+  /^NETRC$/i,
 ];
 
 const COMMIT_ENV = {
@@ -97,7 +120,18 @@ export class Git {
     const result = spawnSync('git', args, {
       cwd: this.cwd,
       encoding: 'utf8',
-      env: { ...inherited, LC_ALL: 'C', ...env },
+      env: {
+        ...inherited,
+        ...env,
+        LC_ALL: 'C',
+        GIT_CONFIG_GLOBAL: NULL_DEVICE,
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_SYSTEM: NULL_DEVICE,
+        GIT_TERMINAL_PROMPT: '0',
+        GCM_INTERACTIVE: 'never',
+        HOME: NULL_DEVICE,
+        XDG_CONFIG_HOME: NULL_DEVICE,
+      },
       input,
     });
 
@@ -114,38 +148,82 @@ export class Git {
     return this.run(args, options).stdout.trim();
   }
 
+  localConfigEntries() {
+    const result = this.run(['config', '--local', '--null', '--get-regexp', '.*'], {
+      allowFailure: true,
+    });
+    if (result.status === 1 && !result.stdout) return [];
+    if (result.status !== 0) {
+      throw new Error(`Could not audit repository Git config: ${result.stderr.trim()}`);
+    }
+    return result.stdout
+      .split('\0')
+      .filter(Boolean)
+      .map((record) => {
+        const separator = record.indexOf('\n');
+        if (separator <= 0) throw new Error('Malformed repository Git config record');
+        return [record.slice(0, separator).toLowerCase(), record.slice(separator + 1)];
+      });
+  }
+
+  assertSafeLocalConfig() {
+    const counts = new Map();
+    let originUrl = null;
+    for (const [key, value] of this.localConfigEntries()) {
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+      const branchMatch = key.match(/^branch\.(.+)\.(remote|merge)$/);
+      if (branchMatch) {
+        const valid = branchMatch[2] === 'remote'
+          ? value === 'origin'
+          : /^refs\/heads\/[A-Za-z0-9._/-]+$/.test(value) && !value.includes('..');
+        if (!valid) throw new Error(`Unsafe repository Git config: ${key}`);
+        continue;
+      }
+      if (SAFE_AUTH_CONFIG.has(key)) {
+        if (!/^AUTHORIZATION: basic [A-Za-z0-9+/=]+$/i.test(value)) {
+          throw new Error(`Unsafe repository Git config: ${key}`);
+        }
+        continue;
+      }
+      if (!SAFE_LOCAL_CONFIG.has(key)) throw new Error(`Unsafe repository Git config: ${key}`);
+      if (key === 'remote.origin.url') {
+        if (!this.acceptedRemoteUrls.has(value)) throw new Error('Untrusted repository origin URL');
+        originUrl = value;
+      } else if (key === 'remote.origin.fetch') {
+        if (!/^\+?refs\/heads\/[A-Za-z0-9.*_/-]+:refs\/remotes\/origin\/[A-Za-z0-9.*_/-]+$/.test(value)) {
+          throw new Error('Unsafe repository Git config: remote.origin.fetch');
+        }
+      } else if (key === 'core.repositoryformatversion' && value !== '0') {
+        throw new Error('Unsupported repository format');
+      } else if (key === 'core.bare' && value !== 'false') {
+        throw new Error('Calibration requires a non-bare checkout');
+      } else if (
+        ['core.filemode', 'core.logallrefupdates', 'core.ignorecase', 'core.precomposeunicode', 'core.symlinks', 'push.followtags']
+          .includes(key) &&
+        !['true', 'false'].includes(value.toLowerCase())
+      ) {
+        throw new Error(`Unsafe repository Git config: ${key}`);
+      } else if (key === 'gc.auto' && value !== '0') {
+        throw new Error('Unsafe repository Git config: gc.auto');
+      }
+    }
+    if (counts.get('remote.origin.url') !== 1 || originUrl === null) {
+      throw new Error('Repository must have one exact origin URL');
+    }
+    for (const key of SAFE_AUTH_CONFIG) {
+      if ((counts.get(key) ?? 0) > 1) throw new Error(`Duplicate scoped checkout authentication: ${key}`);
+    }
+    const authCount = [...SAFE_AUTH_CONFIG].reduce((total, key) => total + (counts.get(key) ?? 0), 0);
+    if (authCount > 1) throw new Error('Only one scoped checkout authentication entry is allowed');
+    return { originUrl };
+  }
+
   assertTrustedRemote({ requirePush = false } = {}) {
     this.assertNoHostileEnvironment();
     if (this.remote !== 'origin') throw new Error(`Git operations require exact origin, got ${this.remote}`);
-
-    const pushUrls = this.run(['config', '--get-all', 'remote.origin.pushurl'], { allowFailure: true });
-    if (pushUrls.status !== 1 || pushUrls.stdout.trim()) {
-      throw new Error('Explicit remote.origin.pushurl is forbidden');
-    }
-    const rewrites = this.run(
-      ['config', '--show-origin', '--get-regexp', '^url\\..*\\.(insteadof|pushinsteadof)$'],
-      { allowFailure: true },
-    );
-    if (rewrites.status !== 1 || rewrites.stdout.trim()) {
-      throw new Error('Configured Git URL rewrites are forbidden');
-    }
-
-    const fetchUrls = this.text(['remote', 'get-url', '--all', 'origin']).split('\n').filter(Boolean);
-    if (fetchUrls.length !== 1 || !this.acceptedRemoteUrls.has(fetchUrls[0])) {
-      throw new Error(`Untrusted effective origin fetch URL(s): ${fetchUrls.join(', ') || 'none'}`);
-    }
-
-    let effectivePushUrls = [];
-    if (requirePush) {
-      effectivePushUrls = this.text(['remote', 'get-url', '--push', '--all', 'origin'])
-        .split('\n')
-        .filter(Boolean);
-      if (effectivePushUrls.length !== 1 || !this.acceptedRemoteUrls.has(effectivePushUrls[0])) {
-        throw new Error(`Untrusted effective origin push URL(s): ${effectivePushUrls.join(', ') || 'none'}`);
-      }
-    }
+    const { originUrl } = this.assertSafeLocalConfig();
     if (requirePush && this.trustedSource !== null) this.assertTrustedSource();
-    return { fetchUrl: fetchUrls[0], pushUrl: effectivePushUrls[0] ?? null };
+    return { fetchUrl: originUrl, pushUrl: requirePush ? originUrl : null };
   }
 
   remoteMain() {
@@ -155,14 +233,9 @@ export class Git {
   remoteRef(ref, { calibrationOnly = true } = {}) {
     if (calibrationOnly) assertCalibrationRef(ref);
     else if (ref !== 'refs/heads/main') throw new Error(`Unsupported trusted ref: ${ref}`);
+    this.assertTrustedRemote();
     const output = this.text(['ls-remote', '--heads', this.remote, ref]);
-    if (!output) return null;
-    const lines = output.split('\n');
-    if (lines.length !== 1) throw new Error(`Expected one remote value for ${ref}`);
-    const [sha, observedRef] = lines[0].split(/\s+/);
-    if (observedRef !== ref) throw new Error(`Malformed remote value for ${ref}`);
-    assertSha(sha);
-    return sha;
+    return parseRemoteAdvertisement(output, [ref])[ref];
   }
 
   remoteCalibrationRefs(refs) {
@@ -171,17 +244,9 @@ export class Git {
       throw new Error('Remote calibration observation requires unique fixed refs');
     }
     for (const ref of uniqueRefs) assertCalibrationRef(ref);
+    this.assertTrustedRemote();
     const output = this.text(['ls-remote', '--heads', this.remote, ...uniqueRefs]);
-    const observed = Object.fromEntries(uniqueRefs.map((ref) => [ref, null]));
-    for (const line of output.split('\n').filter(Boolean)) {
-      const [sha, ref, extra] = line.split(/\s+/);
-      if (!Object.hasOwn(observed, ref) || observed[ref] !== null || extra !== undefined) {
-        throw new Error(`Malformed or duplicate remote calibration value for ${ref ?? 'unknown ref'}`);
-      }
-      assertSha(sha);
-      observed[ref] = sha;
-    }
-    return observed;
+    return parseRemoteAdvertisement(output, uniqueRefs);
   }
 
   bindTrustedSource(source) {
@@ -205,6 +270,23 @@ export class Git {
     }
     return this.trustedSource;
   }
+}
+
+export function parseRemoteAdvertisement(output, refs) {
+  const uniqueRefs = [...new Set(refs)];
+  if (uniqueRefs.length !== refs.length || uniqueRefs.length === 0) {
+    throw new Error('Remote advertisement requires unique requested refs');
+  }
+  const observed = Object.fromEntries(uniqueRefs.map((ref) => [ref, null]));
+  for (const line of output.split('\n').filter(Boolean)) {
+    const match = line.match(/^([0-9a-f]{40})\t([^\t\r\n ]+)$/);
+    if (!match) throw new Error('Malformed remote advertisement record');
+    const [, sha, ref] = match;
+    if (!Object.hasOwn(observed, ref)) throw new Error(`Unexpected advertised ref: ${ref}`);
+    if (observed[ref] !== null) throw new Error(`Duplicate advertised ref: ${ref}`);
+    observed[ref] = sha;
+  }
+  return observed;
 }
 
 export function calibrationRef(role) {
@@ -235,6 +317,27 @@ export function pushWithLease(git, ref, expected, next) {
       `--force-with-lease=${ref}:${expected ?? ''}`,
       git.remote,
       `${next}:${ref}`,
+    ],
+    { allowFailure: true },
+  );
+}
+
+export function pushAtomicApproval(git, graph) {
+  const headRef = calibrationRef('head');
+  const approvedRef = calibrationRef('approved');
+  for (const sha of [graph.a, graph.b]) assertSha(sha);
+  git.assertTrustedRemote({ requirePush: true });
+  return git.run(
+    [
+      'push',
+      '--porcelain',
+      '--atomic',
+      '--no-follow-tags',
+      `--force-with-lease=${headRef}:${graph.b}`,
+      `--force-with-lease=${approvedRef}:${graph.a}`,
+      git.remote,
+      `${graph.b}:${headRef}`,
+      `${graph.b}:${approvedRef}`,
     ],
     { allowFailure: true },
   );
@@ -363,9 +466,15 @@ function requireGraphRefs(git, graph, { create }) {
   return results;
 }
 
+function readState(git) {
+  const headRef = calibrationRef('head');
+  const approvedRef = calibrationRef('approved');
+  const observed = git.remoteCalibrationRefs([headRef, approvedRef]);
+  return { head: observed[headRef], approved: observed[approvedRef] };
+}
+
 function observeState(git, graph) {
-  const head = git.remoteRef(calibrationRef('head'));
-  const approved = git.remoteRef(calibrationRef('approved'));
+  const { head, approved } = readState(git);
   if (![graph.a, graph.b].includes(head)) {
     throw new Error(`Calibration head is ${head ?? 'absent'}, expected exact A or B`);
   }
@@ -376,6 +485,27 @@ function observeState(git, graph) {
     throw new Error('Calibration approval cannot advance to B before head');
   }
   return { head, approved };
+}
+
+function approveHead(git, graph) {
+  const before = observeState(git, graph);
+  if (before.head !== graph.b) throw new Error('Cannot approve B before calibration head is exact B');
+  if (before.approved === graph.b) return 'reused';
+  const push = pushAtomicApproval(git, graph);
+  const after = readState(git);
+  if (push.status !== 0) {
+    if (after.head === graph.b && after.approved === graph.b) return 'approved-lost-success';
+    throw new Error(
+      `Atomic approval was rejected; head=${after.head ?? 'absent'}, approved=${after.approved ?? 'absent'}: ` +
+        `${push.stderr.trim() || push.stdout.trim()}`,
+    );
+  }
+  if (after.head !== graph.b || after.approved !== graph.b) {
+    throw new Error(
+      `Atomic approval verification failed; head=${after.head ?? 'absent'}, approved=${after.approved ?? 'absent'}`,
+    );
+  }
+  return 'advanced';
 }
 
 export function runStateCalibration({ mode, git = new Git(), source }) {
@@ -409,11 +539,9 @@ export function runStateCalibration({ mode, git = new Git(), source }) {
       approved: before.approved === graph.a ? 'retained-a' : 'retained-b',
     };
   } else {
-    const before = observeState(git, graph);
-    if (before.head !== graph.b) throw new Error('Cannot approve B before calibration head is exact B');
     transition = {
       head: 'retained-b',
-      approved: advanceRef(git, calibrationRef('approved'), graph.a, graph.b),
+      approved: approveHead(git, graph),
     };
   }
 
