@@ -27,13 +27,44 @@ In the future contract, merging the current validated release PR is explicit
 authorization to publish its exact source. **Do not merge today's PR:** no
 publication or reconciliation automation exists in this slice.
 
+## Ready-state exact-version QA
+
+Ready or refreshed-ready proposals may run the read-only `Ready release QA`
+workflow. The workflow treats its event only as a wake-up and validates the
+full staged commit and source commit directly. The staged commit must be the
+structured one-parent empty intent for exact version `1.0.1`; PR title and body
+are never inputs.
+
+The runner creates a detached temporary worktree at the exact source. Its only
+candidate changes are the root, core, and add-on manifest versions; the exact
+add-on-to-core dependency; and the corresponding lockfile fields. It installs,
+tests with an explicit `LAB_01_EXPECTED_PACKAGE_VERSION=1.0.1` contract, runs
+any declared builds, and packs the two allowlisted packages. Ordinary source
+tests default to strict `1.0.0` assertions; candidate QA does not skip them. A
+pinned `verdaccio@6.8.0` listens only on `127.0.0.1`, has no uplink, and accepts
+only `@fablebook/lab-01-core` and `@fablebook/lab-01-addon`. Both packages are
+published there at exact version `1.0.1`, then their metadata and downloaded
+tarball hashes are checked against the packed candidates.
+
+The final consumer is generated outside the repository and has no workspace
+configuration. Its lockfile must resolve both exact versions from the ephemeral
+loopback registry, retain the add-on's exact core dependency, and contain no
+link, file, or workspace resolution. The retained JSON evidence binds the
+staged SHA, source SHA and tree, transformed Git tree and content hash, package
+names and integrities, loopback metadata/tarball URLs, consumer result, step
+durations, and successful cleanup. Evidence for another staged SHA, source, or
+transformed identity fails closed.
+
+The workflow has only `contents: read`, does not persist checkout credentials,
+and performs no GitHub or public npm write. All worktrees, processes, registry
+storage, generated credentials/configuration, packages, and consumer files are
+temporary; only sanitized evidence is retained.
+
 ## Not yet automated
 
 The following lifecycle stages are intentionally **NOT YET AUTOMATED**:
 
-- marking the proposal ready and starting release QA;
 - replacing a closed, unmerged proposal;
-- materializing and testing exact `1.0.1` packages with isolated Verdaccio;
 - publishing packages, reconciling branches, tagging `v1.0.1`, or creating a
   GitHub Release.
 

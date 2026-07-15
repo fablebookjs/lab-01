@@ -1,0 +1,72 @@
+name: Ready release QA
+
+on:
+  pull_request:
+    branches:
+      - releases/v1.0
+    types:
+      - ready_for_review
+      - synchronize
+  workflow_dispatch:
+    inputs:
+      staged_sha:
+        description: Full staged release-intent commit SHA
+        required: true
+        type: string
+      source_sha:
+        description: Full source commit SHA named by the intent
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ready-release-qa-${{ github.event.pull_request.number || inputs.staged_sha }}
+  cancel-in-progress: true
+
+jobs:
+  exact-version-qa:
+    if: >-
+      github.repository == 'fablebookjs/lab-01' &&
+      (github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false)
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_REPOSITORY: fablebookjs/lab-01
+      STAGED_SHA: ${{ github.event.pull_request.head.sha || inputs.staged_sha }}
+      SOURCE_SHA: ${{ github.event.pull_request.base.sha || inputs.source_sha }}
+    steps:
+      - name: Assert the read-only laboratory boundary
+        run: |
+          test "$GITHUB_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$STAGED_SHA" != ""
+          test "$SOURCE_SHA" != ""
+
+      - name: Check out the trusted release source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.base.sha || inputs.source_sha }}
+
+      - name: Fetch the exact staged intent without changing a remote ref
+        run: git fetch --no-tags origin "$STAGED_SHA"
+
+      - name: Install the pinned local QA tooling
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Test the exact proposed packages through loopback Verdaccio
+        run: >-
+          node scripts/qa-ready-release.mjs
+          --repository "$EXPECTED_REPOSITORY"
+          --staged-sha "$STAGED_SHA"
+          --source-sha "$SOURCE_SHA"
+          --evidence "$RUNNER_TEMP/ready-release-qa.json"
+
+      - name: Retain sanitized exact-snapshot evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ready-release-qa-${{ env.STAGED_SHA }}
+          path: ${{ runner.temp }}/ready-release-qa.json
+          if-no-files-found: error
+          retention-days: 7

@@ -6,6 +6,10 @@
     "packages/*"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "qa:ready": "node scripts/qa-ready-release.mjs"
+  },
+  "devDependencies": {
+    "verdaccio": "6.8.0"
   }
 }

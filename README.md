@@ -23,3 +23,10 @@ that same draft PR from the exact current release-line head.
 
 See [the release-process note](docs/release-process.md) for the current contract
 and explicit automation limits.
+
+Ready-state package QA is implemented as a read-only exact-snapshot check. It
+materializes `1.0.1` only in a temporary worktree, publishes only the two
+synthetic candidates to loopback Verdaccio, installs them into a temporary
+non-workspace consumer, records sanitized identity and integrity evidence, and
+then removes the worktree, registry process, and registry storage. It does not
+publish to public npm or mutate GitHub state.
