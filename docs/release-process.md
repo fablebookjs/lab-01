@@ -61,6 +61,42 @@ its exact source. **Do not merge today's draft PR:** the public `1.0.0`
 baseline, npm trusted-publisher settings, GitHub environment, and fresh QA for
 the manifest-hardened head are still external gates.
 
+## One-time public baseline bootstrap
+
+The synthetic public `1.0.0` baseline is prepared separately from the patch
+release. From a clone whose `origin` is exactly `fablebookjs/lab-01`, inspect
+the non-mutating plan first:
+
+```sh
+node scripts/bootstrap-npm-baseline.mjs --preflight
+```
+
+The script rejects any repository, tag commit, package, version, or package
+order outside its fixed allowlist. It archives the exact `v1.0.0` commit—not
+the current release branch—packs core before add-on, binds the default registry
+and `@fablebook` scope to `https://registry.npmjs.org/`, and compares any
+existing version's integrity and shasum with the locally packed artifact.
+
+Only the operator may start the mutating mode in an interactive terminal:
+
+```sh
+node scripts/bootstrap-npm-baseline.mjs --publish
+```
+
+The operator must type the displayed confirmation exactly. The script then
+uses npm's interactive web login with a temporary user config and home; it
+does not accept inherited npm configuration or credential variables and
+removes its config, cache, packed artifacts, and login material on success or
+failure. It never writes the repository or the normal `~/.npmrc`.
+
+Publication is bounded to `@fablebook/lab-01-core@1.0.0` followed by
+`@fablebook/lab-01-addon@1.0.0`, always with public access. If core exists and
+matches, a rerun skips it and continues with the add-on. An existing mismatch
+or incomplete registry response stops without overwrite; after any failure,
+rerun `--preflight` before deciding whether to resume. This bootstrap does not
+publish `1.0.1`, merge the release PR, or alter any Git ref, tag, Release,
+workflow, Pages setting, or Storybook resource.
+
 ## Ready-state exact-version QA
 
 Ready or refreshed-ready proposals may run the read-only `Ready release QA`
