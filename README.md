@@ -28,14 +28,15 @@ closed PR #1 and created [draft PR #12](https://github.com/fablebookjs/lab-01/pu
 rerunning the same delivery recognized the existing replacement without
 creating another PR.
 
-The maintainer now has an explicit ownership handoff for the issue #19
-finalizer. With no open proposal, it accepts only the uniquely latest merged
-`staged/v1.0` lifecycle PR, its exact ordered merge `M`, and a current line at a
-validated finalizer-owned M/H/V/J state. It performs no ref, PR-body, or QA
-dispatch write in those states. After the finalizer creates one exact draft
-`1.0.2` intent from the current line, the maintainer recognizes that proposal
-without applying its fixed `1.0.1` behavior. The finalizer itself is not added
-or claimed live by this prerequisite.
+This prerequisite gives the maintainer an explicit ownership handoff for the
+issue #19 finalizer. With no open proposal, it accepts only the uniquely latest
+merged `staged/v1.0` lifecycle PR, its exact ordered merge `M`, and the concrete
+deterministic `V` snapshot. It performs no ref, PR-body, or QA dispatch write in
+those states. H/J ownership remains deliberately fail-closed until the
+finalizer supplies a committed durable observer/schema. After the finalizer
+creates one exact draft `1.0.2` intent from the current line, the maintainer
+recognizes that proposal without applying its fixed `1.0.1` behavior. The
+finalizer itself is not added or claimed live by this prerequisite.
 
 See [the release-process note](docs/release-process.md) for the current contract
 and explicit automation limits.

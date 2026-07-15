@@ -20,8 +20,10 @@ This repository currently demonstrates only the first visible release intent:
    the historical review and comment record. The first live transition closed
    PR #1 and created draft PR #12.
 6. When the uniquely latest lifecycle PR is merged with the exact ordered
-   `[source, intent]` graph, the maintainer validates the no-open M/post-M state
-   and yields ownership without changing `staged/v1.0`, PR text, or QA state.
+   `[source, intent]` graph, the maintainer validates exact `M` or the concrete
+   deterministic `V` snapshot and yields ownership without changing
+   `staged/v1.0`, PR text, or QA state. H/J remain fail-closed pending the
+   finalizer's durable observer/schema.
 7. When the finalizer later creates one exact draft `1.0.2` proposal from the
    current line, the maintainer validates and yields to that proposal instead
    of applying the fixed G1 `1.0.1` refresh or QA behavior.
@@ -148,26 +150,27 @@ PR. That PR must be merged—not merely closed—from the same repository's
 the intent must be the exact one-parent empty `1.0.1` intent; and merge `M` must
 have ordered parents `[source, intent]` and the sealed source tree.
 
-The current release line may then be:
+The current release line may currently be:
 
 - exact `M`;
-- an explicitly finalizer-observed late clean `H` bound to that `M`;
 - deterministic snapshot `V` at `release-snapshots/v1.0.1`, with one parent
-  `M` and the exact structured snapshot trailers; or
-- a finalizer-observed normal reconciliation `J`, with ordered parents `[H, V]`,
-  its expected tree, and exact M/V/H metadata.
+  `M` and the exact structured snapshot trailers.
 
-The H/J observer binding is a typed integration seam because the finalizer's
-committed reconciliation marker interface is not settled yet. The maintainer
-does not infer those states from arbitrary ancestry. Missing pages, duplicate
+H/J ownership is intentionally pending because the finalizer's committed
+durable observer and reconciliation marker schema are not settled yet. The
+maintainer does not accept caller-authored facts or infer those states from
+arbitrary ancestry; H/J therefore fail closed. Missing pages, duplicate
 or malformed lifecycle PRs, a closed-unmerged latest PR, stale staged state,
-wrong versions, unexplained line heads, or contradictory M/V/J graphs fail
+wrong versions, unexplained line heads, or contradictory M/V evidence fail
 closed.
 
-Every accepted finalizer-owned state returns before staged/ref/PR-body/QA
+Every accepted M/V finalizer-owned state returns before staged/ref/PR-body/QA
 writes. An exact next proposal is accepted only when it is the unique latest
-open lifecycle PR, remains draft, and its empty `1.0.2` intent has the exact
-current release-line source and unchanged tree.
+open lifecycle PR, remains draft, its PR base SHA equals the current release
+head, and its empty `1.0.2` intent has that exact source and unchanged tree.
+Before returning, the maintainer repeats the complete bounded all-state history
+snapshot, rehydrates the latest lifecycle PR, and reclassifies every exact
+identity; a created, closed, reordered, or changed PR fails the run.
 
 ## Ready-state exact-version QA
 

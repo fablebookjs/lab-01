@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  assertStableOwnershipSnapshots,
   classifyMaintainerOwnership,
   readCompletePullHistory,
   settleMaintainerOwnership,
@@ -171,15 +172,13 @@ const nextObservation = () => ({
   postMerge: null,
 });
 
-test('accepts no-open M, late H, snapshot V, normal J, and exact next 1.0.2 ownership', () => {
+test('accepts concrete no-open M, snapshot V, and exact next 1.0.2 ownership', () => {
   assert.deepEqual(classifyMaintainerOwnership(baseObservation()), {
     owner: 'finalizer-owns-release',
     state: 'sealed-merge',
     mergeSha: MERGE,
   });
-  assert.equal(classifyMaintainerOwnership(lateObservation()).state, 'late-head');
   assert.equal(classifyMaintainerOwnership(versionObservation()).state, 'version-snapshot');
-  assert.equal(classifyMaintainerOwnership(reconciliationObservation()).state, 'normal-reconciliation');
   assert.deepEqual(classifyMaintainerOwnership(nextObservation()), {
     owner: 'next-proposal-owned',
     state: 'draft',
@@ -203,9 +202,7 @@ test('accepted handoff states never access a maintenance write or dispatch adapt
   );
   for (const observation of [
     baseObservation(),
-    lateObservation(),
     versionObservation(),
-    reconciliationObservation(),
     nextObservation(),
   ]) {
     const result = await settleMaintainerOwnership({ observation, effects });
@@ -234,7 +231,7 @@ test('preserves the existing exact open 1.0.1 maintainer path', async () => {
 test('reads complete paginated all-state history and rejects ambiguous or duplicate pages', async () => {
   const first = Array.from({ length: 100 }, (_, index) => ({ number: index + 1 }));
   const calls = [];
-  const pages = [first, [{ number: 101 }], first];
+  const pages = [first, [{ number: 101 }], first, [{ number: 101 }]];
   const pulls = await readCompletePullHistory({
     request: async (path) => {
       calls.push(path);
@@ -246,6 +243,7 @@ test('reads complete paginated all-state history and rejects ambiguous or duplic
     '/repos/fablebookjs/lab-01/pulls?state=all&per_page=100&page=1',
     '/repos/fablebookjs/lab-01/pulls?state=all&per_page=100&page=2',
     '/repos/fablebookjs/lab-01/pulls?state=all&per_page=100&page=1',
+    '/repos/fablebookjs/lab-01/pulls?state=all&per_page=100&page=2',
   ]);
 
   await assert.rejects(
@@ -259,13 +257,38 @@ test('reads complete paginated all-state history and rejects ambiguous or duplic
     }),
     /duplicate or malformed paginated PR history/,
   );
-  let changed = 0;
-  await assert.rejects(
-    readCompletePullHistory({
-      request: async () => (++changed === 1 ? [{ number: 1 }] : [{ number: 2 }]),
-    }),
-    /history changed while paginating/,
-  );
+  const authority = {
+    number: 12,
+    state: 'open',
+    draft: true,
+    merged: false,
+    merged_at: null,
+    merge_commit_sha: null,
+    base: { ref: RELEASE_LINE, sha: SOURCE, repo: { full_name: REPOSITORY } },
+    head: { ref: STAGED_LINE, sha: INTENT, repo: { full_name: REPOSITORY } },
+  };
+  const mutations = [
+    (value) => (value.state = 'closed'),
+    (value) => (value.draft = false),
+    (value) => (value.merged = true),
+    (value) => (value.merged_at = '2026-07-16T01:00:00Z'),
+    (value) => (value.merge_commit_sha = MERGE),
+    (value) => (value.base.ref = 'main'),
+    (value) => (value.base.sha = LATE),
+    (value) => (value.base.repo.full_name = 'fork/lab-01'),
+    (value) => (value.head.ref = 'other'),
+    (value) => (value.head.sha = LATE),
+    (value) => (value.head.repo.full_name = 'fork/lab-01'),
+  ];
+  for (const mutate of mutations) {
+    let sweep = 0;
+    const changed = structuredClone(authority);
+    mutate(changed);
+    await assert.rejects(
+      readCompletePullHistory({ request: async () => (++sweep === 1 ? [authority] : [changed]) }),
+      /changed across complete bounded snapshots/,
+    );
+  }
 });
 
 test('fails closed on duplicate, malformed, stale, wrong-version, and non-draft proposal state', () => {
@@ -331,6 +354,15 @@ test('fails closed on duplicate, malformed, stale, wrong-version, and non-draft 
       /must be draft/,
     ],
     [
+      'next proposal base SHA is not current',
+      () => {
+        const value = nextObservation();
+        value.pulls[1].base.sha = SOURCE;
+        return value;
+      },
+      /base SHA does not equal the current release line/,
+    ],
+    [
       'open proposal without draft state',
       () => {
         const value = nextObservation();
@@ -391,7 +423,7 @@ test('fails closed on duplicate, malformed, stale, wrong-version, and non-draft 
   }
 });
 
-test('fails closed on merged, snapshot, and post-M graph contradictions', () => {
+test('fails closed on merged, snapshot, and pending H/J state', () => {
   const cases = [
     [
       'reversed M parents',
@@ -412,9 +444,9 @@ test('fails closed on merged, snapshot, and post-M graph contradictions', () => 
       /sealed source tree/,
     ],
     [
-      'unexplained post-M line',
-      () => ({ ...baseObservation(), releaseHeadSha: LATE }),
-      /lacks an exact finalizer observation binding/,
+      'arbitrary H self-attestation',
+      lateObservation,
+      /awaits a concrete durable finalizer observer/,
     ],
     [
       'wrong V parent',
@@ -444,43 +476,58 @@ test('fails closed on merged, snapshot, and post-M graph contradictions', () => 
       /snapshot metadata/,
     ],
     [
-      'stale H binding',
-      () => {
-        const value = lateObservation();
-        value.postMerge.mergeSha = SOURCE;
-        return value;
-      },
-      /lacks an exact finalizer observation binding/,
-    ],
-    [
-      'reversed J parents',
-      () => {
-        const value = reconciliationObservation();
-        value.commits[RECONCILIATION].parents = [SNAPSHOT, LATE];
-        return value;
-      },
-      /normal J finalizer binding or graph/,
-    ],
-    [
-      'wrong J structured metadata',
-      () => {
-        const value = reconciliationObservation();
-        value.postMerge.metadata.snapshotSha = SOURCE;
-        return value;
-      },
-      /normal J finalizer binding or graph/,
-    ],
-    [
-      'wrong J tree',
-      () => {
-        const value = reconciliationObservation();
-        value.commits[RECONCILIATION].commitTree = 'tree-wrong';
-        return value;
-      },
-      /normal J finalizer binding or graph/,
+      'arbitrary J self-attestation',
+      reconciliationObservation,
+      /awaits a concrete durable finalizer observer/,
     ],
   ];
   for (const [name, fixture, pattern] of cases) {
     assert.throws(() => classifyMaintainerOwnership(fixture()), pattern, name);
   }
+});
+
+const classifiedSnapshot = (observation) => ({
+  observation,
+  decision: classifyMaintainerOwnership(observation),
+});
+
+test('rejects same-number changes and reordered history across final ownership classification', () => {
+  const firstObservation = nextObservation();
+  const sameNumberChanged = nextObservation();
+  sameNumberChanged.pulls[0].merged_at = '2026-07-16T02:00:00Z';
+  assert.throws(
+    () => assertStableOwnershipSnapshots(
+      classifiedSnapshot(firstObservation),
+      classifiedSnapshot(sameNumberChanged),
+    ),
+    /changed across complete all-state classifications/,
+  );
+
+  const reordered = nextObservation();
+  reordered.pulls.reverse();
+  assert.throws(
+    () => assertStableOwnershipSnapshots(
+      classifiedSnapshot(firstObservation),
+      classifiedSnapshot(reordered),
+    ),
+    /changed across complete all-state classifications/,
+  );
+});
+
+test('rejects a lifecycle PR created and closed between ownership snapshots', () => {
+  const first = classifiedSnapshot(baseObservation());
+  const changed = baseObservation();
+  changed.pulls.push({
+    ...openPull({ number: 13, sha: INTENT }),
+    state: 'closed',
+    draft: false,
+    merged: false,
+    merged_at: null,
+    merge_commit_sha: null,
+  });
+  assert.throws(
+    () => classifyMaintainerOwnership(changed),
+    /closed without a merge commit/,
+  );
+  assert.equal(first.decision.state, 'sealed-merge');
 });
