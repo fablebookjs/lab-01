@@ -77,6 +77,13 @@ base is the exact v2 base branch. It checks out exact
 runs the trusted base copy of the checker. It never checks out or executes PR
 head code, calls an API, or mutates a PR.
 
+The `synchronize` trigger remains useful evidence for natural human-authored
+head updates, but the acceptance sequence does not depend on a synchronize run
+from the state workflow's `GITHUB_TOKEN` ref update. The retained authority
+baseline shows that token-authored writes do not recursively trigger dependable
+workflows. Consequently, both decisive B checks below are woken by explicit
+authenticated human PR-body edits.
+
 The checker reads `GITHUB_EVENT_PATH` and requires the exact repository and
 event, a matching positive PR number other than protected evidence PRs 12, 16,
 and 19, an open non-draft non-merged same-repository PR, exact fixed base/head
@@ -263,8 +270,8 @@ be present in that current commit's rollup.
 | Phase | PR head / body authorization | Latest exact REST check | GraphQL `(mergeable, mergeStateStatus, rollup.state)` |
 | --- | --- | --- | --- |
 | `a-green` | A / A after `opened` | `(A, completed, success, APP_ID, github-actions)` | `(MERGEABLE, CLEAN, SUCCESS)` |
-| `b-failing` | B / A after `synchronize` | `(B, completed, failure, APP_ID, github-actions)`; A success remains retained on A | `(MERGEABLE, UNSTABLE, FAILURE)` |
-| `b-green` | B / B after `edited` | newest exact B run `(B, completed, success, APP_ID, github-actions)` | `(MERGEABLE, CLEAN, SUCCESS)` |
+| `b-failing` | B / A after authenticated human `edited` wake-up | `(B, completed, failure, APP_ID, github-actions)`; A success remains retained on A | `(MERGEABLE, UNSTABLE, FAILURE)` |
+| `b-green` | B / B after second authenticated human `edited` authorization | newest exact B run `(B, completed, success, APP_ID, github-actions)` | `(MERGEABLE, CLEAN, SUCCESS)` |
 
 If GitHub reports `BLOCKED` rather than `UNSTABLE` for the completed B failure,
 retain that raw policy-aware result and stop: it still demonstrates policy
@@ -335,18 +342,182 @@ fails the evidence contract.
      -f mode=advance-head
    ```
 
-   The PR `synchronize` run must attach the same context to exact B and fail
-   because the retained body still authorizes A. Confirm A's old success still
-   exists, B's current PR rollup contains the failure, and policy is not clean.
-   Poll for exact `b-failing`. With `strict=false`, this isolates current-head
-   check binding from base-update strictness.
+   Read back the same PR and exact remote refs. Record whether a `synchronize`
+   run is absent, awaiting approval, queued/running, or completed. Preserve it
+   as evidence if present, but do not wait for it or use it as the required
+   B/A failure. Acceptance must not depend on token-authored synchronize.
 
-5. Edit only the same PR body so its sole machine line is
-   `Authorized-Head-SHA: B`. The `edited` run must attach to current B and make
-   the same context/App pair green. Poll for exact `b-green`, reread protection,
-   and verify the stable PR remains open, non-draft, and never merged.
+5. Before authorizing B, require the authenticated human operator. The commands
+   below avoid shell evaluation of PR text: `jq` writes a fixed body file and
+   `gh pr edit --body-file` passes the file directly. `PR`, `A`, and `B` must be
+   literal values already recorded by the operator; do not populate them by
+   evaluating untrusted PR content.
 
-6. Retain the v2 PR, all new refs, runs, REST/GraphQL/protection responses, and
+   First record the authenticated identity and the pre-edit workflow-run set:
+
+   ```sh
+   gh api user > b-failing-operator.json
+   jq -e '.login == "ndelangen"' b-failing-operator.json
+
+   gh api \
+     -H 'X-GitHub-Api-Version: 2026-03-10' \
+     "repos/$REPO/actions/workflows/calibrate-required-check.yml/runs?event=pull_request&per_page=100" \
+     > b-failing-runs-before.json
+   ```
+
+   Stop unless the identity assertion succeeds. Generate a body which retains
+   exact authorization A and adds one clearly non-authoritative evidence line,
+   then use the authenticated human session to edit the same PR:
+
+   ```sh
+   jq -n -j --arg sha "$A" \
+     '"Required-check calibration v2.\n\nAuthorized-Head-SHA: \($sha)\nCalibration-Wake-Up-Evidence: b-stale-authorization"' \
+     > b-failing-body.md
+
+   gh pr edit "$PR" \
+     --repo "$REPO" \
+     --body-file b-failing-body.md
+
+   gh pr view "$PR" \
+     --repo "$REPO" \
+     --json number,state,isDraft,headRefName,headRefOid,baseRefName,body \
+     > b-failing-pr.json
+
+   jq -e --argjson number "$PR" --arg head "$B" --rawfile expected b-failing-body.md \
+     '.number == $number and .state == "OPEN" and .isDraft == false and
+      .baseRefName == "calibration/g1/required-check-pr/base" and
+      .headRefName == "calibration/g1/required-check-pr/head" and
+      .headRefOid == $head and .body == $expected' \
+     b-failing-pr.json
+   ```
+
+   Treat any failed identity or PR readback assertion as a stop. Read the exact
+   current merge ref without executing its contents and validate its one-record
+   shape:
+
+   ```sh
+   git ls-remote --refs \
+     https://github.com/fablebookjs/lab-01.git \
+     "refs/pull/$PR/merge" \
+     > b-failing-merge-ref.txt
+
+   jq -Rsre --arg ref "refs/pull/$PR/merge" \
+     'split("\n") | map(select(length > 0)) as $lines |
+      select(($lines | length) == 1) |
+      ($lines[0] | capture("^(?<sha>[0-9a-f]{40})\\t(?<ref>[^\\t ]+)$")) |
+      select(.ref == $ref) | .sha' \
+     b-failing-merge-ref.txt \
+     > b-failing-merge-sha.txt
+
+   gh api \
+     -H 'X-GitHub-Api-Version: 2026-03-10' \
+     "repos/$REPO/actions/workflows/calibrate-required-check.yml/runs?event=pull_request&per_page=100" \
+     > b-failing-runs-after.json
+
+   jq -ce \
+     --slurpfile before b-failing-runs-before.json \
+     --rawfile merge b-failing-merge-sha.txt \
+     '($merge | rtrimstr("\n")) as $merge_sha |
+      [.workflow_runs[] | . as $run |
+       select(([$before[0].workflow_runs[].id] | index($run.id)) == null) |
+       select(.event == "pull_request" and
+              .actor.login == "ndelangen" and
+              .head_branch == "calibration/g1/required-check-pr/head" and
+              .head_sha == $merge_sha)] as $runs |
+      select(($runs | length) == 1) | $runs[0]' \
+     b-failing-runs-after.json \
+     > b-failing-run.json
+
+   jq -e '.status == "completed" and .conclusion == "failure"' b-failing-run.json
+   jq -r '.id' b-failing-run.json > b-failing-run-id.txt
+   read -r B_FAILING_RUN_ID < b-failing-run-id.txt
+   gh run view "$B_FAILING_RUN_ID" --repo "$REPO" --log > b-failing-run.log
+
+   rg -F '"action": "edited"' b-failing-run.log
+   rg -F "\"number\": $PR" b-failing-run.log
+   rg -F "\"headSha\": \"$B\"" b-failing-run.log
+   rg -F "\"authorizedSha\": \"$A\"" b-failing-run.log
+   rg -F "\"remoteHeadSha\": \"$B\"" b-failing-run.log
+
+   gh api --paginate \
+     --slurp \
+     -H 'X-GitHub-Api-Version: 2026-03-10' \
+     "repos/$REPO/commits/$B/check-runs?filter=all&per_page=100" \
+     > b-failing-check-runs.json
+
+   jq -ce \
+     --arg sha "$B" \
+     --arg context "$CONTEXT" \
+     --argjson app_id "$APP_ID" \
+     --arg run "/actions/runs/$B_FAILING_RUN_ID/" \
+     '[.[].check_runs[] |
+       select(.head_sha == $sha and
+              .name == $context and
+              .app.id == $app_id and
+              .status == "completed" and
+              .conclusion == "failure" and
+              (.details_url | contains($run)))] |
+      sort_by(.id) | last | select(. != null)' \
+     b-failing-check-runs.json \
+     > b-failing-check.json
+   ```
+
+   Repeat the after-read and exclusion query every five seconds for at most five
+   minutes until the exact run is completed; never select a pre-edit run. The
+   exclusion query above must select exactly the new human run: event
+   `pull_request`, actor `ndelangen`, fixed head branch, and run `head_sha` equal
+   to the exact advertised merge ref. Its retained logs must report action
+   `edited`, exact `PR`, event head B, remote head B, and PR-body authorization
+   A. Then use the existing paginated REST check-run query on exact B and require
+   the same context/App pair with completed `failure`; the selected check details
+   must belong to `B_FAILING_RUN_ID`. Poll GraphQL for exact `b-failing` and
+   confirm A's success remains retained.
+
+   If the human `edited` run does not appear, awaits approval that cannot be
+   granted, does not execute, has the wrong actor/ref/SHA/action/PR, or lacks the
+   exact B/A failure context, stop. Do not change authorization to B.
+
+6. Only after exact `b-failing` is retained, make a second authenticated human
+   edit. The deterministic body below differs from the prior body only in the
+   authorization SHA; its non-authoritative wake-up/evidence line is unchanged:
+
+   ```sh
+   gh api \
+     -H 'X-GitHub-Api-Version: 2026-03-10' \
+     "repos/$REPO/actions/workflows/calibrate-required-check.yml/runs?event=pull_request&per_page=100" \
+     > b-green-runs-before.json
+
+   jq -n -j --arg sha "$B" \
+     '"Required-check calibration v2.\n\nAuthorized-Head-SHA: \($sha)\nCalibration-Wake-Up-Evidence: b-stale-authorization"' \
+     > b-green-body.md
+
+   gh pr edit "$PR" \
+     --repo "$REPO" \
+     --body-file b-green-body.md
+
+   gh pr view "$PR" \
+     --repo "$REPO" \
+     --json number,state,isDraft,headRefName,headRefOid,baseRefName,body \
+     > b-green-pr.json
+
+   jq -e --argjson number "$PR" --arg head "$B" --rawfile expected b-green-body.md \
+     '.number == $number and .state == "OPEN" and .isDraft == false and
+      .baseRefName == "calibration/g1/required-check-pr/base" and
+      .headRefName == "calibration/g1/required-check-pr/head" and
+      .headRefOid == $head and .body == $expected' \
+     b-green-pr.json
+   ```
+
+   Repeat the before/after run-set exclusion and exact actor, merge-ref, action,
+   PR, head, context, and App checks from step 5. The new human `edited` run must
+   produce exact B/B success. Poll for exact `b-green`, reread protection, and
+   verify the stable PR remains open, non-draft, and never merged.
+
+   These explicit human PR interactions are compatible with the product model
+   in which a maintainer authorizes release movement. They do not prove fully
+   autonomous dependent workflow dispatch after a `GITHUB_TOKEN` ref write.
+
+7. Retain the v2 PR, all new refs, runs, REST/GraphQL/protection responses, and
    the complete old v1 evidence. Cleanup is a separate authorized operation.
 
 ## Preservation boundary and non-goals

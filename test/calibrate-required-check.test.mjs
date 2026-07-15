@@ -1124,6 +1124,7 @@ test('workflows have exact state dispatch, PR trigger, permissions, and one stab
     checkYaml.replace('  pull_request:', '  pull_request:\n  push:'),
     checkYaml.replace('calibration/g1/required-check-pr/base', 'main'),
     checkYaml.replace('      - edited', '      - closed'),
+    checkYaml.replace('      - synchronize\n', ''),
     checkYaml.replace('      - reopened', ''),
     checkYaml.replace('permissions:\n  contents: read', 'permissions: { contents: write }'),
     checkYaml.replace('    runs-on: ubuntu-latest', '    permissions: { statuses: write }\n    runs-on: ubuntu-latest'),
@@ -1196,8 +1197,8 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.match(docs, /`opened`/);
   assert.match(docs, /`synchronize`/);
   assert.match(docs, /`edited`/);
-  assert.match(docs, /exact B and fail/);
-  assert.match(docs, /same context\/App pair green/);
+  assert.match(docs, /exact B\/A failure/);
+  assert.match(docs, /produce exact B\/B success/);
   assert.match(docs, /does not prove the identity, entitlement, or policy right/);
   assert.match(docs, /actions\/runs\/29437465131/);
   assert.match(docs, /actions\/runs\/29438908229/);
@@ -1216,4 +1217,19 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.match(docs, /point-in-time check/);
   assert.match(docs, /GitHub associates the\s+check run with the pull-request event's merge\/head state/s);
   assert.match(checkScript, /constants\.O_NONBLOCK/);
+  assert.match(docs, /acceptance sequence does not depend on a synchronize run/);
+  assert.match(docs, /Acceptance must not depend on token-authored synchronize/);
+  assert.doesNotMatch(docs, /The PR `synchronize` run must attach/);
+  const bFailingRow = docs.split('\n').find((line) => line.startsWith('| `b-failing`'));
+  assert.match(bFailingRow, /authenticated human `edited` wake-up/);
+  assert.doesNotMatch(bFailingRow, /synchronize/);
+  assert.match(docs, /absent, awaiting approval, queued\/running, or completed/);
+  assert.match(docs, /jq -e '\.login == "ndelangen"'/);
+  assert.match(docs, /actor `ndelangen`/);
+  assert.equal(docs.match(/Calibration-Wake-Up-Evidence: b-stale-authorization/g)?.length, 2);
+  assert.equal(docs.match(/--body-file b-(?:failing|green)-body\.md/g)?.length, 2);
+  assert.match(docs, /If the human `edited` run does not appear/);
+  assert.match(docs, /Do not change authorization to B/);
+  assert.match(docs, /differ.*only in the\s+authorization SHA/s);
+  assert.match(docs, /do not prove fully\s+autonomous dependent workflow dispatch/s);
 });
