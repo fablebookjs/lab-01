@@ -34,6 +34,26 @@ import {
 
 const OLD_NAMESPACE = 'refs/heads/calibration/g1/required-check';
 const BRANCH_NAMESPACE = 'calibration/g1/required-check-pr';
+const HUMAN_EDITED_RUN_SELECTOR = `
+[.workflow_runs[] | . as $run |
+ select(([$before[0].workflow_runs[].id] | index($run.id)) == null) |
+ select(.event == "pull_request" and
+        .actor.login == "ndelangen" and
+        .path == ".github/workflows/calibrate-required-check.yml" and
+        .head_branch == "calibration/g1/required-check-pr/head" and
+        .head_sha == $head and
+        .status == "completed" and
+        .conclusion == $conclusion)] as $runs |
+select(($runs | length) == 1) | $runs[0]
+`.trim();
+const CHECKER_EVIDENCE_SELECTOR = `
+.action == "edited" and
+.number == $number and
+.headSha == $head and
+.remoteHeadSha == $head and
+.remoteMergeSha == $merge and
+.authorizedSha == $authorized
+`.trim();
 
 function command(cwd, args, env = {}) {
   return execFileSync('git', args, {
@@ -227,6 +247,49 @@ function parseWorkflowYaml(yaml) {
   ].join('; ');
   return JSON.parse(
     execFileSync('ruby', ['-rpsych', '-rjson', '-e', ruby], { input: yaml, encoding: 'utf8' }),
+  );
+}
+
+function runHumanEditedRunSelector({ after, before, head, conclusion }) {
+  return spawnSync(
+    'jq',
+    [
+      '-ce',
+      '--argjson',
+      'before',
+      JSON.stringify([before]),
+      '--arg',
+      'head',
+      head,
+      '--arg',
+      'conclusion',
+      conclusion,
+      HUMAN_EDITED_RUN_SELECTOR,
+    ],
+    { encoding: 'utf8', input: JSON.stringify(after) },
+  );
+}
+
+function runCheckerEvidenceSelector({ evidence, number, head, merge, authorized }) {
+  return spawnSync(
+    'jq',
+    [
+      '-e',
+      '--argjson',
+      'number',
+      String(number),
+      '--arg',
+      'head',
+      head,
+      '--arg',
+      'merge',
+      merge,
+      '--arg',
+      'authorized',
+      authorized,
+      CHECKER_EVIDENCE_SELECTOR,
+    ],
+    { encoding: 'utf8', input: JSON.stringify(evidence) },
   );
 }
 
@@ -1149,6 +1212,124 @@ test('workflows have exact state dispatch, PR trigger, permissions, and one stab
   }
 });
 
+test('operator jq evidence distinguishes REST head B from the synthetic merge identity', () => {
+  const a = 'a'.repeat(40);
+  const b = 'b'.repeat(40);
+  const merge = 'c'.repeat(40);
+  const wrongHead = 'd'.repeat(40);
+  assert.notEqual(b, merge);
+
+  const oldRun = {
+    id: 100,
+    event: 'pull_request',
+    actor: { login: 'ndelangen' },
+    path: '.github/workflows/calibrate-required-check.yml',
+    head_branch: 'calibration/g1/required-check-pr/head',
+    head_sha: b,
+    status: 'completed',
+    conclusion: 'failure',
+  };
+  const failingRun = { ...oldRun, id: 101 };
+  const before = { workflow_runs: [oldRun] };
+  const selectedFailure = runHumanEditedRunSelector({
+    before,
+    after: { workflow_runs: [oldRun, failingRun] },
+    head: b,
+    conclusion: 'failure',
+  });
+  assert.equal(selectedFailure.status, 0, selectedFailure.stderr);
+  assert.equal(JSON.parse(selectedFailure.stdout).id, failingRun.id);
+
+  const successfulRun = { ...failingRun, id: 102, conclusion: 'success' };
+  const selectedSuccess = runHumanEditedRunSelector({
+    before: { workflow_runs: [oldRun, failingRun] },
+    after: { workflow_runs: [oldRun, failingRun, successfulRun] },
+    head: b,
+    conclusion: 'success',
+  });
+  assert.equal(selectedSuccess.status, 0, selectedSuccess.stderr);
+  assert.equal(JSON.parse(selectedSuccess.stdout).id, successfulRun.id);
+
+  const rejectedRuns = [
+    { name: 'merge SHA used as REST head', run: { ...failingRun, head_sha: merge } },
+    { name: 'wrong current B', run: { ...failingRun, head_sha: wrongHead } },
+    { name: 'wrong actor', run: { ...failingRun, actor: { login: 'github-actions[bot]' } } },
+    { name: 'wrong event', run: { ...failingRun, event: 'workflow_dispatch' } },
+    { name: 'wrong workflow', run: { ...failingRun, path: '.github/workflows/other.yml' } },
+    { name: 'wrong conclusion', run: { ...failingRun, conclusion: 'success' } },
+    { name: 'incomplete run', run: { ...failingRun, status: 'in_progress', conclusion: null } },
+  ];
+  for (const { name, run } of rejectedRuns) {
+    const result = runHumanEditedRunSelector({
+      before,
+      after: { workflow_runs: [oldRun, run] },
+      head: b,
+      conclusion: 'failure',
+    });
+    assert.notEqual(result.status, 0, name);
+  }
+  assert.notEqual(
+    runHumanEditedRunSelector({
+      before,
+      after: { workflow_runs: [oldRun, failingRun] },
+      head: wrongHead,
+      conclusion: 'failure',
+    }).status,
+    0,
+  );
+
+  const preexistingOnly = runHumanEditedRunSelector({
+    before: { workflow_runs: [failingRun] },
+    after: { workflow_runs: [failingRun] },
+    head: b,
+    conclusion: 'failure',
+  });
+  assert.notEqual(preexistingOnly.status, 0);
+
+  const extraMatch = runHumanEditedRunSelector({
+    before,
+    after: { workflow_runs: [oldRun, failingRun, { ...failingRun, id: 103 }] },
+    head: b,
+    conclusion: 'failure',
+  });
+  assert.notEqual(extraMatch.status, 0);
+
+  const checkerEvidence = {
+    action: 'edited',
+    number: 20,
+    headSha: b,
+    remoteHeadSha: b,
+    remoteMergeSha: merge,
+    authorizedSha: a,
+  };
+  const selectedCheckerEvidence = runCheckerEvidenceSelector({
+    evidence: checkerEvidence,
+    number: 20,
+    head: b,
+    merge,
+    authorized: a,
+  });
+  assert.equal(selectedCheckerEvidence.status, 0, selectedCheckerEvidence.stderr);
+  const selectedGreenCheckerEvidence = runCheckerEvidenceSelector({
+    evidence: { ...checkerEvidence, authorizedSha: b },
+    number: 20,
+    head: b,
+    merge,
+    authorized: b,
+  });
+  assert.equal(selectedGreenCheckerEvidence.status, 0, selectedGreenCheckerEvidence.stderr);
+  assert.notEqual(
+    runCheckerEvidenceSelector({
+      evidence: { ...checkerEvidence, remoteMergeSha: b },
+      number: 20,
+      head: b,
+      merge,
+      authorized: a,
+    }).status,
+    0,
+  );
+});
+
 test('scripts and documentation retain the release boundary and do not claim live proof', () => {
   const stateScript = readFileSync(
     new URL('../scripts/calibrate-required-check-state.mjs', import.meta.url),
@@ -1232,4 +1413,11 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.match(docs, /Do not change authorization to B/);
   assert.match(docs, /differ.*only in the\s+authorization SHA/s);
   assert.match(docs, /do not prove fully\s+autonomous dependent workflow dispatch/s);
+  assert.match(docs, /\.head_sha == \$head/);
+  assert.doesNotMatch(docs, /\.head_sha == \$merge_sha/);
+  assert.match(docs, /REST workflow-run `head_sha=B`/);
+  assert.match(docs, /run\.head_sha=B, checker\.headSha=B/);
+  assert.match(docs, /checker\.remoteMergeSha=advertised refs\/pull\/PR\/merge SHA/);
+  assert.match(docs, /remoteMergeSha.*B_FAILING_MERGE_SHA/s);
+  assert.match(docs, /--arg conclusion success/);
 });

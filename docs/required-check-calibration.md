@@ -416,21 +416,24 @@ fails the evidence contract.
 
    jq -ce \
      --slurpfile before b-failing-runs-before.json \
-     --rawfile merge b-failing-merge-sha.txt \
-     '($merge | rtrimstr("\n")) as $merge_sha |
-      [.workflow_runs[] | . as $run |
+     --arg head "$B" \
+     --arg conclusion failure \
+     '[.workflow_runs[] | . as $run |
        select(([$before[0].workflow_runs[].id] | index($run.id)) == null) |
        select(.event == "pull_request" and
               .actor.login == "ndelangen" and
+              .path == ".github/workflows/calibrate-required-check.yml" and
               .head_branch == "calibration/g1/required-check-pr/head" and
-              .head_sha == $merge_sha)] as $runs |
+              .head_sha == $head and
+              .status == "completed" and
+              .conclusion == $conclusion)] as $runs |
       select(($runs | length) == 1) | $runs[0]' \
      b-failing-runs-after.json \
      > b-failing-run.json
 
-   jq -e '.status == "completed" and .conclusion == "failure"' b-failing-run.json
    jq -r '.id' b-failing-run.json > b-failing-run-id.txt
    read -r B_FAILING_RUN_ID < b-failing-run-id.txt
+   read -r B_FAILING_MERGE_SHA < b-failing-merge-sha.txt
    gh run view "$B_FAILING_RUN_ID" --repo "$REPO" --log > b-failing-run.log
 
    rg -F '"action": "edited"' b-failing-run.log
@@ -438,6 +441,7 @@ fails the evidence contract.
    rg -F "\"headSha\": \"$B\"" b-failing-run.log
    rg -F "\"authorizedSha\": \"$A\"" b-failing-run.log
    rg -F "\"remoteHeadSha\": \"$B\"" b-failing-run.log
+   rg -F "\"remoteMergeSha\": \"$B_FAILING_MERGE_SHA\"" b-failing-run.log
 
    gh api --paginate \
      --slurp \
@@ -465,13 +469,21 @@ fails the evidence contract.
    Repeat the after-read and exclusion query every five seconds for at most five
    minutes until the exact run is completed; never select a pre-edit run. The
    exclusion query above must select exactly the new human run: event
-   `pull_request`, actor `ndelangen`, fixed head branch, and run `head_sha` equal
-   to the exact advertised merge ref. Its retained logs must report action
-   `edited`, exact `PR`, event head B, remote head B, and PR-body authorization
-   A. Then use the existing paginated REST check-run query on exact B and require
-   the same context/App pair with completed `failure`; the selected check details
-   must belong to `B_FAILING_RUN_ID`. Poll GraphQL for exact `b-failing` and
-   confirm A's success remains retained.
+   `pull_request`, actor `ndelangen`, exact workflow path, fixed head branch,
+   completed failure, and REST workflow-run `head_sha=B`. Its retained logs must
+   report action `edited`, exact `PR`, event head B, remote head B, PR-body
+   authorization A, and checker `remoteMergeSha` equal to the separately
+   advertised `refs/pull/PR/merge` SHA. The checker already enforces that
+   `GITHUB_SHA` equals that remote merge SHA. Then use the paginated REST
+   check-run query on exact B and require the same context/App pair with
+   completed `failure`; the selected check details must belong to
+   `B_FAILING_RUN_ID`. Poll GraphQL for exact `b-failing` and confirm A's success
+   remains retained.
+
+   The B/A evidence tuple deliberately distinguishes the identities:
+   `(run.head_sha=B, checker.headSha=B, checker.remoteHeadSha=B,
+   checker.remoteMergeSha=advertised refs/pull/PR/merge SHA,
+   checker.authorizedSha=A, check.conclusion=failure)`.
 
    If the human `edited` run does not appear, awaits approval that cannot be
    granted, does not execute, has the wrong actor/ref/SHA/action/PR, or lacks the
@@ -508,10 +520,19 @@ fails the evidence contract.
      b-green-pr.json
    ```
 
-   Repeat the before/after run-set exclusion and exact actor, merge-ref, action,
-   PR, head, context, and App checks from step 5. The new human `edited` run must
-   produce exact B/B success. Poll for exact `b-green`, reread protection, and
-   verify the stable PR remains open, non-draft, and never merged.
+   Repeat the before/after run-set exclusion from step 5 with
+   `--arg head "$B"` and `--arg conclusion success`. Repeat the exact actor,
+   workflow, action, PR, context, and App checks. REST workflow-run `head_sha`
+   must again be B; it must not be the synthetic merge SHA. Separately require
+   checker `remoteMergeSha` to equal the freshly advertised pull merge SHA. The
+   new human `edited` run must produce exact B/B success. Poll for exact
+   `b-green`, reread protection, and verify the stable PR remains open,
+   non-draft, and never merged.
+
+   The B/B evidence tuple is
+   `(run.head_sha=B, checker.headSha=B, checker.remoteHeadSha=B,
+   checker.remoteMergeSha=advertised refs/pull/PR/merge SHA,
+   checker.authorizedSha=B, check.conclusion=success)`.
 
    These explicit human PR interactions are compatible with the product model
    in which a maintainer authorizes release movement. They do not prove fully
