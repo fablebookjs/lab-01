@@ -26,3 +26,8 @@ and explicit automation limits.
 GitHub authority for normal post-publication reconciliation is tested separately
 on [fixed calibration refs](docs/reconciliation-calibration.md), so the completed
 release-PR demonstration remains intact.
+
+The destructive conflict path has a separate
+[fixed-ref recovery calibration](docs/conflict-recovery-calibration.md). It can
+retain an intentionally interrupted force and resume it into one draft recovery
+PR without targeting the live release line or proposal.
