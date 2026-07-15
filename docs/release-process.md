@@ -116,9 +116,15 @@ temporary; only sanitized evidence is retained.
 
 ## Not yet live or implemented
 
-Ready-state exact-version QA and close-and-regenerate are implemented and
-tested locally, but neither workflow is installed on the default branch or
-calibrated against the current release PR. Do not mark the PR ready or close it
+Ready-state exact-version QA is implemented and tested locally. Automatic
+`ready_for_review` and `synchronize` QA becomes live when this workflow is
+integrated into the PR base, `releases/v1.0`; it has not yet produced
+GitHub-current evidence. Its manual `workflow_dispatch` recovery trigger still
+requires the workflow on the default branch.
+
+Close-and-regenerate is also implemented and tested locally, but its
+`pull_request_target` workflow must be installed on the default branch and its
+write authority calibrated before closing the current PR. Do not close the PR
 for a lifecycle demonstration until that controlled installation is complete.
 
 Public package publication, branch reconciliation, tagging `v1.0.1`, and

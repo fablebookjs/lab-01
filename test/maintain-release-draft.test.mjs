@@ -98,7 +98,7 @@ The structured empty commit is authoritative. This editable title and body are p
 
 Automatic draft maintenance is live. A push to \`releases/v1.0\` refreshes this same draft PR from the exact new release-line head while preserving its number, base, head, and draft state.
 
-Ready-state exact-version QA and close-and-regenerate support are implemented, but remain offline until their workflows are installed on the default branch and calibrated against the current PR. Publication, branch reconciliation, a \`v1.0.1\` tag, and a GitHub Release are not implemented. Do not mark this PR ready or close it for a lifecycle demonstration until that calibration is complete. Do not merge this release PR.
+Ready-state exact-version QA is implemented. Once that workflow is present on the \`releases/v1.0\` base, ready and synchronize events run it against the current PR; no GitHub-current QA evidence has been captured yet. Its manual-dispatch fallback and close-and-regenerate remain offline until their workflows are installed on the default branch and GitHub authority is calibrated. Publication, branch reconciliation, a \`v1.0.1\` tag, and a GitHub Release are not implemented. Do not close this PR for a lifecycle demonstration until close-and-regenerate is installed and calibrated. Do not merge this release PR.
 
 See [docs/release-process.md](https://github.com/fablebookjs/lab-01/blob/releases/v1.0/docs/release-process.md) for the current contract and safety boundary.`,
   );

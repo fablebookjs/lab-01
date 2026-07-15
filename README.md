@@ -38,9 +38,12 @@ The checked-in workflow first uses `actions/checkout` read authority to
 materialize the exact staged commit with full history, then rederives the one
 current ready PR and both current refs through the read-only GitHub API. A
 manual dispatch supplies no SHA authority. Local proofs must instead pass
-`--authority local`; their evidence is explicitly non-GitHub-current. The
-ready-QA and close-and-regenerate workflows are not live until they are
-installed on the default branch and calibrated against the current release PR.
+`--authority local`; their evidence is explicitly non-GitHub-current. Once
+this workflow is integrated into the `releases/v1.0` base, ready and synchronize
+events install the automatic QA path; its manual-dispatch fallback still
+requires default-branch installation. No GitHub-current QA evidence has been
+captured yet. Close-and-regenerate separately requires default-branch
+installation and write-authority calibration before the current PR is closed.
 
 The pinned Verdaccio toolchain is bootstrapped separately from the candidate.
 Candidate, publish, and consumer npm subprocesses receive closed environments,
