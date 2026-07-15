@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -95,6 +95,18 @@ function remoteRef(f, ref) {
   return output ? output.split(/\s+/)[0] : null;
 }
 
+function updateRemoteRef(f, ref, sha) {
+  command(f.runner, ['push', '--force', '--no-follow-tags', f.remote, `${sha}:${ref}`]);
+}
+
+function deleteRemoteRef(f, ref) {
+  command(f.runner, ['push', '--no-follow-tags', f.remote, `:${ref}`]);
+}
+
+function setPullMergeRef(f, number, sha) {
+  updateRemoteRef(f, `refs/pull/${number}/merge`, sha);
+}
+
 function checkout(f, ref) {
   command(f.runner, ['checkout', '--detach', ref]);
 }
@@ -156,7 +168,7 @@ function evaluateEvent(git, event, overrides = {}) {
     repository: 'fablebookjs/lab-01',
     eventName: 'pull_request',
     githubRef: `refs/pull/${event.number}/merge`,
-    githubSha: 'f'.repeat(40),
+    githubSha: event.pull_request.head.sha,
     baseRef: `${BRANCH_NAMESPACE}/base`,
     headRef: `${BRANCH_NAMESPACE}/head`,
     ...overrides,
@@ -356,6 +368,7 @@ test('pull-request events prove opened A/A, synchronize B/A, and edited B/B bind
   try {
     const git = new Git(gitOptions(f));
     const setup = runStateCalibration({ mode: 'setup', git, source: f.source });
+    setPullMergeRef(f, 20, setup.graph.a);
 
     checkout(f, setup.graph.base);
     const aCheck = evaluateEvent(git, pullRequestEvent({
@@ -365,12 +378,27 @@ test('pull-request events prove opened A/A, synchronize B/A, and edited B/B bind
     }));
     assert.equal(aCheck.authorized, true);
     assert.equal(aCheck.reason, 'pr-body-authorizes-current-head');
+    assert.equal(aCheck.remoteBaseSha, setup.graph.base);
+    assert.equal(aCheck.remoteHeadSha, setup.graph.a);
+    assert.equal(aCheck.remoteMergeSha, setup.graph.a);
 
     checkoutMain(f);
     const advanced = runStateCalibration({ mode: 'advance-head', git, source: f.source });
     assert.equal(advanced.state.head, setup.graph.b);
 
     checkout(f, setup.graph.base);
+    assert.throws(
+      () => evaluateEvent(git, pullRequestEvent({
+        action: 'edited',
+        baseSha: setup.graph.base,
+        headSha: setup.graph.a,
+        authorizedSha: setup.graph.a,
+        before: setup.graph.b,
+      })),
+      /Event head SHA is not the current remote calibration head/,
+    );
+
+    setPullMergeRef(f, 20, setup.graph.b);
     const aOnB = evaluateEvent(git, pullRequestEvent({
       action: 'synchronize',
       baseSha: setup.graph.base,
@@ -390,6 +418,9 @@ test('pull-request events prove opened A/A, synchronize B/A, and edited B/B bind
     }));
     assert.equal(currentB.authorized, true);
     assert.equal(currentB.reason, 'pr-body-authorizes-current-head');
+    assert.equal(currentB.remoteBaseSha, setup.graph.base);
+    assert.equal(currentB.remoteHeadSha, setup.graph.b);
+    assert.equal(currentB.remoteMergeSha, setup.graph.b);
   } finally {
     f.cleanup();
   }
@@ -427,6 +458,7 @@ test('PR-body authorization rejects absent, duplicate, malformed, and arbitrary 
   try {
     const git = new RecordingGit(gitOptions(f));
     const setup = runStateCalibration({ mode: 'setup', git, source: f.source });
+    setPullMergeRef(f, 20, setup.graph.a);
     checkout(f, setup.graph.base);
     for (const body of [
       '',
@@ -727,6 +759,7 @@ test('global config is isolated and system or command-scope config overrides are
       assert.equal(globalProbe.status, 1);
       const setup = runStateCalibration({ mode: 'setup', git, source: f.source });
       assert.ok(git.advertisements.length > 0);
+      setPullMergeRef(f, 20, setup.graph.a);
       checkout(f, setup.graph.base);
       const checkGit = new RecordingGit(gitOptions(f));
       assert.equal(
@@ -737,7 +770,8 @@ test('global config is isolated and system or command-scope config overrides are
         })).authorized,
         true,
       );
-      assert.equal(checkGit.advertisements.length, 0);
+      assert.equal(checkGit.advertisements.length, 1);
+      assert.deepEqual(checkGit.networkEnvironments, [{}]);
       checkoutMain(f);
       assert.equal(existsSync(marker), false);
     } finally {
@@ -847,6 +881,7 @@ test('checkout-v7 includeIf remains rejected, then controlled live auth succeeds
     for (const environment of git.networkEnvironments) {
       assert.deepEqual(environment, git.controlledNetworkEnvironment());
     }
+    setPullMergeRef(f, 20, result.graph.a);
     checkout(f, result.graph.base);
     const readOnly = new RecordingGit({
       ...gitOptions(f),
@@ -861,6 +896,7 @@ test('checkout-v7 includeIf remains rejected, then controlled live auth succeeds
       })).authorized,
       true,
     );
+    assert.equal(readOnly.advertisements.length, 1);
     assert.ok(readOnly.networkEnvironments.every((environment) => Object.keys(environment).length === 0));
     checkoutMain(f);
     assert.equal(git.token, null);
@@ -888,6 +924,7 @@ test('event payload, action, identity, refs, and trusted base checkout all fail 
   try {
     const git = new Git(gitOptions(f));
     const setup = runStateCalibration({ mode: 'setup', git, source: f.source });
+    setPullMergeRef(f, 20, setup.graph.a);
     checkout(f, setup.graph.base);
     const valid = pullRequestEvent({
       action: 'opened',
@@ -944,10 +981,76 @@ test('event payload, action, identity, refs, and trusted base checkout all fail 
   }
 });
 
+test('one strict public advertisement binds current base, head, merge ref, and GITHUB_SHA', () => {
+  const f = fixture();
+  try {
+    const setupGit = new Git(gitOptions(f));
+    const setup = runStateCalibration({ mode: 'setup', git: setupGit, source: f.source });
+    setPullMergeRef(f, 20, setup.graph.a);
+    checkout(f, setup.graph.base);
+    const event = pullRequestEvent({
+      action: 'opened',
+      baseSha: setup.graph.base,
+      headSha: setup.graph.a,
+    });
+    const git = new RecordingGit(gitOptions(f));
+    assert.equal(evaluateEvent(git, event).authorized, true);
+    assert.deepEqual(git.advertisements, [[
+      'ls-remote',
+      '--refs',
+      'origin',
+      calibrationRef('base'),
+      calibrationRef('head'),
+      'refs/pull/20/merge',
+    ]]);
+    assert.deepEqual(git.networkEnvironments, [{}]);
+
+    assert.throws(
+      () => evaluateEvent(git, event, { githubSha: 'f'.repeat(40) }),
+      /GITHUB_SHA is not the current remote pull request merge ref/,
+    );
+
+    updateRemoteRef(f, calibrationRef('base'), f.source);
+    assert.throws(
+      () => evaluateEvent(git, event),
+      /Event base SHA is not the current remote calibration base/,
+    );
+    updateRemoteRef(f, calibrationRef('base'), setup.graph.base);
+
+    updateRemoteRef(f, 'refs/pull/20/merge', f.source);
+    assert.throws(
+      () => evaluateEvent(git, event),
+      /GITHUB_SHA is not the current remote pull request merge ref/,
+    );
+    deleteRemoteRef(f, 'refs/pull/20/merge');
+    assert.throws(
+      () => evaluateEvent(git, event),
+      /Required remote ref is absent: refs\/pull\/20\/merge/,
+    );
+    setPullMergeRef(f, 20, setup.graph.a);
+
+    class MalformedAdvertisementGit extends Git {
+      text(args, options) {
+        if (args[0] === 'ls-remote') {
+          return `${setup.graph.base}\t${calibrationRef('base')}\textra-field`;
+        }
+        return super.text(args, options);
+      }
+    }
+    assert.throws(
+      () => evaluateEvent(new MalformedAdvertisementGit(gitOptions(f)), event),
+      /Malformed remote advertisement record/,
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+
 test('GITHUB_EVENT_PATH accepts one bounded regular JSON file and rejects path attacks', () => {
   const root = mkdtempSync(join(tmpdir(), 'lab-01-required-check-event-'));
   const eventPath = join(root, 'event.json');
   const symlinkPath = join(root, 'event-link.json');
+  const fifoPath = join(root, 'event.fifo');
   try {
     const event = { action: 'opened', number: 20 };
     writeFileSync(eventPath, JSON.stringify(event));
@@ -960,6 +1063,22 @@ test('GITHUB_EVENT_PATH accepts one bounded regular JSON file and rejects path a
     writeFileSync(eventPath, 'x'.repeat(1024 * 1024 + 1));
     assert.throws(() => readPullRequestEvent(eventPath), /unsafe size/);
     assert.throws(() => readPullRequestEvent(''), /GITHUB_EVENT_PATH/);
+
+    execFileSync('mkfifo', [fifoPath]);
+    const checkerUrl = new URL('../scripts/check-required-calibration-head.mjs', import.meta.url).href;
+    const probeSource =
+      `import { readPullRequestEvent } from ${JSON.stringify(checkerUrl)};\n` +
+      'readPullRequestEvent(process.argv[1]);\n';
+    const started = Date.now();
+    const fifoProbe = spawnSync(
+      process.execPath,
+      ['--input-type=module', '-e', probeSource, fifoPath],
+      { encoding: 'utf8', timeout: 1000 },
+    );
+    assert.equal(fifoProbe.status, 1);
+    assert.equal(fifoProbe.signal, null);
+    assert.match(fifoProbe.stderr, /regular non-symlink file/);
+    assert.ok(Date.now() - started < 750, 'FIFO rejection must not wait for a writer');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1091,4 +1210,10 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.match(docs, /(?:stopped|failed safely) before creating any required-check ref/);
   assert.match(docs, /persist-credentials: false/);
   assert.match(docs, /GIT_CONFIG_COUNT/);
+  assert.match(docs, /one credential-free public `git ls-remote --refs` request/);
+  assert.match(docs, /refs\/pull\/<PR>\/merge/);
+  assert.match(docs, /GITHUB_SHA.*current remote pull\s+merge ref/s);
+  assert.match(docs, /point-in-time check/);
+  assert.match(docs, /GitHub associates the\s+check run with the pull-request event's merge\/head state/s);
+  assert.match(checkScript, /constants\.O_NONBLOCK/);
 });

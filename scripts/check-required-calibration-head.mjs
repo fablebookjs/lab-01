@@ -12,6 +12,8 @@ import {
   Git,
   REPOSITORY,
   assertSha,
+  calibrationRef,
+  parseRemoteAdvertisement,
 } from './calibrate-required-check-state.mjs';
 
 export const AUTHORIZATION_PREFIX = 'Authorized-Head-SHA:';
@@ -53,7 +55,10 @@ export function readPullRequestEvent(path) {
   }
   let descriptor;
   try {
-    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    descriptor = openSync(
+      path,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
   } catch {
     throw new Error('GITHUB_EVENT_PATH must be a readable regular non-symlink file');
   }
@@ -145,14 +150,34 @@ export function evaluatePullRequestHead({
   assertSha(head.sha);
   assertActionCoherence(event, event.action, head.sha, pullRequest.body);
 
-  const authorizedSha = parseAuthorizedHead(pullRequest.body);
   git.assertNoHostileEnvironment();
   git.assertTrustedRemote();
+  const baseRemoteRef = calibrationRef('base');
+  const headRemoteRef = calibrationRef('head');
+  const mergeRemoteRef = `refs/pull/${number}/merge`;
+  const remoteRefs = [baseRemoteRef, headRemoteRef, mergeRemoteRef];
+  const advertisement = parseRemoteAdvertisement(
+    git.text(['ls-remote', '--refs', git.remote, ...remoteRefs], { network: true }),
+    remoteRefs,
+  );
+  for (const ref of remoteRefs) {
+    if (advertisement[ref] === null) throw new Error(`Required remote ref is absent: ${ref}`);
+  }
+  if (advertisement[baseRemoteRef] !== base.sha) {
+    throw new Error('Event base SHA is not the current remote calibration base');
+  }
+  if (advertisement[headRemoteRef] !== head.sha) {
+    throw new Error('Event head SHA is not the current remote calibration head');
+  }
+  if (advertisement[mergeRemoteRef] !== githubSha) {
+    throw new Error('GITHUB_SHA is not the current remote pull request merge ref');
+  }
   const localHead = git.text(['rev-parse', 'HEAD']);
   if (localHead !== base.sha) {
     throw new Error(`Local HEAD ${localHead} is not trusted event base SHA ${base.sha}`);
   }
 
+  const authorizedSha = parseAuthorizedHead(pullRequest.body);
   const authorized = authorizedSha === head.sha;
   return {
     authorized,
@@ -163,6 +188,9 @@ export function evaluatePullRequestHead({
     headSha: head.sha,
     authorizedSha,
     localHead,
+    remoteBaseSha: advertisement[baseRemoteRef],
+    remoteHeadSha: advertisement[headRemoteRef],
+    remoteMergeSha: advertisement[mergeRemoteRef],
   };
 }
 
@@ -176,6 +204,7 @@ export function buildCheckSummary(result) {
     `- Trusted base SHA: \`${result.baseSha}\`\n` +
     `- Current head SHA: \`${result.headSha}\`\n` +
     `- PR-body authorized SHA: \`${result.authorizedSha}\`\n` +
+    `- Current remote merge SHA: \`${result.remoteMergeSha}\`\n` +
     `- Permission used: \`contents: read\` only\n`
   );
 }

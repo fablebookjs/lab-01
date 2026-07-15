@@ -81,7 +81,14 @@ The checker reads `GITHUB_EVENT_PATH` and requires the exact repository and
 event, a matching positive PR number other than protected evidence PRs 12, 16,
 and 19, an open non-draft non-merged same-repository PR, exact fixed base/head
 refs, lowercase 40-hex base/head identities, action-specific webhook fields,
-and local `HEAD` equal to the event base SHA.
+and local `HEAD` equal to the event base SHA. Immediately before authorization,
+it performs one credential-free public `git ls-remote --refs` request for exactly
+the new base ref, new head ref, and `refs/pull/<PR>/merge`. Its strict parser
+rejects missing, duplicate, unknown, malformed, or extra-field records. The
+event base SHA must equal the current remote base, the event head SHA must equal
+the current remote head, and `GITHUB_SHA` must equal the current remote pull
+merge ref. The read retains the same isolated Git configuration and exact
+trusted origin validation as the state workflow, but receives no token.
 
 The PR body provides the durable explicit authorization. It must contain
 exactly one machine line, with no indentation or suffix:
@@ -94,6 +101,14 @@ Absent, duplicate, malformed, or non-current authorization fails the stable
 check. This proves current-head binding plus an explicit PR-body wake-up. It
 does not prove the identity, entitlement, or policy right of the maintainer who
 edits that body.
+
+The current-ref observation is necessarily a point-in-time check: a ref can race
+after the advertisement. That bounded race cannot let the resulting old check
+satisfy protection for a newer current PR head, because GitHub associates the
+check run with the pull-request event's merge/head state rather than whatever
+the fixed ref points to later. The live sequence must still observe the PR
+rollup and policy transitions below; that observation, not this inference
+alone, is the product proof.
 
 ## Authoritative live evidence contract
 
