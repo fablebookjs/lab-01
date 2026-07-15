@@ -1898,7 +1898,7 @@ test('v3 jq evidence requires no B context before edit and one human B/B success
   }
 });
 
-test('scripts and documentation retain the release boundary and do not claim live proof', () => {
+test('scripts and documentation retain the release boundary and exact completed v3 proof', () => {
   const stateScript = readFileSync(
     new URL('../scripts/calibrate-required-check-state.mjs', import.meta.url),
     'utf8',
@@ -1922,7 +1922,53 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.doesNotMatch(stateScript, /push.*GITHUB_TOKEN|AUTHORIZATION.*args/);
   assert.doesNotMatch(stateScript, /approved|approve-head/i);
   assert.doesNotMatch(checkScript, /approved|approve-head/i);
-  assert.match(docs, /does not claim v3 proof\s+until the complete live sequence/);
+  assert.match(docs, /completed v3 live proof/);
+  assert.match(docs, /completed stale-green proof/);
+  assert.match(docs, /retained exact live v3 tuples prove current-head required-check binding/);
+  assert.doesNotMatch(
+    docs,
+    /does not claim v3 proof|until the complete live sequence|pending[- ]proof|proof remains|proof has not|not yet/i,
+  );
+  const retainedV3Values = {
+    installPullRequest: 'pull/22',
+    installedMain: '581e096a5c58ce5d904bb18a99b6c1fdc594ab43',
+    setupRun: '29449811320',
+    base: '4c734933625e643a97928514649b1302697e86db',
+    a: 'eb2aaae563a1d25d6ba16a10da69ab7e0644af6f',
+    b: 'fd7773ad426f620a3e98603cb72887a705c85cbe',
+    evidencePullRequest: 'pull/23',
+    aRun: '29449854427',
+    aCheck: '87469366909',
+    advanceRun: '29449898852',
+    priorBodySha256: 'd296653cb97e435b54fdcc4cd88c6b406176199cda16a44a91099d8c745ba44f',
+    merge: 'a748e2c7a2f6774a70d0324e98b04f7cea74eab8',
+    bRun: '29449963241',
+    bCheck: '87469722671',
+    currentBodySha256: '6fd20fe033ed89c02e0a294043fd92a44de7e8b18728977652360847fe662858',
+    releases: '0a9e2a9ae101ed71f83d9c4253bd7fe5c07f6e35',
+    staged: '4e9321b895f01394f79b1377d46b5348ac59601d',
+    tag: 'b59edf1d4c0fff51295327e8ce9e72678c336156',
+  };
+  for (const [label, value] of Object.entries(retainedV3Values)) {
+    assert.ok(docs.includes(value), `missing retained v3 ${label}: ${value}`);
+  }
+  assert.match(
+    docs,
+    /PR #12 is open\/draft; PR #16 is open\/draft\/conflicting; PR #19 is\s+open\/blocked; PR #21 is open\/unstable; PR #23 is open\/non-draft\/unmerged/s,
+  );
+  assert.match(docs, /only tag is `v1\.0\.0`/);
+  assert.match(docs, /GitHub Releases remain zero/);
+  assert.match(docs, /@fablebook\/lab-01-core@1\.0\.1/);
+  assert.match(docs, /@fablebook\/lab-01-addon@1\.0\.1/);
+  assert.match(docs, /both remain `E404`/);
+  assert.match(
+    docs,
+    /All three calibration namespaces, retained PRs, and base protections remain\s+intact\. No cleanup is authorized or performed\./s,
+  );
+  assert.match(
+    docs,
+    /strict=false, enforce_admins=true, checks=\[\{context: "Required calibration\s+head", app_id: 15368\}\]/s,
+  );
   assert.match(docs, /calibration\/g1\/required-check-current\/base/);
   assert.match(docs, /calibration\/g1\/required-check-current\/head/);
   assert.match(docs, /calibration\/g1\/required-check-pr\/\{base,a,b,head\}/);
@@ -1973,9 +2019,12 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.match(docs, /\.conclusion == "success"/);
   assert.match(docs, /remoteMergeSha.*separately advertised/s);
   assert.match(docs, /Require exactly one exact context\/App match/);
-  assert.match(docs, /does not prove fully autonomous dependent\s+dispatch/s);
+  assert.match(docs, /do not prove fully autonomous dependent\s+dispatch/s);
   assert.match(docs, /must not modify v1 or v2 namespaces/);
-  assert.doesNotMatch(docs, /v3 proof (?:is|was) complete|v3 succeeded/i);
+  assert.match(
+    docs,
+    /B has exactly one same-name CheckRun, and final GraphQL is exactly\s+`MERGEABLE\/CLEAN\/SUCCESS`/s,
+  );
   assert.doesNotMatch(docs, /authorized_sha|--authorized-sha/);
   assert.match(docs, /\(\$pr\.commits\.nodes \| length\) == 1/);
   assert.match(docs, /\$pr\.commits\.nodes\[0\]\.commit\.oid == \$head/);
