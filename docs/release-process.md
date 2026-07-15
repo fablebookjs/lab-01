@@ -15,10 +15,10 @@ This repository currently demonstrates only the first visible release intent:
    empty intent based on the exact current line head and updates the existing
    PR in place while preserving whether it is draft or ready. A manual workflow
    dispatch is the recovery wake-up.
-5. The close-and-regenerate handler is implemented for later installation on
-   the default branch. When installed, closing the current release PR without
-   merging creates a fresh structured empty intent commit and one new draft PR.
-   The closed PR remains untouched as the historical review and comment record.
+5. Closing the current release PR without merging creates a fresh structured
+   empty intent commit and one new draft PR. The closed PR remains untouched as
+   the historical review and comment record. The first live transition closed
+   PR #1 and created draft PR #12.
 
 The maintainer re-reads both remote refs and the matching open release PR before
 acting. It accepts only this repository, release line, staged line, fixed
@@ -49,10 +49,12 @@ concurrent release or staged advance restarts state derivation. Replacement PR
 creation always sends `draft: true` and uses the same generated body as normal
 draft maintenance.
 
-The workflow is deliberately not live merely because it exists on this local
-branch: `pull_request_target` installation on the default branch, built-in token
-PR-creation authority, event behavior, actor, input/output SHAs, and branch-rule
-behavior still require controlled GitHub calibration before the first demo.
+The workflow is live from the default branch. With organization-level
+Actions-created PR authority enabled, [run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336)
+closed historical PR #1, moved `staged/v1.0` from the closed intent to a fresh
+expected-old guarded empty intent, and created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12).
+Attempt 2 of the same run returned `replacement-exists`; exactly one matching
+open release PR remained.
 
 In the future contract, merging the current validated release PR is explicit
 authorization to publish its exact source. **Do not merge today's PR:** no
@@ -132,10 +134,9 @@ GitHub-current proof is
 [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684);
 every refreshed ready head needs its own successful proof.
 
-Close-and-regenerate is installed on the default branch. The current remaining
-gate is organization policy: Fablebook must allow Actions-created PRs before
-the built-in token can create a replacement. Do not close the release PR for
-that demonstration until this setting is enabled and read back.
+Close-and-regenerate is live. [Run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336)
+created the clean draft replacement, and its duplicate attempt converged on the
+same PR without another ref or PR write.
 
 Public package publication, branch reconciliation, tagging `v1.0.1`, and
 creating a GitHub Release are intentionally **NOT YET IMPLEMENTED**. This slice

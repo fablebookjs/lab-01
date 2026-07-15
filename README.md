@@ -20,10 +20,11 @@ The draft release PR proposes `1.0.1` from a structured empty commit on
 `staged/v1.0`. Its base is `releases/v1.0`, which started at the same commit as
 `main` and tag `v1.0.0`. Pushes to the release line now automatically refresh
 that same PR from the exact current release-line head while preserving whether
-it is draft or ready. A separate,
-locally tested workflow is ready for later default-branch installation to
-replace a closed, unmerged release PR with a clean draft; it is not enabled or
-calibrated against GitHub authority in this branch.
+it is draft or ready. Closing an unmerged release PR now automatically creates
+one fresh empty intent and a new draft replacement. The first live transition
+closed PR #1 and created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12);
+rerunning the same delivery recognized the existing replacement without
+creating another PR.
 
 See [the release-process note](docs/release-process.md) for the current contract
 and explicit automation limits.
