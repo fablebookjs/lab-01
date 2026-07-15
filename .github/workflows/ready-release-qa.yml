@@ -6,7 +6,6 @@ on:
       - releases/v1.0
     types:
       - ready_for_review
-      - synchronize
   workflow_dispatch:
 
 permissions:
@@ -14,7 +13,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: ready-release-qa-${{ github.event.pull_request.number || github.run_id }}
+  group: ready-release-qa-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -71,7 +70,7 @@ jobs:
           --evidence "$RUNNER_TEMP/ready-release-qa.json"
 
       - name: Retain sanitized exact-snapshot evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ready-release-qa-${{ github.event.pull_request.head.sha || github.sha }}
           path: ${{ runner.temp }}/ready-release-qa.json
