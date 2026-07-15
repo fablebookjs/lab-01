@@ -17,10 +17,10 @@ import {
 } from './calibrate-required-check-state.mjs';
 
 export const AUTHORIZATION_PREFIX = 'Authorized-Head-SHA:';
-export const PULL_REQUEST_ACTIONS = ['opened', 'synchronize', 'reopened', 'edited'];
-export const PROTECTED_PULL_REQUESTS = new Set([12, 16, 19]);
+export const PULL_REQUEST_ACTIONS = ['opened', 'reopened', 'edited'];
+export const PROTECTED_PULL_REQUESTS = new Set([12, 16, 19, 21]);
 
-const BRANCH_NAMESPACE = 'calibration/g1/required-check-pr';
+const BRANCH_NAMESPACE = 'calibration/g1/required-check-current';
 const BASE_REF = `${BRANCH_NAMESPACE}/base`;
 const HEAD_REF = `${BRANCH_NAMESPACE}/head`;
 const MAX_EVENT_BYTES = 1024 * 1024;
@@ -87,16 +87,9 @@ export function readPullRequestEvent(path) {
   return requireObject(parsed, 'GitHub event payload');
 }
 
-function assertActionCoherence(event, action, headSha, body) {
-  if (action === 'synchronize') {
-    assertSha(event.before);
-    assertSha(event.after);
-    if (event.before === event.after) throw new Error('Synchronize event must change the head SHA');
-    if (event.after !== headSha) throw new Error('Synchronize event after SHA is not current PR head');
-    return;
-  }
+function assertActionCoherence(event, action, body) {
   if (Object.hasOwn(event, 'before') || Object.hasOwn(event, 'after')) {
-    throw new Error(`${action} event must not carry synchronize SHA fields`);
+    throw new Error(`${action} event must not carry head-transition SHA fields`);
   }
   if (action === 'edited') {
     const changes = requireObject(event.changes, 'Edited event changes');
@@ -148,7 +141,7 @@ export function evaluatePullRequestHead({
   requireExact(requireObject(head.repo, 'Pull request head repository').full_name, REPOSITORY, 'Head repository');
   assertSha(base.sha);
   assertSha(head.sha);
-  assertActionCoherence(event, event.action, head.sha, pullRequest.body);
+  assertActionCoherence(event, event.action, pullRequest.body);
 
   git.assertNoHostileEnvironment();
   git.assertTrustedRemote();

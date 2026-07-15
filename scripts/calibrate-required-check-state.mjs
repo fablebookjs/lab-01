@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const REPOSITORY = 'fablebookjs/lab-01';
-export const NAMESPACE = 'refs/heads/calibration/g1/required-check-pr';
-export const FILE_PATH = 'calibration/g1/required-check-pr/state.txt';
+export const NAMESPACE = 'refs/heads/calibration/g1/required-check-current';
+export const FILE_PATH = 'calibration/g1/required-check-current/state.txt';
 export const MODES = ['setup', 'advance-head'];
 export const ROLES = ['base', 'a', 'b', 'head'];
 
@@ -498,7 +498,7 @@ export function runStateCalibration({ mode, git = new Git(), source }) {
 
 function buildSummary(result) {
   return (
-    `## G1 required-check PR state calibration\n\n` +
+    `## G1 current required-check state calibration\n\n` +
     `- Mode: \`${result.mode}\`\n` +
     `- Base: \`${result.graph.base}\`\n` +
     `- A: \`${result.graph.a}\`\n` +

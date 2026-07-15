@@ -3,10 +3,9 @@ name: Required check calibration
 on:
   pull_request:
     branches:
-      - calibration/g1/required-check-pr/base
+      - calibration/g1/required-check-current/base
     types:
       - opened
-      - synchronize
       - reopened
       - edited
 
@@ -14,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: calibration-g1-required-check-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+  group: calibration-g1-required-check-current-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
   cancel-in-progress: false
 
 jobs:
