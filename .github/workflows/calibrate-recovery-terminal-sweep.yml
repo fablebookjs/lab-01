@@ -1,0 +1,35 @@
+name: Sweep recovery-terminal calibration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: calibration-g1-recovery-terminal
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Assert the fixed laboratory target
+        run: |
+          test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01"
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+      - name: Check out trusted main code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Suppress or create the next proposal
+        run: node scripts/calibrate-recovery-terminal.mjs --mode sweep
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

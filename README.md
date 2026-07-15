@@ -31,3 +31,9 @@ The destructive conflict path has a separate
 [fixed-ref recovery calibration](docs/conflict-recovery-calibration.md). It can
 retain an intentionally interrupted force and resume it into one draft recovery
 PR without targeting the live release line or proposal.
+
+Recovery completion and terminal next-proposal suppression use a third,
+[dedicated fixed namespace](docs/recovery-terminal-calibration.md). That probe
+requires a human-created, normally merged recovery PR and stops after one draft
+empty proposal; finalization and publication remain outside this repository
+slice.
