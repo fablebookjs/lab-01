@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -17,7 +25,15 @@ import {
   runStateCalibration,
   verifyGraph,
 } from '../scripts/calibrate-required-check-state.mjs';
-import { evaluateRequiredHead } from '../scripts/check-required-calibration-head.mjs';
+import {
+  AUTHORIZATION_PREFIX,
+  evaluatePullRequestHead,
+  parseAuthorizedHead,
+  readPullRequestEvent,
+} from '../scripts/check-required-calibration-head.mjs';
+
+const OLD_NAMESPACE = 'refs/heads/calibration/g1/required-check';
+const BRANCH_NAMESPACE = 'calibration/g1/required-check-pr';
 
 function command(cwd, args, env = {}) {
   return execFileSync('git', args, {
@@ -52,6 +68,10 @@ function fixture() {
     `${source}:refs/heads/staged/v1.0`,
     `${source}:refs/heads/calibration/g1/reconciliation/no-late/line`,
     `${source}:refs/heads/calibration/g1/conflict-recovery/line`,
+    `${source}:${OLD_NAMESPACE}/base`,
+    `${source}:${OLD_NAMESPACE}/a`,
+    `${source}:${OLD_NAMESPACE}/b`,
+    `${source}:${OLD_NAMESPACE}/head`,
   ]);
   command(seed, ['tag', '-a', 'v1.0.0', source, '-m', 'retained release tag']);
   command(seed, ['push', 'origin', 'refs/tags/v1.0.0']);
@@ -81,6 +101,66 @@ function checkout(f, ref) {
 
 function checkoutMain(f) {
   command(f.runner, ['checkout', 'main']);
+}
+
+function authorizedBody(sha) {
+  return `Retained calibration authorization.\n\n${AUTHORIZATION_PREFIX} ${sha}`;
+}
+
+function pullRequestEvent({
+  action,
+  baseSha,
+  headSha,
+  authorizedSha = headSha,
+  body = authorizedBody(authorizedSha),
+  number = 20,
+  before,
+  repository = 'fablebookjs/lab-01',
+  baseRepository = repository,
+  headRepository = repository,
+  baseRef = `${BRANCH_NAMESPACE}/base`,
+  headRef = `${BRANCH_NAMESPACE}/head`,
+  draft = false,
+  merged = false,
+  mergedAt = null,
+  state = 'open',
+} = {}) {
+  const event = {
+    action,
+    number,
+    repository: { full_name: repository },
+    pull_request: {
+      number,
+      state,
+      draft,
+      merged,
+      merged_at: mergedAt,
+      body,
+      base: { ref: baseRef, sha: baseSha, repo: { full_name: baseRepository } },
+      head: { ref: headRef, sha: headSha, repo: { full_name: headRepository } },
+    },
+  };
+  if (action === 'synchronize') {
+    event.before = before;
+    event.after = headSha;
+  } else if (action === 'edited') {
+    event.changes = { body: { from: authorizedBody(before) } };
+  }
+  return event;
+}
+
+function evaluateEvent(git, event, overrides = {}) {
+  return evaluatePullRequestHead({
+    git,
+    event,
+    repository: 'fablebookjs/lab-01',
+    eventName: 'pull_request',
+    githubRef: `refs/pull/${event.number}/merge`,
+    githubSha: 'f'.repeat(40),
+    baseRef: `${BRANCH_NAMESPACE}/base`,
+    headRef: `${BRANCH_NAMESPACE}/head`,
+    ...overrides,
+  });
 }
 
 class RecordingGit extends Git {
@@ -139,7 +219,7 @@ function parseWorkflowYaml(yaml) {
 }
 
 const EXPECTED_STATE_WORKFLOW = {
-  name: 'Calibrate required-check state',
+  name: 'Calibrate required-check PR state',
   on: {
     workflow_dispatch: {
       inputs: {
@@ -153,10 +233,10 @@ const EXPECTED_STATE_WORKFLOW = {
     },
   },
   permissions: { contents: 'write' },
-  concurrency: { group: 'calibration-g1-required-check-state', 'cancel-in-progress': false },
+  concurrency: { group: 'calibration-g1-required-check-pr-state', 'cancel-in-progress': false },
   jobs: {
     'maintain-state': {
-      name: 'Maintain required-check calibration state',
+      name: 'Maintain required-check PR calibration state',
       'runs-on': 'ubuntu-latest',
       'timeout-minutes': 10,
       steps: [
@@ -185,19 +265,15 @@ const EXPECTED_STATE_WORKFLOW = {
 const EXPECTED_CHECK_WORKFLOW = {
   name: 'Required check calibration',
   on: {
-    workflow_dispatch: {
-      inputs: {
-        authorized_sha: {
-          description: 'Exact full calibration head SHA to authorize',
-          required: true,
-          type: 'string',
-        },
-      },
+    pull_request: {
+      branches: ['calibration/g1/required-check-pr/base'],
+      types: ['opened', 'synchronize', 'reopened', 'edited'],
     },
   },
   permissions: { contents: 'read' },
   concurrency: {
-    group: 'calibration-g1-required-check-${{ github.sha }}',
+    group:
+      'calibration-g1-required-check-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}',
     'cancel-in-progress': false,
   },
   jobs: {
@@ -207,21 +283,17 @@ const EXPECTED_CHECK_WORKFLOW = {
       'timeout-minutes': 5,
       steps: [
         {
-          name: 'Assert the fixed calibration head',
-          run:
-            'test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01"\n' +
-            'test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n' +
-            'test "$GITHUB_REF" = "refs/heads/calibration/g1/required-check/head"\n',
-        },
-        {
-          name: 'Check out the exact dispatched calibration head',
+          name: 'Check out the exact trusted calibration base',
           uses: 'actions/checkout@v7',
-          with: { 'fetch-depth': 1, 'persist-credentials': false, ref: '${{ github.sha }}' },
+          with: {
+            'fetch-depth': 1,
+            'persist-credentials': false,
+            ref: '${{ github.event.pull_request.base.sha }}',
+          },
         },
         {
-          name: 'Require the exact current explicitly authorized head',
-          run: 'node scripts/check-required-calibration-head.mjs --authorized-sha "$AUTHORIZED_SHA"',
-          env: { AUTHORIZED_SHA: '${{ inputs.authorized_sha }}' },
+          name: 'Require the exact current PR-body-authorized head',
+          run: 'node scripts/check-required-calibration-head.mjs',
         },
       ],
     },
@@ -259,6 +331,10 @@ test('setup creates only the deterministic four-ref graph and preserves all reta
       'refs/heads/staged/v1.0',
       'refs/heads/calibration/g1/reconciliation/no-late/line',
       'refs/heads/calibration/g1/conflict-recovery/line',
+      `${OLD_NAMESPACE}/base`,
+      `${OLD_NAMESPACE}/a`,
+      `${OLD_NAMESPACE}/b`,
+      `${OLD_NAMESPACE}/head`,
     ]) {
       assert.equal(remoteRef(f, ref), f.source);
     }
@@ -275,49 +351,45 @@ test('setup creates only the deterministic four-ref graph and preserves all reta
   }
 });
 
-test('explicit A and B authorization proves stale and current exact-SHA binding', () => {
+test('pull-request events prove opened A/A, synchronize B/A, and edited B/B binding', () => {
   const f = fixture();
   try {
     const git = new Git(gitOptions(f));
     const setup = runStateCalibration({ mode: 'setup', git, source: f.source });
 
-    checkout(f, setup.graph.a);
-    const aCheck = evaluateRequiredHead({
-      git,
+    checkout(f, setup.graph.base);
+    const aCheck = evaluateEvent(git, pullRequestEvent({
+      action: 'opened',
+      baseSha: setup.graph.base,
       headSha: setup.graph.a,
-      authorizedSha: setup.graph.a,
-    });
+    }));
     assert.equal(aCheck.authorized, true);
-    assert.equal(aCheck.reason, 'current-head-matches-authorized-sha');
+    assert.equal(aCheck.reason, 'pr-body-authorizes-current-head');
 
     checkoutMain(f);
     const advanced = runStateCalibration({ mode: 'advance-head', git, source: f.source });
     assert.equal(advanced.state.head, setup.graph.b);
 
-    checkout(f, setup.graph.a);
-    const staleA = evaluateRequiredHead({
-      git,
-      headSha: setup.graph.a,
-      authorizedSha: setup.graph.a,
-    });
-    assert.equal(staleA.authorized, false);
-    assert.equal(staleA.reason, 'dispatched-sha-is-not-current-remote-head');
-
-    checkout(f, setup.graph.b);
-    const aOnB = evaluateRequiredHead({
-      git,
+    checkout(f, setup.graph.base);
+    const aOnB = evaluateEvent(git, pullRequestEvent({
+      action: 'synchronize',
+      baseSha: setup.graph.base,
       headSha: setup.graph.b,
       authorizedSha: setup.graph.a,
-    });
+      before: setup.graph.a,
+    }));
     assert.equal(aOnB.authorized, false);
-    assert.equal(aOnB.reason, 'dispatched-sha-is-not-authorized');
-    const currentB = evaluateRequiredHead({
-      git,
+    assert.equal(aOnB.reason, 'pr-body-does-not-authorize-current-head');
+
+    const currentB = evaluateEvent(git, pullRequestEvent({
+      action: 'edited',
+      baseSha: setup.graph.base,
       headSha: setup.graph.b,
       authorizedSha: setup.graph.b,
-    });
+      before: setup.graph.a,
+    }));
     assert.equal(currentB.authorized, true);
-    assert.equal(currentB.reason, 'current-head-matches-authorized-sha');
+    assert.equal(currentB.reason, 'pr-body-authorizes-current-head');
   } finally {
     f.cleanup();
   }
@@ -350,25 +422,41 @@ test('setup and advance reruns converge without rewrites or an approval write pa
   }
 });
 
-test('malformed and arbitrary authorization inputs fail without any write path', () => {
+test('PR-body authorization rejects absent, duplicate, malformed, and arbitrary SHA lines', () => {
   const f = fixture();
   try {
     const git = new RecordingGit(gitOptions(f));
     const setup = runStateCalibration({ mode: 'setup', git, source: f.source });
-    checkout(f, setup.graph.a);
-    for (const authorizedSha of [null, '', 'abc', 'A'.repeat(40), '1'.repeat(39)]) {
+    checkout(f, setup.graph.base);
+    for (const body of [
+      '',
+      'No authorization',
+      'Authorized-Head-SHA:',
+      `Authorized-Head-SHA: ${'A'.repeat(40)}`,
+      `Authorized-Head-SHA: ${'1'.repeat(39)}`,
+      `Authorized-Head-SHA: ${setup.graph.a}\nAuthorized-Head-SHA: ${setup.graph.a}`,
+      ` Authorized-Head-SHA: ${setup.graph.a}`,
+      `Authorized-Head-SHA: ${setup.graph.a}\n - Authorized-Head-SHA: ${setup.graph.a}`,
+    ]) {
       assert.throws(
-        () => evaluateRequiredHead({ git, headSha: setup.graph.a, authorizedSha }),
-        /Invalid commit identity/,
+        () => evaluateEvent(git, pullRequestEvent({
+          action: 'opened',
+          baseSha: setup.graph.base,
+          headSha: setup.graph.a,
+          body,
+        })),
+        /Authorized-Head-SHA/,
       );
     }
-    const arbitrary = evaluateRequiredHead({
-      git,
+    assert.equal(parseAuthorizedHead(`Authorized-Head-SHA: ${setup.graph.a}`), setup.graph.a);
+    const arbitrary = evaluateEvent(git, pullRequestEvent({
+      action: 'opened',
+      baseSha: setup.graph.base,
       headSha: setup.graph.a,
       authorizedSha: '1'.repeat(40),
-    });
+    }));
     assert.equal(arbitrary.authorized, false);
-    assert.equal(arbitrary.reason, 'dispatched-sha-is-not-authorized');
+    assert.equal(arbitrary.reason, 'pr-body-does-not-authorize-current-head');
     assert.equal(git.pushes.length, 4);
   } finally {
     f.cleanup();
@@ -545,7 +633,11 @@ test('hostile Git environment and every local transport or credential override f
       );
       assert.equal(hostile.calls, 0);
       assert.throws(
-        () => evaluateRequiredHead({ git: hostile, headSha: f.source, authorizedSha: f.source }),
+        () => evaluateEvent(hostile, pullRequestEvent({
+          action: 'opened',
+          baseSha: f.source,
+          headSha: f.source,
+        })),
         /Hostile inherited Git environment: GIT_EXEC_PATH/,
       );
       assert.equal(hostile.calls, 0);
@@ -599,7 +691,11 @@ test('hostile Git environment and every local transport or credential override f
       assert.equal(stateGit.pushes.length, 0, key);
       const checkGit = new RecordingGit(gitOptions(f));
       assert.throws(
-        () => evaluateRequiredHead({ git: checkGit, headSha: f.source, authorizedSha: f.source }),
+        () => evaluateEvent(checkGit, pullRequestEvent({
+          action: 'opened',
+          baseSha: f.source,
+          headSha: f.source,
+        })),
         /Unsafe repository Git config/,
         key,
       );
@@ -631,17 +727,17 @@ test('global config is isolated and system or command-scope config overrides are
       assert.equal(globalProbe.status, 1);
       const setup = runStateCalibration({ mode: 'setup', git, source: f.source });
       assert.ok(git.advertisements.length > 0);
-      checkout(f, setup.graph.a);
+      checkout(f, setup.graph.base);
       const checkGit = new RecordingGit(gitOptions(f));
       assert.equal(
-        evaluateRequiredHead({
-          git: checkGit,
+        evaluateEvent(checkGit, pullRequestEvent({
+          action: 'opened',
+          baseSha: setup.graph.base,
           headSha: setup.graph.a,
-          authorizedSha: setup.graph.a,
-        }).authorized,
+        })).authorized,
         true,
       );
-      assert.ok(checkGit.advertisements.length > 0);
+      assert.equal(checkGit.advertisements.length, 0);
       checkoutMain(f);
       assert.equal(existsSync(marker), false);
     } finally {
@@ -668,11 +764,11 @@ test('global config is isolated and system or command-scope config overrides are
         assert.equal(git.pushes.length, 0, key);
         const checkGit = new RecordingGit(gitOptions(f));
         assert.throws(
-          () => evaluateRequiredHead({
-            git: checkGit,
+          () => evaluateEvent(checkGit, pullRequestEvent({
+            action: 'opened',
+            baseSha: f.source,
             headSha: f.source,
-            authorizedSha: f.source,
-          }),
+          })),
           new RegExp(`Hostile inherited Git environment: ${key}`),
         );
         assert.equal(checkGit.advertisements.length, 0, key);
@@ -751,18 +847,18 @@ test('checkout-v7 includeIf remains rejected, then controlled live auth succeeds
     for (const environment of git.networkEnvironments) {
       assert.deepEqual(environment, git.controlledNetworkEnvironment());
     }
-    checkout(f, result.graph.a);
+    checkout(f, result.graph.base);
     const readOnly = new RecordingGit({
       ...gitOptions(f),
       liveNetworkWrite: true,
       token: undefined,
     });
     assert.equal(
-      evaluateRequiredHead({
-        git: readOnly,
+      evaluateEvent(readOnly, pullRequestEvent({
+        action: 'opened',
+        baseSha: result.graph.base,
         headSha: result.graph.a,
-        authorizedSha: result.graph.a,
-      }).authorized,
+      })).authorized,
       true,
     );
     assert.ok(readOnly.networkEnvironments.every((environment) => Object.keys(environment).length === 0));
@@ -787,7 +883,89 @@ test('checkout-v7 includeIf remains rejected, then controlled live auth succeeds
   }
 });
 
-test('workflows have exact manual triggers, isolated permissions, and one stable check context', () => {
+test('event payload, action, identity, refs, and trusted base checkout all fail closed', () => {
+  const f = fixture();
+  try {
+    const git = new Git(gitOptions(f));
+    const setup = runStateCalibration({ mode: 'setup', git, source: f.source });
+    checkout(f, setup.graph.base);
+    const valid = pullRequestEvent({
+      action: 'opened',
+      baseSha: setup.graph.base,
+      headSha: setup.graph.a,
+    });
+
+    const mutations = [
+      ['wrong event repository', (event) => { event.repository.full_name = 'attacker/fork'; }],
+      ['wrong base repository', (event) => { event.pull_request.base.repo.full_name = 'attacker/fork'; }],
+      ['fork head', (event) => { event.pull_request.head.repo.full_name = 'attacker/fork'; }],
+      ['wrong base ref', (event) => { event.pull_request.base.ref = 'main'; }],
+      ['wrong head ref', (event) => { event.pull_request.head.ref = 'feature'; }],
+      ['draft', (event) => { event.pull_request.draft = true; }],
+      ['merged', (event) => { event.pull_request.merged = true; event.pull_request.merged_at = '2026-07-15T18:00:00Z'; }],
+      ['closed', (event) => { event.pull_request.state = 'closed'; }],
+      ['mismatched number', (event) => { event.pull_request.number = 21; }],
+      ['protected release PR', (event) => { event.number = 12; event.pull_request.number = 12; }],
+      ['protected recovery PR', (event) => { event.number = 16; event.pull_request.number = 16; }],
+      ['protected failed calibration PR', (event) => { event.number = 19; event.pull_request.number = 19; }],
+      ['uppercase head SHA', (event) => { event.pull_request.head.sha = 'A'.repeat(40); }],
+    ];
+    for (const [description, mutate] of mutations) {
+      const event = structuredClone(valid);
+      mutate(event);
+      assert.throws(() => evaluateEvent(git, event), undefined, description);
+    }
+    assert.throws(() => evaluateEvent(git, valid, { repository: 'attacker/fork' }), /GITHUB_REPOSITORY/);
+    assert.throws(() => evaluateEvent(git, valid, { eventName: 'workflow_dispatch' }), /GITHUB_EVENT_NAME/);
+    assert.throws(() => evaluateEvent(git, valid, { githubRef: 'refs/heads/main' }), /GITHUB_REF/);
+    assert.throws(() => evaluateEvent(git, valid, { baseRef: 'main' }), /GITHUB_BASE_REF/);
+    assert.throws(() => evaluateEvent(git, valid, { headRef: 'feature' }), /GITHUB_HEAD_REF/);
+
+    const badSynchronize = pullRequestEvent({
+      action: 'synchronize',
+      baseSha: setup.graph.base,
+      headSha: setup.graph.b,
+      before: setup.graph.b,
+    });
+    assert.throws(() => evaluateEvent(git, badSynchronize), /must change the head SHA/);
+    const badEdited = pullRequestEvent({
+      action: 'edited',
+      baseSha: setup.graph.base,
+      headSha: setup.graph.a,
+      before: setup.graph.a,
+    });
+    badEdited.changes = { title: { from: 'old' } };
+    assert.throws(() => evaluateEvent(git, badEdited), /Edited event body change/);
+
+    checkout(f, setup.graph.a);
+    assert.throws(() => evaluateEvent(git, valid), /not trusted event base SHA/);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('GITHUB_EVENT_PATH accepts one bounded regular JSON file and rejects path attacks', () => {
+  const root = mkdtempSync(join(tmpdir(), 'lab-01-required-check-event-'));
+  const eventPath = join(root, 'event.json');
+  const symlinkPath = join(root, 'event-link.json');
+  try {
+    const event = { action: 'opened', number: 20 };
+    writeFileSync(eventPath, JSON.stringify(event));
+    assert.deepEqual(readPullRequestEvent(eventPath), event);
+    symlinkSync(eventPath, symlinkPath);
+    assert.throws(() => readPullRequestEvent(symlinkPath), /non-symlink/);
+    assert.throws(() => readPullRequestEvent(root), /regular non-symlink/);
+    writeFileSync(eventPath, '{not-json');
+    assert.throws(() => readPullRequestEvent(eventPath), /not valid JSON/);
+    writeFileSync(eventPath, 'x'.repeat(1024 * 1024 + 1));
+    assert.throws(() => readPullRequestEvent(eventPath), /unsafe size/);
+    assert.throws(() => readPullRequestEvent(''), /GITHUB_EVENT_PATH/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('workflows have exact state dispatch, PR trigger, permissions, and one stable check context', () => {
   const stateYaml = readFileSync(
     new URL('../.github/workflows/calibrate-required-check-state.yml', import.meta.url),
     'utf8',
@@ -824,7 +1002,10 @@ test('workflows have exact manual triggers, isolated permissions, and one stable
   }
 
   const checkMutants = [
-    checkYaml.replace('  workflow_dispatch:', '  workflow_dispatch:\n  push:'),
+    checkYaml.replace('  pull_request:', '  pull_request:\n  push:'),
+    checkYaml.replace('calibration/g1/required-check-pr/base', 'main'),
+    checkYaml.replace('      - edited', '      - closed'),
+    checkYaml.replace('      - reopened', ''),
     checkYaml.replace('permissions:\n  contents: read', 'permissions: { contents: write }'),
     checkYaml.replace('    runs-on: ubuntu-latest', '    permissions: { statuses: write }\n    runs-on: ubuntu-latest'),
     checkYaml.replace(
@@ -832,14 +1013,14 @@ test('workflows have exact manual triggers, isolated permissions, and one stable
       'jobs:\n  injected: { runs-on: ubuntu-latest, steps: [{ run: "curl https://api.github.com" }] }\n',
     ),
     checkYaml.replace(
-      '      - name: Require the exact current explicitly authorized head',
+      '      - name: Require the exact current PR-body-authorized head',
       '      - { name: Unsafe merge, run: "gh pr merge --merge" }\n' +
-        '      - name: Require the exact current explicitly authorized head',
+        '      - name: Require the exact current PR-body-authorized head',
     ),
     checkYaml.replace('persist-credentials: false', 'persist-credentials: true'),
-    checkYaml.replace('        required: true', '        required: false'),
-    checkYaml.replace('${{ inputs.authorized_sha }}', '${{ github.sha }}'),
-    checkYaml.replace(' --authorized-sha "$AUTHORIZED_SHA"', ''),
+    checkYaml.replace('${{ github.event.pull_request.base.sha }}', '${{ github.event.pull_request.head.sha }}'),
+    checkYaml.replace('fetch-depth: 1', 'fetch-depth: 0'),
+    checkYaml.replace('node scripts/check-required-calibration-head.mjs', 'curl https://api.github.com'),
     checkYaml.replace('Required calibration head', 'Different context'),
     checkYaml.replace('cancel-in-progress: false', 'cancel-in-progress: true'),
   ];
@@ -862,7 +1043,7 @@ test('scripts and documentation retain the release boundary and do not claim liv
     assert.doesNotMatch(script, /releases\/v1\.0|staged\/v1\.0|\/pulls|refs\/tags|\bnpm\b|storybook/i);
     assert.doesNotMatch(
       script,
-      /api\.github\.com|\bgh\s+api\b|\bgh\s+pr\b|\bcurl\b|\/branches\/.*\/protection|\/merge(?:s|d)?\b/i,
+      /api\.github\.com|\bgh\s+api\b|\bgh\s+pr\b|\bcurl\b|\/branches\/.*\/protection/i,
     );
     assert.doesNotMatch(script, /\bfetch\s*\(|https?\.request\s*\(|spawnSync\((?!'git')/);
   }
@@ -872,7 +1053,7 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.doesNotMatch(stateScript, /push.*GITHUB_TOKEN|AUTHORIZATION.*args/);
   assert.doesNotMatch(stateScript, /approved|approve-head/i);
   assert.doesNotMatch(checkScript, /approved|approve-head/i);
-  assert.match(docs, /does not\s+claim that behavior has been proved until the complete live sequence/);
+  assert.match(docs, /does not\s+claim that behavior has been proved until the complete live v2 sequence/);
   assert.match(docs, /required_status_checks\.strict=false/);
   assert.match(docs, /enforce_admins\.enabled=true/);
   assert.match(docs, /required_status_checks\.checks=\[\{context: CONTEXT, app_id: APP_ID\}\]/);
@@ -880,26 +1061,34 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.match(docs, /statusCheckRollup/);
   assert.match(docs, /mergeStateStatus/);
   assert.match(docs, /`\(MERGEABLE, CLEAN, SUCCESS\)`/);
-  assert.match(docs, /`\(MERGEABLE, BLOCKED, null\)`/);
   assert.match(docs, /`\(MERGEABLE, UNSTABLE, FAILURE\)`/);
-  assert.match(docs, /app\.slug.*`github-actions`/s);
+  assert.match(docs, /app\.slug.*github-actions/s);
   assert.match(docs, /--paginate \\\n  --slurp/);
   assert.match(docs, /filter=all&per_page=100/);
   assert.match(docs, /sort_by\(\.id\) \| last \| select\(\. != null\)/);
   assert.match(docs, /\.required_status_checks\.checks \| length/);
-  assert.match(docs, /every five seconds, for at most five minutes/);
+  assert.match(docs, /every five seconds(?:,)? for at most five minutes/);
   assert.match(docs, /number=PR, state=OPEN, isDraft=false, merged=false, mergedAt=null/);
-  assert.match(docs, /Never merge, close, or draft this PR/);
+  assert.match(docs, /Never merge, close, or draft\s+(?:this|the) PR/);
   assert.match(docs, /release PR #12/);
   assert.match(docs, /conflict-recovery PR #16/);
+  assert.match(docs, /failed\/manual calibration PR #19/);
+  assert.match(docs, /Authorized-Head-SHA: <lowercase 40-hex current head SHA>/);
+  assert.match(docs, /`opened`/);
+  assert.match(docs, /`synchronize`/);
+  assert.match(docs, /`edited`/);
+  assert.match(docs, /exact B and fail/);
   assert.match(docs, /same context\/App pair green/);
-  assert.match(docs, /authorized_sha=A/);
-  assert.match(docs, /authorized_sha=B/);
   assert.match(docs, /does not prove the identity, entitlement, or policy right/);
   assert.match(docs, /actions\/runs\/29437465131/);
+  assert.match(docs, /actions\/runs\/29438908229/);
+  assert.match(docs, /actions\/runs\/29439025160/);
+  assert.match(docs, /statusCheckRollup=null/);
+  assert.match(docs, /App ID `15368`/);
+  assert.match(docs, /App ID and slug\n  come from REST only/);
+  assert.doesNotMatch(docs, /authorized_sha|--authorized-sha/);
   assert.match(docs, /includeif\.gitdir:.*lab-01.*\.git\.path/s);
-  assert.match(docs, /stopped before creating any required-check ref/);
-  assert.match(docs, /No successful rerun is claimed here/);
+  assert.match(docs, /(?:stopped|failed safely) before creating any required-check ref/);
   assert.match(docs, /persist-credentials: false/);
   assert.match(docs, /GIT_CONFIG_COUNT/);
 });
