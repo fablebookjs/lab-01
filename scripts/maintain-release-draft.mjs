@@ -200,6 +200,16 @@ async function findDraftPull() {
   return matching[0];
 }
 
+async function waitForPullHead(pullNumber, intent) {
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    const pull = await github(`/repos/${REPOSITORY}/pulls/${pullNumber}`);
+    assertMatchingDraft(pull);
+    if (pull.head.sha === intent) return pull;
+    if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
+  }
+  fail('release PR did not converge on the current staged intent');
+}
+
 function includedCommits(baseline, source) {
   const output = git('log', '--reverse', '--format=%H%x09%s', `${baseline}..${source}`);
   if (!output) return [];
@@ -263,9 +273,7 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
 
   const commits = includedCommits(baseline, releaseSource);
   if (!dryRun) {
-    const currentPull = await github(`/repos/${REPOSITORY}/pulls/${pull.number}`);
-    assertMatchingDraft(currentPull);
-    if (currentPull.head.sha !== intent) fail('release PR did not converge on the current staged intent');
+    await waitForPullHead(pull.number, intent);
 
     const body = buildPullRequestBody({ source: releaseSource, intent, includedCommits: commits });
     await github(`/repos/${REPOSITORY}/pulls/${pull.number}`, {
