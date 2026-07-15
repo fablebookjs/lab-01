@@ -67,10 +67,6 @@ export function classifyCloseEvent(event, repository = REPOSITORY) {
   if (!SHA_PATTERN.test(pull.head.sha ?? '')) {
     fail('release pull request wake-up has an invalid head SHA');
   }
-  if (pull.merged === true || pull.merged_at) {
-    return { action: 'ignored-merged', pullRequest: pull.number };
-  }
-
   return {
     action: 'regenerate',
     pullRequest: pull.number,
@@ -178,10 +174,13 @@ export async function reconcileClosedPull({
       fail('durable GitHub state is missing the current release pull request');
     }
 
-    if (latestPull.number > wakeUp.pullRequest) {
-      if (latestPull.state === 'open') assertReplacementPull(latestPull, state.stagedIntent);
+    if (latestPull.state === 'open') {
+      assertReplacementPull(latestPull, state.stagedIntent);
+      if (!state.stagedCurrent) {
+        fail('the open replacement release pull request is based on a stale staged intent');
+      }
       return {
-        action: latestPull.state === 'open' ? 'replacement-exists' : 'ignored-stale-close',
+        action: 'replacement-exists',
         pullRequest: latestPull.number,
         releaseSource: state.releaseSource,
         intent: state.stagedIntent,
@@ -192,10 +191,10 @@ export async function reconcileClosedPull({
       return { action: 'ignored-merged', pullRequest: latestPull.number };
     }
     if (latestPull.state !== 'closed') {
-      fail('the closed release pull request was reopened instead of replaced');
+      fail('the latest release pull request has an unexpected state');
     }
 
-    if (!state.stagedCurrent || state.stagedIntent === wakeUp.closedHead) {
+    if (!state.stagedCurrent || state.stagedIntent === latestPull.head.sha) {
       const intent = await adapter.createFreshIntent({
         source: state.releaseSource,
         previousIntent: state.stagedIntent,
@@ -253,7 +252,7 @@ export async function reconcileClosedPull({
       }
       return {
         action: 'created-replacement',
-        closedPullRequest: wakeUp.pullRequest,
+        closedPullRequest: latestPull.number,
         pullRequest: pull.number,
         releaseSource: state.releaseSource,
         intent: state.stagedIntent,

@@ -31,10 +31,13 @@ The close handler treats `pull_request_target` deliveries only as wake-ups. It
 accepts the exact same-repository `staged/v1.0` to `releases/v1.0` identity,
 checks out only trusted `releases/v1.0` code, and re-reads the refs and current
 PR history. A merged release PR never regenerates. Unrelated events do nothing;
-fork, partial release-PR identities, reopened historical PRs, and ambiguous
-state fail closed. A delayed close for an older PR cannot alter a newer PR, and
-a duplicate delivery recognizes an existing open draft replacement rather than
-creating another one.
+fork, partial release-PR identities, and ambiguous state fail closed. After the
+triggering event is matched to the same historical PR and closed head, the
+latest durable lifecycle PR decides the action. A latest merged PR is a no-op;
+a latest closed, unmerged PR gets a replacement even when an older close was
+the wake-up. A latest open PR counts as the replacement only when it is a draft
+at the exact current staged intent and that intent is current for the release
+line; stale or otherwise unexpected open state fails closed.
 
 Before reusing the same head/base pair, the handler writes a fresh empty intent
 commit. The write uses `--force-with-lease` with the exact observed old staged

@@ -147,13 +147,13 @@ test('an unmerged close writes one fresh intent and creates one draft replacemen
   assert.match(harness.calls.createPull[0].body, new RegExp(freshIntentA));
 });
 
-test('a merged release close is a no-op before any durable-state read', async () => {
+test('a latest merged release pull request is a no-op after durable event validation', async () => {
   const merged = pull({
     number: 7,
     merged: true,
     mergedAt: '2026-07-15T10:00:00Z',
   });
-  const harness = fakeAdapter({ states: [] });
+  const harness = fakeAdapter({ states: [state({ pulls: [merged] })] });
 
   assert.deepEqual(
     await reconcileClosedPull({ event: eventFor(merged), adapter: harness.adapter }),
@@ -177,7 +177,7 @@ test('unrelated closes are ignored while suspicious release identities fail clos
   );
 });
 
-test('a duplicate wake-up recognizes the already-open replacement without mutation', async () => {
+test('a delayed old close recognizes a newer current open replacement without mutation', async () => {
   const closed = pull({ number: 7 });
   const replacement = pull({
     number: 8,
@@ -200,11 +200,21 @@ test('a duplicate wake-up recognizes the already-open replacement without mutati
   assert.deepEqual(harness.calls.createPull, []);
 });
 
-test('a stale close cannot overwrite or recreate after a newer lifecycle PR', async () => {
+test('a delayed old close replaces the latest newer closed lifecycle PR', async () => {
   const stale = pull({ number: 7 });
   const newerClosed = pull({ number: 8, headSha: concurrentIntent });
   const harness = fakeAdapter({
-    states: [state({ stagedIntent: concurrentIntent, pulls: [stale, newerClosed] })],
+    states: [
+      state({ stagedIntent: concurrentIntent, pulls: [stale, newerClosed] }),
+      state({ stagedIntent: freshIntentA, pulls: [stale, newerClosed] }),
+    ],
+    refs: [
+      { releaseSource: sourceA, stagedIntent: concurrentIntent },
+      { releaseSource: sourceA, stagedIntent: freshIntentA },
+      { releaseSource: sourceA, stagedIntent: freshIntentA },
+    ],
+    intents: [freshIntentA],
+    createdPullNumber: 9,
   });
 
   const result = await reconcileClosedPull({
@@ -212,7 +222,40 @@ test('a stale close cannot overwrite or recreate after a newer lifecycle PR', as
     adapter: harness.adapter,
   });
 
-  assert.equal(result.action, 'ignored-stale-close');
+  assert.equal(result.action, 'created-replacement');
+  assert.equal(result.closedPullRequest, 8);
+  assert.equal(result.pullRequest, 9);
+  assert.deepEqual(harness.calls.createFreshIntent, [
+    { source: sourceA, previousIntent: concurrentIntent },
+  ]);
+  assert.equal(harness.calls.updateStagedRef.length, 1);
+  assert.equal(harness.calls.updateStagedRef[0].expectedOld, concurrentIntent);
+  assert.equal(harness.calls.updateStagedRef[0].intent, freshIntentA);
+  assert.equal(harness.calls.createPull.length, 1);
+});
+
+test('a delayed old close fails closed when the newer open replacement is stale', async () => {
+  const stale = pull({ number: 7 });
+  const newerOpen = pull({
+    number: 8,
+    state: 'open',
+    draft: true,
+    headSha: concurrentIntent,
+  });
+  const harness = fakeAdapter({
+    states: [
+      state({
+        stagedIntent: concurrentIntent,
+        stagedCurrent: false,
+        pulls: [stale, newerOpen],
+      }),
+    ],
+  });
+
+  await assert.rejects(
+    reconcileClosedPull({ event: eventFor(stale), adapter: harness.adapter }),
+    /open replacement release pull request is based on a stale staged intent/,
+  );
   assert.deepEqual(harness.calls.updateStagedRef, []);
   assert.deepEqual(harness.calls.createPull, []);
 });
