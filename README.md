@@ -2,7 +2,8 @@
 
 `lab-01` is a disposable, synthetic monorepo for proving a visible release-PR
 contract without touching Storybook resources. The bounded G1 proof uses only
-the two public synthetic packages named below.
+the two public synthetic packages named below. Public-package finalization is
+a separately gated issue #19 concern; the release-PR maintainer never publishes.
 
 The `1.0.0` baseline contains:
 
@@ -26,6 +27,15 @@ one fresh empty intent and a new draft replacement. The first live transition
 closed PR #1 and created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12);
 rerunning the same delivery recognized the existing replacement without
 creating another PR.
+
+The maintainer now has an explicit ownership handoff for the issue #19
+finalizer. With no open proposal, it accepts only the uniquely latest merged
+`staged/v1.0` lifecycle PR, its exact ordered merge `M`, and a current line at a
+validated finalizer-owned M/H/V/J state. It performs no ref, PR-body, or QA
+dispatch write in those states. After the finalizer creates one exact draft
+`1.0.2` intent from the current line, the maintainer recognizes that proposal
+without applying its fixed `1.0.1` behavior. The finalizer itself is not added
+or claimed live by this prerequisite.
 
 See [the release-process note](docs/release-process.md) for the current contract
 and explicit automation limits.

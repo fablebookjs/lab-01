@@ -19,6 +19,12 @@ This repository currently demonstrates only the first visible release intent:
    empty intent commit and one new draft PR. The closed PR remains untouched as
    the historical review and comment record. The first live transition closed
    PR #1 and created draft PR #12.
+6. When the uniquely latest lifecycle PR is merged with the exact ordered
+   `[source, intent]` graph, the maintainer validates the no-open M/post-M state
+   and yields ownership without changing `staged/v1.0`, PR text, or QA state.
+7. When the finalizer later creates one exact draft `1.0.2` proposal from the
+   current line, the maintainer validates and yields to that proposal instead
+   of applying the fixed G1 `1.0.1` refresh or QA behavior.
 
 The maintainer re-reads both remote refs and the matching open release PR before
 acting. It accepts only this repository, release line, staged line, fixed
@@ -127,6 +133,41 @@ workflow, Pages setting, or Storybook resource.
 This operator-only `1.0.0` bootstrap is the only current public npm write in
 the repository. No workflow invokes it, no workflow publishes a package, and
 no `1.0.1` publication automation exists yet.
+
+Merging the current validated release PR is explicit authorization for a
+separately reviewed issue #19 finalizer to publish its exact source. This
+maintainer does not publish or reconcile. Until that finalizer and its operator
+gate are installed, the release PR must remain unmerged.
+
+## Maintainer-to-finalizer ownership handoff
+
+Events remain wake-ups. If no current lifecycle PR is open, the maintainer reads
+complete paginated all-state PR history and requires one unique latest lifecycle
+PR. That PR must be merged—not merely closed—from the same repository's
+`staged/v1.0` into `releases/v1.0`. Its staged head must still be the staged ref;
+the intent must be the exact one-parent empty `1.0.1` intent; and merge `M` must
+have ordered parents `[source, intent]` and the sealed source tree.
+
+The current release line may then be:
+
+- exact `M`;
+- an explicitly finalizer-observed late clean `H` bound to that `M`;
+- deterministic snapshot `V` at `release-snapshots/v1.0.1`, with one parent
+  `M` and the exact structured snapshot trailers; or
+- a finalizer-observed normal reconciliation `J`, with ordered parents `[H, V]`,
+  its expected tree, and exact M/V/H metadata.
+
+The H/J observer binding is a typed integration seam because the finalizer's
+committed reconciliation marker interface is not settled yet. The maintainer
+does not infer those states from arbitrary ancestry. Missing pages, duplicate
+or malformed lifecycle PRs, a closed-unmerged latest PR, stale staged state,
+wrong versions, unexplained line heads, or contradictory M/V/J graphs fail
+closed.
+
+Every accepted finalizer-owned state returns before staged/ref/PR-body/QA
+writes. An exact next proposal is accepted only when it is the unique latest
+open lifecycle PR, remains draft, and its empty `1.0.2` intent has the exact
+current release-line source and unchanged tree.
 
 ## Ready-state exact-version QA
 
@@ -333,3 +374,9 @@ The accepted issue #14 state contract requires publication to complete before
 normal reconciliation or conflict recovery begins. Consequently this slice
 never reconciles the release line while either package is absent and never
 creates `v1.0.1`, a GitHub Release, or a `1.0.2` proposal.
+
+The issue #19 public-package finalizer is intentionally **NOT INSTALLED BY THIS
+PREREQUISITE**. The maintainer only validates and yields at its ownership
+boundaries; it does not publish to public npm, reconcile, tag, create a GitHub
+Release, or mutate Storybook. The draft maintainer does not execute
+pull-request-head code.
