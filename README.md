@@ -22,3 +22,7 @@ commit as `main` and tag `v1.0.0`.
 
 See [the release-process note](docs/release-process.md) for the current contract
 and explicit automation limits.
+
+GitHub authority for normal post-publication reconciliation is tested separately
+on [fixed calibration refs](docs/reconciliation-calibration.md), so the completed
+release-PR demonstration remains intact.

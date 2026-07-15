@@ -1,0 +1,43 @@
+name: Calibrate clean reconciliation
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Fixed laboratory graph to exercise
+        required: true
+        type: choice
+        options:
+          - no-late
+          - clean-late
+          - concurrent-head
+
+permissions:
+  contents: write
+
+concurrency:
+  group: calibration-g1-reconciliation-${{ inputs.scenario }}
+  cancel-in-progress: false
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Assert the fixed laboratory target
+        run: |
+          test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01"
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+      - name: Check out trusted main code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          ref: ${{ github.sha }}
+
+      - name: Exercise the fixed reconciliation graph
+        run: node scripts/calibrate-clean-reconciliation.mjs --scenario "$SCENARIO"
+        env:
+          SCENARIO: ${{ inputs.scenario }}
