@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -41,10 +42,15 @@ const HUMAN_EDITED_RUN_SELECTOR = `
  select(.event == "pull_request" and
         .actor.login == "ndelangen" and
         .path == ".github/workflows/calibrate-required-check.yml" and
-        .head_branch == "calibration/g1/required-check-current/head" and
+        .head_branch == $head_ref and
         .head_sha == $head and
         .status == "completed" and
-        .conclusion == $conclusion)] as $runs |
+        .conclusion == $conclusion and
+        (.pull_requests | length) == 1 and
+        .pull_requests[0].number == $number and
+        .pull_requests[0].base.ref == $base and
+        .pull_requests[0].head.ref == $head_ref and
+        .pull_requests[0].head.sha == $head)] as $runs |
 select(($runs | length) == 1) | $runs[0]
 `.trim();
 const CHECKER_EVIDENCE_SELECTOR = `
@@ -53,27 +59,55 @@ const CHECKER_EVIDENCE_SELECTOR = `
 .headSha == $head and
 .remoteHeadSha == $head and
 .remoteMergeSha == $merge and
-.authorizedSha == $authorized
+.authorizedSha == $authorized and
+.priorAuthorizedSha == $prior_authorized and
+.priorBodySha256 == $prior_body_sha and
+.currentBodySha256 == $current_body_sha
 `.trim();
-const B_BEFORE_EDIT_POLICY_SELECTOR = `
+const EXACT_POLICY_SELECTOR = `
 .repository.pullRequest as $pr |
-$pr.mergeable == "MERGEABLE" and
-$pr.mergeStateStatus == "BLOCKED" and
+$pr != null and
+$pr.number == $number and
+$pr.state == "OPEN" and
+$pr.isDraft == false and
+$pr.merged == false and
+$pr.mergedAt == null and
+$pr.baseRefName == $base and
+$pr.baseRefOid == $base_oid and
+$pr.headRefName == $head_ref and
 $pr.headRefOid == $head and
-$pr.commits.nodes[0].commit.statusCheckRollup == null
-`.trim();
-const B_AFTER_EDIT_POLICY_SELECTOR = `
-.repository.pullRequest as $pr |
 $pr.mergeable == "MERGEABLE" and
-$pr.mergeStateStatus == "CLEAN" and
-$pr.headRefOid == $head and
-$pr.commits.nodes[0].commit.statusCheckRollup.state == "SUCCESS"
+$pr.mergeStateStatus == $policy and
+($pr.commits.nodes | length) == 1 and
+$pr.commits.nodes[0].commit.oid == $head and
+(if $rollup == "null" then
+   $pr.commits.nodes[0].commit.statusCheckRollup == null
+ else
+   ($pr.commits.nodes[0].commit.statusCheckRollup.state == $rollup and
+    $pr.commits.nodes[0].commit.statusCheckRollup.contexts.totalCount <= 100)
+ end)
 `.trim();
-const REQUIRED_CONTEXT_CHECK_SELECTOR = `
+const EXACT_PROTECTION_SELECTOR = `
+.required_status_checks.strict == false and
+.enforce_admins.enabled == true and
+(.required_status_checks.checks | length) == 1 and
+.required_status_checks.checks[0].context == $context and
+.required_status_checks.checks[0].app_id == $app_id
+`.trim();
+const SAME_NAME_CHECK_SELECTOR = `
+[.[].check_runs[] |
+ select(.head_sha == $head and
+        .name == $context)]
+`.trim();
+const EXACT_CHECK_SELECTOR = `
 [.[].check_runs[] |
  select(.head_sha == $head and
         .name == $context and
-        .app.id == $app_id)]
+        .app.id == $app_id and
+        .status == "completed" and
+        .conclusion == $conclusion and
+        (.details_url | contains($run_path)))] as $checks |
+select(($checks | length) == 1) | $checks[0]
 `.trim();
 
 function command(cwd, args, env = {}) {
@@ -272,7 +306,15 @@ function parseWorkflowYaml(yaml) {
   );
 }
 
-function runHumanEditedRunSelector({ after, before, head, conclusion }) {
+function runHumanEditedRunSelector({
+  after,
+  before,
+  number = 20,
+  base = `${BRANCH_NAMESPACE}/base`,
+  headRef = `${BRANCH_NAMESPACE}/head`,
+  head,
+  conclusion,
+}) {
   return spawnSync(
     'jq',
     [
@@ -283,6 +325,15 @@ function runHumanEditedRunSelector({ after, before, head, conclusion }) {
       '--arg',
       'head',
       head,
+      '--argjson',
+      'number',
+      String(number),
+      '--arg',
+      'base',
+      base,
+      '--arg',
+      'head_ref',
+      headRef,
       '--arg',
       'conclusion',
       conclusion,
@@ -292,7 +343,20 @@ function runHumanEditedRunSelector({ after, before, head, conclusion }) {
   );
 }
 
-function runCheckerEvidenceSelector({ evidence, number, head, merge, authorized }) {
+function bodySha256(body) {
+  return createHash('sha256').update(body, 'utf8').digest('hex');
+}
+
+function runCheckerEvidenceSelector({
+  evidence,
+  number,
+  head,
+  merge,
+  authorized,
+  priorAuthorized,
+  priorBodySha256,
+  currentBodySha256,
+}) {
   return spawnSync(
     'jq',
     [
@@ -309,20 +373,48 @@ function runCheckerEvidenceSelector({ evidence, number, head, merge, authorized 
       '--arg',
       'authorized',
       authorized,
+      '--arg',
+      'prior_authorized',
+      priorAuthorized,
+      '--arg',
+      'prior_body_sha',
+      priorBodySha256,
+      '--arg',
+      'current_body_sha',
+      currentBodySha256,
       CHECKER_EVIDENCE_SELECTOR,
     ],
     { encoding: 'utf8', input: JSON.stringify(evidence) },
   );
 }
 
-function runPolicySelector(policy, selector, head) {
-  return spawnSync('jq', ['-e', '--arg', 'head', head, selector], {
+function runPolicySelector(policy, expected) {
+  return spawnSync('jq', [
+    '-e',
+    '--argjson', 'number', String(expected.number),
+    '--arg', 'base', expected.base,
+    '--arg', 'base_oid', expected.baseOid,
+    '--arg', 'head_ref', expected.headRef,
+    '--arg', 'head', expected.head,
+    '--arg', 'policy', expected.policy,
+    '--arg', 'rollup', expected.rollup,
+    EXACT_POLICY_SELECTOR,
+  ], {
     encoding: 'utf8',
     input: JSON.stringify(policy),
   });
 }
 
-function runRequiredContextCheckSelector(checkRuns, { head, context, appId }) {
+function runProtectionSelector(protection, { context, appId }) {
+  return spawnSync('jq', [
+    '-e',
+    '--arg', 'context', context,
+    '--argjson', 'app_id', String(appId),
+    EXACT_PROTECTION_SELECTOR,
+  ], { encoding: 'utf8', input: JSON.stringify(protection) });
+}
+
+function runSameNameCheckSelector(checkRuns, { head, context }) {
   return spawnSync(
     'jq',
     [
@@ -333,13 +425,22 @@ function runRequiredContextCheckSelector(checkRuns, { head, context, appId }) {
       '--arg',
       'context',
       context,
-      '--argjson',
-      'app_id',
-      String(appId),
-      REQUIRED_CONTEXT_CHECK_SELECTOR,
+      SAME_NAME_CHECK_SELECTOR,
     ],
     { encoding: 'utf8', input: JSON.stringify(checkRuns) },
   );
+}
+
+function runExactCheckSelector(checkRuns, expected) {
+  return spawnSync('jq', [
+    '-ce',
+    '--arg', 'head', expected.head,
+    '--arg', 'context', expected.context,
+    '--argjson', 'app_id', String(expected.appId),
+    '--arg', 'conclusion', expected.conclusion,
+    '--arg', 'run_path', `/actions/runs/${expected.runId}/`,
+    EXACT_CHECK_SELECTOR,
+  ], { encoding: 'utf8', input: JSON.stringify(checkRuns) });
 }
 
 const EXPECTED_STATE_WORKFLOW = {
@@ -537,6 +638,104 @@ test('pull-request events prove opened A/A and first edited B/B without a synchr
     assert.equal(currentB.remoteBaseSha, setup.graph.base);
     assert.equal(currentB.remoteHeadSha, setup.graph.b);
     assert.equal(currentB.remoteMergeSha, setup.graph.b);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('edited authorization requires strict remote A to current remote B body transition', () => {
+  const f = fixture();
+  try {
+    const git = new Git(gitOptions(f));
+    const setup = runStateCalibration({ mode: 'setup', git, source: f.source });
+    runStateCalibration({ mode: 'advance-head', git, source: f.source });
+    setPullMergeRef(f, 20, setup.graph.b);
+    checkout(f, setup.graph.base);
+
+    const reopened = evaluateEvent(git, pullRequestEvent({
+      action: 'reopened',
+      baseSha: setup.graph.base,
+      headSha: setup.graph.b,
+      authorizedSha: setup.graph.b,
+    }));
+    assert.equal(reopened.authorized, true);
+    assert.equal(reopened.priorAuthorizedSha, null);
+
+    const exactEvent = pullRequestEvent({
+      action: 'edited',
+      baseSha: setup.graph.base,
+      headSha: setup.graph.b,
+      authorizedSha: setup.graph.b,
+      before: setup.graph.a,
+    });
+    const exact = evaluateEvent(git, exactEvent);
+    assert.equal(exact.authorized, true);
+    assert.equal(exact.priorAuthorizedSha, setup.graph.a);
+    assert.equal(exact.authorizedSha, setup.graph.b);
+    assert.equal(exact.remoteASha, setup.graph.a);
+    assert.equal(exact.remoteHeadSha, setup.graph.b);
+    assert.equal(exact.priorBodySha256, bodySha256(exactEvent.changes.body.from));
+    assert.equal(exact.currentBodySha256, bodySha256(exactEvent.pull_request.body));
+
+    const invalidPriorBodies = [
+      'No authorization',
+      'Authorized-Head-SHA: malformed',
+      `Authorized-Head-SHA: ${setup.graph.a}\nAuthorized-Head-SHA: ${setup.graph.a}`,
+      authorizedBody(f.source),
+    ];
+    for (const priorBody of invalidPriorBodies) {
+      const event = structuredClone(exactEvent);
+      event.changes.body.from = priorBody;
+      assert.throws(() => evaluateEvent(git, event), /Authorized-Head-SHA|prior authorization/);
+    }
+
+    const currentNotB = pullRequestEvent({
+      action: 'edited',
+      baseSha: setup.graph.base,
+      headSha: setup.graph.b,
+      body: `Changed prose\n\nAuthorized-Head-SHA: ${setup.graph.a}`,
+      before: setup.graph.a,
+    });
+    assert.throws(
+      () => evaluateEvent(git, currentNotB),
+      /Edited current authorization is not exact current remote head/,
+    );
+
+    const unrelatedSameAuthorization = pullRequestEvent({
+      action: 'edited',
+      baseSha: setup.graph.base,
+      headSha: setup.graph.b,
+      body: `New prose\n\nAuthorized-Head-SHA: ${setup.graph.b}`,
+      before: setup.graph.b,
+    });
+    assert.throws(
+      () => evaluateEvent(git, unrelatedSameAuthorization),
+      /prior authorization|did not change the authorized SHA/,
+    );
+
+    const fakePrior = structuredClone(exactEvent);
+    fakePrior.changes.body.from = `Different retained prose\n\nAuthorized-Head-SHA: ${setup.graph.a}`;
+    const fakePriorResult = evaluateEvent(git, fakePrior);
+    assert.notEqual(fakePriorResult.priorBodySha256, exact.priorBodySha256);
+    assert.notEqual(
+      runCheckerEvidenceSelector({
+        evidence: fakePriorResult,
+        number: 20,
+        head: setup.graph.b,
+        merge: setup.graph.b,
+        authorized: setup.graph.b,
+        priorAuthorized: setup.graph.a,
+        priorBodySha256: exact.priorBodySha256,
+        currentBodySha256: exact.currentBodySha256,
+      }).status,
+      0,
+    );
+
+    updateRemoteRef(f, calibrationRef('a'), f.source);
+    assert.throws(
+      () => evaluateEvent(git, exactEvent),
+      /Edited prior authorization is not exact remote calibration A/,
+    );
   } finally {
     f.cleanup();
   }
@@ -1117,6 +1316,7 @@ test('one strict public advertisement binds current base, head, merge ref, and G
       '--refs',
       'origin',
       calibrationRef('base'),
+      calibrationRef('a'),
       calibrationRef('head'),
       'refs/pull/20/merge',
     ]]);
@@ -1271,6 +1471,7 @@ test('v3 jq evidence requires no B context before edit and one human B/B success
   const b = 'b'.repeat(40);
   const merge = 'c'.repeat(40);
   const wrongHead = 'd'.repeat(40);
+  const baseOid = 'e'.repeat(40);
   const context = 'Required calibration head';
   const appId = 15368;
   assert.notEqual(b, merge);
@@ -1284,8 +1485,22 @@ test('v3 jq evidence requires no B context before edit and one human B/B success
     head_sha: a,
     status: 'completed',
     conclusion: 'success',
+    pull_requests: [{
+      number: 20,
+      base: { ref: `${BRANCH_NAMESPACE}/base` },
+      head: { ref: `${BRANCH_NAMESPACE}/head`, sha: a },
+    }],
   };
-  const successfulRun = { ...oldRun, id: 101, head_sha: b };
+  const successfulRun = {
+    ...oldRun,
+    id: 101,
+    head_sha: b,
+    pull_requests: [{
+      number: 20,
+      base: { ref: `${BRANCH_NAMESPACE}/base` },
+      head: { ref: `${BRANCH_NAMESPACE}/head`, sha: b },
+    }],
+  };
   const before = { workflow_runs: [oldRun] };
   const selectedSuccess = runHumanEditedRunSelector({
     before,
@@ -1304,6 +1519,28 @@ test('v3 jq evidence requires no B context before edit and one human B/B success
     { name: 'wrong workflow', run: { ...successfulRun, path: '.github/workflows/other.yml' } },
     { name: 'wrong conclusion', run: { ...successfulRun, conclusion: 'failure' } },
     { name: 'incomplete run', run: { ...successfulRun, status: 'in_progress', conclusion: null } },
+    {
+      name: 'wrong PR number',
+      run: { ...successfulRun, pull_requests: [{ ...successfulRun.pull_requests[0], number: 99 }] },
+    },
+    {
+      name: 'wrong PR base',
+      run: {
+        ...successfulRun,
+        pull_requests: [{ ...successfulRun.pull_requests[0], base: { ref: 'main' } }],
+      },
+    },
+    {
+      name: 'wrong PR head ref',
+      run: {
+        ...successfulRun,
+        pull_requests: [{ ...successfulRun.pull_requests[0], head: { ref: 'feature', sha: b } }],
+      },
+    },
+    {
+      name: 'multiple PRs',
+      run: { ...successfulRun, pull_requests: [successfulRun.pull_requests[0], successfulRun.pull_requests[0]] },
+    },
   ];
   for (const { name, run } of rejectedRuns) {
     const result = runHumanEditedRunSelector({
@@ -1340,6 +1577,8 @@ test('v3 jq evidence requires no B context before edit and one human B/B success
   });
   assert.notEqual(extraMatch.status, 0);
 
+  const priorBody = authorizedBody(a);
+  const currentBody = authorizedBody(b);
   const checkerEvidence = {
     action: 'edited',
     number: 20,
@@ -1347,6 +1586,9 @@ test('v3 jq evidence requires no B context before edit and one human B/B success
     remoteHeadSha: b,
     remoteMergeSha: merge,
     authorizedSha: b,
+    priorAuthorizedSha: a,
+    priorBodySha256: bodySha256(priorBody),
+    currentBodySha256: bodySha256(currentBody),
   };
   const selectedGreenCheckerEvidence = runCheckerEvidenceSelector({
     evidence: checkerEvidence,
@@ -1354,6 +1596,9 @@ test('v3 jq evidence requires no B context before edit and one human B/B success
     head: b,
     merge,
     authorized: b,
+    priorAuthorized: a,
+    priorBodySha256: bodySha256(priorBody),
+    currentBodySha256: bodySha256(currentBody),
   });
   assert.equal(selectedGreenCheckerEvidence.status, 0, selectedGreenCheckerEvidence.stderr);
   assert.notEqual(
@@ -1363,6 +1608,25 @@ test('v3 jq evidence requires no B context before edit and one human B/B success
       head: b,
       merge,
       authorized: b,
+      priorAuthorized: a,
+      priorBodySha256: bodySha256(priorBody),
+      currentBodySha256: bodySha256(currentBody),
+    }).status,
+    0,
+  );
+  assert.notEqual(
+    runCheckerEvidenceSelector({
+      evidence: {
+        ...checkerEvidence,
+        priorBodySha256: bodySha256(`Fake\n\nAuthorized-Head-SHA: ${a}`),
+      },
+      number: 20,
+      head: b,
+      merge,
+      authorized: b,
+      priorAuthorized: a,
+      priorBodySha256: bodySha256(priorBody),
+      currentBodySha256: bodySha256(currentBody),
     }).status,
     0,
   );
@@ -1375,10 +1639,9 @@ test('v3 jq evidence requires no B context before edit and one human B/B success
       ],
     },
   ];
-  const selectedBeforeChecks = runRequiredContextCheckSelector(checksBeforeEdit, {
+  const selectedBeforeChecks = runSameNameCheckSelector(checksBeforeEdit, {
     head: b,
     context,
-    appId,
   });
   assert.equal(selectedBeforeChecks.status, 0, selectedBeforeChecks.stderr);
   assert.deepEqual(JSON.parse(selectedBeforeChecks.stdout), []);
@@ -1389,63 +1652,197 @@ test('v3 jq evidence requires no B context before edit and one human B/B success
     app: { id: appId },
     status: 'completed',
     conclusion: 'success',
+    details_url: 'https://github.com/fablebookjs/lab-01/actions/runs/101/job/501',
   };
-  const selectedAfterChecks = runRequiredContextCheckSelector(
+  const selectedAfterChecks = runSameNameCheckSelector(
     [{ check_runs: [...checksBeforeEdit[0].check_runs, bSuccessCheck] }],
-    { head: b, context, appId },
+    { head: b, context },
   );
   assert.equal(selectedAfterChecks.status, 0, selectedAfterChecks.stderr);
   assert.deepEqual(JSON.parse(selectedAfterChecks.stdout), [bSuccessCheck]);
-  const poisonedBeforeEdit = runRequiredContextCheckSelector(
+  const poisonedBeforeEdit = runSameNameCheckSelector(
     [{ check_runs: [...checksBeforeEdit[0].check_runs, { ...bSuccessCheck, conclusion: 'failure' }] }],
-    { head: b, context, appId },
+    { head: b, context },
   );
   assert.equal(JSON.parse(poisonedBeforeEdit.stdout).length, 1);
+  for (const app of [{ id: 99999 }, null, {}, { id: 'malformed' }]) {
+    const sameName = runSameNameCheckSelector(
+      [{ check_runs: [{ ...bSuccessCheck, app }] }],
+      { head: b, context },
+    );
+    assert.ok(JSON.parse(sameName.stdout).length > 0);
+  }
+  const multipleApps = runSameNameCheckSelector(
+    [{
+      check_runs: [
+        bSuccessCheck,
+        { ...bSuccessCheck, app: { id: 99999 } },
+      ],
+    }],
+    { head: b, context },
+  );
+  assert.equal(JSON.parse(multipleApps.stdout).length, 2);
+
+  const exactBCheck = runExactCheckSelector(
+    [{ check_runs: [bSuccessCheck] }],
+    { head: b, context, appId, conclusion: 'success', runId: 101 },
+  );
+  assert.equal(exactBCheck.status, 0, exactBCheck.stderr);
+  const aSuccessCheck = {
+    ...bSuccessCheck,
+    head_sha: a,
+    details_url: 'https://github.com/fablebookjs/lab-01/actions/runs/100/job/401',
+  };
+  const exactACheck = runExactCheckSelector(
+    [{ check_runs: [aSuccessCheck] }],
+    { head: a, context, appId, conclusion: 'success', runId: 100 },
+  );
+  assert.equal(exactACheck.status, 0, exactACheck.stderr);
+  for (const check of [
+    { ...bSuccessCheck, head_sha: wrongHead },
+    { ...bSuccessCheck, name: 'Other context' },
+    { ...bSuccessCheck, app: { id: 99999 } },
+    { ...bSuccessCheck, status: 'in_progress' },
+    { ...bSuccessCheck, conclusion: 'failure' },
+    { ...bSuccessCheck, details_url: 'https://github.com/fablebookjs/lab-01/actions/runs/999/job/501' },
+  ]) {
+    assert.notEqual(
+      runExactCheckSelector(
+        [{ check_runs: [check] }],
+        { head: b, context, appId, conclusion: 'success', runId: 101 },
+      ).status,
+      0,
+    );
+  }
+  assert.notEqual(
+    runExactCheckSelector(
+      [{ check_runs: [bSuccessCheck, { ...bSuccessCheck }] }],
+      { head: b, context, appId, conclusion: 'success', runId: 101 },
+    ).status,
+    0,
+  );
 
   const beforeEditPolicy = {
     repository: {
       pullRequest: {
+        number: 20,
+        state: 'OPEN',
+        isDraft: false,
+        merged: false,
+        mergedAt: null,
+        baseRefName: `${BRANCH_NAMESPACE}/base`,
+        baseRefOid: baseOid,
+        headRefName: `${BRANCH_NAMESPACE}/head`,
         mergeable: 'MERGEABLE',
         mergeStateStatus: 'BLOCKED',
         headRefOid: b,
         commits: {
-          nodes: [{ commit: { statusCheckRollup: null } }],
+          nodes: [{ commit: { oid: b, statusCheckRollup: null } }],
         },
       },
     },
   };
-  const selectedBeforePolicy = runPolicySelector(
-    beforeEditPolicy,
-    B_BEFORE_EDIT_POLICY_SELECTOR,
-    b,
-  );
+  const beforeExpected = {
+    number: 20,
+    base: `${BRANCH_NAMESPACE}/base`,
+    baseOid,
+    headRef: `${BRANCH_NAMESPACE}/head`,
+    head: b,
+    policy: 'BLOCKED',
+    rollup: 'null',
+  };
+  const selectedBeforePolicy = runPolicySelector(beforeEditPolicy, beforeExpected);
   assert.equal(selectedBeforePolicy.status, 0, selectedBeforePolicy.stderr);
   const poisonedPolicy = structuredClone(beforeEditPolicy);
   poisonedPolicy.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup = {
     state: 'FAILURE',
   };
-  assert.notEqual(runPolicySelector(poisonedPolicy, B_BEFORE_EDIT_POLICY_SELECTOR, b).status, 0);
+  assert.notEqual(runPolicySelector(poisonedPolicy, beforeExpected).status, 0);
+
+  const policyMutations = [
+    (pr) => { pr.commits.nodes = []; },
+    (pr) => { pr.commits.nodes.push(structuredClone(pr.commits.nodes[0])); },
+    (pr) => { pr.commits.nodes[0].commit.oid = wrongHead; },
+    (pr) => { pr.number = 99; },
+    (pr) => { pr.state = 'CLOSED'; },
+    (pr) => { pr.isDraft = true; },
+    (pr) => { pr.merged = true; pr.mergedAt = '2026-07-15T20:00:00Z'; },
+    (pr) => { pr.baseRefName = 'main'; },
+    (pr) => { pr.baseRefOid = wrongHead; },
+    (pr) => { pr.headRefName = 'feature'; },
+    (pr) => { pr.headRefOid = wrongHead; },
+    (pr) => { pr.mergeable = 'CONFLICTING'; },
+    (pr) => { pr.mergeStateStatus = 'CLEAN'; },
+  ];
+  for (const mutate of policyMutations) {
+    const policy = structuredClone(beforeEditPolicy);
+    mutate(policy.repository.pullRequest);
+    assert.notEqual(runPolicySelector(policy, beforeExpected).status, 0);
+  }
 
   const afterEditPolicy = structuredClone(beforeEditPolicy);
   afterEditPolicy.repository.pullRequest.mergeStateStatus = 'CLEAN';
   afterEditPolicy.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup = {
     state: 'SUCCESS',
+    contexts: { totalCount: 1 },
   };
-  const selectedAfterPolicy = runPolicySelector(
-    afterEditPolicy,
-    B_AFTER_EDIT_POLICY_SELECTOR,
-    b,
-  );
+  const afterExpected = { ...beforeExpected, policy: 'CLEAN', rollup: 'SUCCESS' };
+  const selectedAfterPolicy = runPolicySelector(afterEditPolicy, afterExpected);
   assert.equal(selectedAfterPolicy.status, 0, selectedAfterPolicy.stderr);
   const aggregatedFailurePolicy = structuredClone(afterEditPolicy);
   aggregatedFailurePolicy.repository.pullRequest.mergeStateStatus = 'UNSTABLE';
   aggregatedFailurePolicy.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup = {
     state: 'FAILURE',
+    contexts: { totalCount: 2 },
   };
   assert.notEqual(
-    runPolicySelector(aggregatedFailurePolicy, B_AFTER_EDIT_POLICY_SELECTOR, b).status,
+    runPolicySelector(aggregatedFailurePolicy, afterExpected).status,
     0,
   );
+  const paginationOverflowPolicy = structuredClone(afterEditPolicy);
+  paginationOverflowPolicy.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.totalCount = 101;
+  assert.notEqual(runPolicySelector(paginationOverflowPolicy, afterExpected).status, 0);
+
+  const protection = {
+    required_status_checks: {
+      strict: false,
+      checks: [{ context, app_id: appId }],
+    },
+    enforce_admins: { enabled: true },
+  };
+  const exactProtection = runProtectionSelector(protection, { context, appId });
+  assert.equal(exactProtection.status, 0, exactProtection.stderr);
+  for (const candidate of [
+    { ...protection, required_status_checks: { ...protection.required_status_checks, strict: true } },
+    { ...protection, enforce_admins: { enabled: false } },
+    { ...protection, required_status_checks: { ...protection.required_status_checks, checks: [] } },
+    {
+      ...protection,
+      required_status_checks: {
+        ...protection.required_status_checks,
+        checks: [
+          { context, app_id: appId },
+          { context: 'Other', app_id: appId },
+        ],
+      },
+    },
+    {
+      ...protection,
+      required_status_checks: {
+        ...protection.required_status_checks,
+        checks: [{ context: 'Other', app_id: appId }],
+      },
+    },
+    {
+      ...protection,
+      required_status_checks: {
+        ...protection.required_status_checks,
+        checks: [{ context, app_id: 99999 }],
+      },
+    },
+  ]) {
+    assert.notEqual(runProtectionSelector(candidate, { context, appId }).status, 0);
+  }
 });
 
 test('scripts and documentation retain the release boundary and do not claim live proof', () => {
@@ -1527,4 +1924,40 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.match(docs, /must not modify v1 or v2 namespaces/);
   assert.doesNotMatch(docs, /v3 proof (?:is|was) complete|v3 succeeded/i);
   assert.doesNotMatch(docs, /authorized_sha|--authorized-sha/);
+  assert.match(docs, /\(\$pr\.commits\.nodes \| length\) == 1/);
+  assert.match(docs, /\$pr\.commits\.nodes\[0\]\.commit\.oid == \$head/);
+  assert.match(docs, /statusCheckRollup\.contexts\.totalCount <= 100/);
+  for (const field of [
+    'number',
+    'state',
+    'isDraft',
+    'merged',
+    'mergedAt',
+    'baseRefName',
+    'baseRefOid',
+    'headRefName',
+    'headRefOid',
+    'mergeable',
+    'mergeStateStatus',
+  ]) {
+    assert.match(docs, new RegExp(`\\$pr\\.${field}`));
+  }
+  assert.match(docs, /\.required_status_checks\.strict == false/);
+  assert.match(docs, /\.enforce_admins\.enabled == true/);
+  assert.match(docs, /\(\.required_status_checks\.checks \| length\) == 1/);
+  assert.match(docs, /\(\.pull_requests \| length\) == 1/);
+  assert.match(docs, /\.pull_requests\[0\]\.number == \$number/);
+  assert.match(docs, /\.pull_requests\[0\]\.base\.ref == \$base/);
+  assert.match(docs, /\.pull_requests\[0\]\.head\.sha == \$head/);
+  assert.match(docs, /\(\.details_url \| contains\(\$run_path\)\)/);
+  assert.match(docs, /select\(\(\$checks \| length\) == 1\)/);
+  assert.match(docs, /same-name CheckRun on B—including one from App `99999`—fails/);
+  assert.match(docs, /b-before-body\.sha256/);
+  assert.match(docs, /priorAuthorizedSha/);
+  assert.match(docs, /priorBodySha256/);
+  assert.match(docs, /remoteASha/);
+  assert.match(docs, /changes\.body\.from/);
+  assert.match(checkScript, /calibrationRef\('a'\)/);
+  assert.match(checkScript, /Edited prior authorization is not exact remote calibration A/);
+  assert.match(checkScript, /Edited current authorization is not exact current remote head/);
 });

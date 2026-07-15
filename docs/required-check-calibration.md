@@ -137,7 +137,8 @@ REST supplies exact App provenance; the GraphQL CheckRun fragment intentionally
 does not request an unsupported App field. Save this query as
 `required-check-calibration.graphql`:
 
-```graphql
+```sh
+tee required-check-calibration.graphql >/dev/null <<'GRAPHQL'
 query RequiredCheckCalibration($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
@@ -173,6 +174,7 @@ query RequiredCheckCalibration($owner: String!, $name: String!, $number: Int!) {
     }
   }
 }
+GRAPHQL
 ```
 
 Poll every five seconds for at most five minutes. A phase is terminal only when
@@ -180,6 +182,211 @@ the invariant PR tuple is
 `(number=PR, state=OPEN, isDraft=false, merged=false, mergedAt=null,
 baseRefName=BASE, baseRefOid=BASE_SHA, headRefName=HEAD)`, the returned commit
 OID equals `headRefOid`, and all phase-specific conditions are exact.
+
+Create these copy-safe selectors once. They are shared by every phase:
+
+```sh
+tee exact-policy.jq >/dev/null <<'JQ'
+.repository.pullRequest as $pr |
+$pr != null and
+$pr.number == $number and
+$pr.state == "OPEN" and
+$pr.isDraft == false and
+$pr.merged == false and
+$pr.mergedAt == null and
+$pr.baseRefName == $base and
+$pr.baseRefOid == $base_oid and
+$pr.headRefName == $head_ref and
+$pr.headRefOid == $head and
+$pr.mergeable == "MERGEABLE" and
+$pr.mergeStateStatus == $policy and
+($pr.commits.nodes | length) == 1 and
+$pr.commits.nodes[0].commit.oid == $head and
+(if $rollup == "null" then
+   $pr.commits.nodes[0].commit.statusCheckRollup == null
+ else
+   ($pr.commits.nodes[0].commit.statusCheckRollup.state == $rollup and
+    $pr.commits.nodes[0].commit.statusCheckRollup.contexts.totalCount <= 100)
+ end)
+JQ
+
+tee exact-protection.jq >/dev/null <<'JQ'
+.required_status_checks.strict == false and
+.enforce_admins.enabled == true and
+(.required_status_checks.checks | length) == 1 and
+.required_status_checks.checks[0].context == $context and
+.required_status_checks.checks[0].app_id == $app_id
+JQ
+
+tee exact-run.jq >/dev/null <<'JQ'
+[.workflow_runs[] | . as $run |
+ select(([$before[0].workflow_runs[].id] | index($run.id)) == null) |
+ select(.event == "pull_request" and
+        .actor.login == "ndelangen" and
+        .path == ".github/workflows/calibrate-required-check.yml" and
+        .head_branch == $head_ref and
+        .head_sha == $head and
+        .status == "completed" and
+        .conclusion == $conclusion and
+        (.pull_requests | length) == 1 and
+        .pull_requests[0].number == $number and
+        .pull_requests[0].base.ref == $base and
+        .pull_requests[0].head.ref == $head_ref and
+        .pull_requests[0].head.sha == $head)] as $runs |
+select(($runs | length) == 1) | $runs[0]
+JQ
+
+tee exact-check.jq >/dev/null <<'JQ'
+[.[].check_runs[] |
+ select(.head_sha == $head and
+        .name == $context and
+        .app.id == $app_id and
+        .status == "completed" and
+        .conclusion == $conclusion and
+        (.details_url | contains($run_path)))] as $checks |
+select(($checks | length) == 1) | $checks[0]
+JQ
+```
+
+For each phase, read and verify the exact protection. The percent-encoded v3
+branch is literal, so no shell evaluation constructs the endpoint. Set `PHASE`
+to the literal `a-green`, `b-before-edit`, or `b-after-edit` before each read:
+
+```sh
+gh api \
+  -H 'X-GitHub-Api-Version: 2026-03-10' \
+  "repos/$REPO/branches/calibration%2Fg1%2Frequired-check-current%2Fbase/protection" \
+  > "$PHASE-protection.json"
+
+jq -e --arg context "$CONTEXT" --argjson app_id "$APP_ID" \
+  -f exact-protection.jq \
+  "$PHASE-protection.json"
+```
+
+For `a-green`, capture the GraphQL, workflow-run, and CheckRun evidence, then
+apply full cardinality and linkage checks:
+
+```sh
+gh api --paginate --slurp \
+  -H 'X-GitHub-Api-Version: 2026-03-10' \
+  "repos/$REPO/commits/$A/check-runs?filter=all&per_page=100" \
+  > a-green-check-runs.json
+
+jq -ce --arg head "$A" \
+  '[.[].check_runs[] |
+    select(.head_sha == $head and
+           .name == "Required calibration head" and
+           .app.slug == "github-actions" and
+           .status == "completed" and
+           .conclusion == "success")] as $checks |
+   select(($checks | length) == 1) | $checks[0]' \
+  a-green-check-runs.json > a-green-bootstrap-check.json
+
+jq -r '.name' a-green-bootstrap-check.json > context.txt
+jq -r '.app.id' a-green-bootstrap-check.json > app-id.txt
+read -r CONTEXT < context.txt
+read -r APP_ID < app-id.txt
+
+gh api graphql \
+  -F query=@required-check-calibration.graphql \
+  -f owner=fablebookjs \
+  -f name=lab-01 \
+  -F number="$PR" \
+  > a-green-policy.json
+
+jq -e --argjson number "$PR" --arg base "$BASE" --arg base_oid "$BASE_SHA" \
+  --arg head_ref "$HEAD" --arg head "$A" --arg policy CLEAN --arg rollup SUCCESS \
+  -f exact-policy.jq a-green-policy.json
+
+jq -n '{workflow_runs: []}' > a-green-runs-before.json
+gh api \
+  -H 'X-GitHub-Api-Version: 2026-03-10' \
+  "repos/$REPO/actions/workflows/calibrate-required-check.yml/runs?event=pull_request&per_page=100" \
+  > a-green-runs-after.json
+
+jq -ce --slurpfile before a-green-runs-before.json \
+  --argjson number "$PR" --arg base "$BASE" --arg head_ref "$HEAD" --arg head "$A" \
+  --arg conclusion success -f exact-run.jq a-green-runs-after.json \
+  > a-green-run.json
+
+jq -r '.id' a-green-run.json > a-green-run-id.txt
+read -r A_RUN_ID < a-green-run-id.txt
+
+jq -ce --arg head "$A" --arg context "$CONTEXT" --argjson app_id "$APP_ID" \
+  --arg conclusion success --arg run_path "/actions/runs/$A_RUN_ID/" \
+  -f exact-check.jq a-green-check-runs.json > a-green-check.json
+```
+
+For `b-before-edit`, use the same full PR/protection selector and require both
+zero same-name CheckRuns across every App and a null rollup:
+
+```sh
+gh api graphql \
+  -F query=@required-check-calibration.graphql \
+  -f owner=fablebookjs \
+  -f name=lab-01 \
+  -F number="$PR" \
+  > b-before-edit-policy.json
+
+jq -e --argjson number "$PR" --arg base "$BASE" --arg base_oid "$BASE_SHA" \
+  --arg head_ref "$HEAD" --arg head "$B" --arg policy BLOCKED --arg rollup null \
+  -f exact-policy.jq b-before-edit-policy.json
+
+gh api --paginate --slurp \
+  -H 'X-GitHub-Api-Version: 2026-03-10' \
+  "repos/$REPO/commits/$B/check-runs?filter=all&per_page=100" \
+  > b-before-edit-check-runs.json
+
+gh api \
+  -H 'X-GitHub-Api-Version: 2026-03-10' \
+  "repos/$REPO/actions/workflows/calibrate-required-check.yml/runs?event=pull_request&per_page=100" \
+  > b-before-edit-runs.json
+
+jq -ce --argjson number "$PR" --arg base "$BASE" --arg head_ref "$HEAD" --arg head "$B" \
+  '[.workflow_runs[] |
+    select(.event == "pull_request" and
+           .path == ".github/workflows/calibrate-required-check.yml" and
+           .head_branch == $head_ref and .head_sha == $head and
+           (.pull_requests | length) == 1 and
+           .pull_requests[0].number == $number and
+           .pull_requests[0].base.ref == $base and
+           .pull_requests[0].head.ref == $head_ref and
+           .pull_requests[0].head.sha == $head)] |
+   select(length == 0)' \
+  b-before-edit-runs.json > b-before-edit-required-runs.json
+
+jq -ce --arg head "$B" --arg context "$CONTEXT" \
+  '[.[].check_runs[] | select(.head_sha == $head and .name == $context)] |
+   select(length == 0)' \
+  b-before-edit-check-runs.json > b-before-edit-required-checks.json
+```
+
+For `b-after-edit`, apply the full PR/protection selector, then bind the one
+exact B CheckRun to the one selected new human run:
+
+```sh
+gh api graphql \
+  -F query=@required-check-calibration.graphql \
+  -f owner=fablebookjs \
+  -f name=lab-01 \
+  -F number="$PR" \
+  > b-after-edit-policy.json
+
+jq -e --argjson number "$PR" --arg base "$BASE" --arg base_oid "$BASE_SHA" \
+  --arg head_ref "$HEAD" --arg head "$B" --arg policy CLEAN --arg rollup SUCCESS \
+  -f exact-policy.jq b-after-edit-policy.json
+
+jq -r '.id' b-after-edit-run.json > b-after-edit-run-id.txt
+read -r B_AFTER_RUN_ID < b-after-edit-run-id.txt
+gh api --paginate --slurp \
+  -H 'X-GitHub-Api-Version: 2026-03-10' \
+  "repos/$REPO/commits/$B/check-runs?filter=all&per_page=100" \
+  > b-after-edit-check-runs.json
+
+jq -ce --arg head "$B" --arg context "$CONTEXT" --argjson app_id "$APP_ID" \
+  --arg conclusion success --arg run_path "/actions/runs/$B_AFTER_RUN_ID/" \
+  -f exact-check.jq b-after-edit-check-runs.json > b-after-edit-check.json
+```
 
 ## Live v3 operator sequence
 
@@ -227,14 +434,16 @@ HEAD=calibration/g1/required-check-current/head
      "repos/$REPO/commits/$B/check-runs?filter=all&per_page=100" \
      > b-before-edit-check-runs.json
 
-   jq -ce --arg head "$B" --arg context "$CONTEXT" --argjson app_id "$APP_ID" \
+   jq -ce --arg head "$B" --arg context "$CONTEXT" \
      '[.[].check_runs[] |
-       select(.head_sha == $head and .name == $context and .app.id == $app_id)] |
+       select(.head_sha == $head and .name == $context)] |
       select(length == 0)' \
      b-before-edit-check-runs.json \
      > b-before-edit-required-checks.json
    ```
 
+   This poison scan deliberately ignores App, status, and conclusion. Any
+   same-name CheckRun on B—including one from App `99999`—fails the gate.
    Query GraphQL and require exact B with
    `(MERGEABLE, BLOCKED, statusCheckRollup=null)`. Query A separately and retain
    its successful required CheckRun. This is the stale-green rejection. If the
@@ -247,13 +456,39 @@ HEAD=calibration/g1/required-check-current/head
    gh api user > b-after-edit-operator.json
    jq -e '.login == "ndelangen"' b-after-edit-operator.json
 
+   gh pr view "$PR" \
+     --repo "$REPO" \
+     --json number,state,isDraft,mergedAt,headRefName,headRefOid,baseRefName,body \
+     > b-before-body-pr.json
+
+   jq -e --argjson number "$PR" --arg head "$B" --arg authorized "$A" \
+     '.number == $number and .state == "OPEN" and .isDraft == false and
+      .mergedAt == null and
+      .baseRefName == "calibration/g1/required-check-current/base" and
+      .headRefName == "calibration/g1/required-check-current/head" and
+      .headRefOid == $head and
+      ([.body | split("\n")[] |
+        select(contains("Authorized-Head-SHA:"))] ==
+       ["Authorized-Head-SHA: " + $authorized])' \
+     b-before-body-pr.json
+
+   jq -rj '.body' b-before-body-pr.json > b-before-body.md
+   node --input-type=module -e '
+     import { readFileSync } from "node:fs";
+     import { parseAuthorizedHead } from "./scripts/check-required-calibration-head.mjs";
+     const actual = parseAuthorizedHead(readFileSync(process.argv[2], "utf8"));
+     if (actual !== process.argv[1]) throw new Error("Pre-edit authorization is not exact A");
+   ' "$A" b-before-body.md
+   shasum -a 256 b-before-body.md > b-before-body.sha256
+
    gh api \
      -H 'X-GitHub-Api-Version: 2026-03-10' \
      "repos/$REPO/actions/workflows/calibrate-required-check.yml/runs?event=pull_request&per_page=100" \
      > b-after-edit-runs-before.json
    ```
 
-   Stop unless identity and `b-before-edit` evidence are exact. Make one body
+   Retain the exact pre-edit body and SHA-256. Stop unless identity, sole exact A
+   authorization, and `b-before-edit` evidence are exact. Make one body
    edit directly from authorization A to B; do not create an intentional B/A
    required run:
 
@@ -261,6 +496,7 @@ HEAD=calibration/g1/required-check-current/head
    jq -n -j --arg sha "$B" \
      '"Required-check calibration v3.\n\nAuthorized-Head-SHA: \($sha)"' \
      > b-after-edit-body.md
+   shasum -a 256 b-after-edit-body.md > b-after-edit-body.sha256
 
    gh pr edit "$PR" --repo "$REPO" --body-file b-after-edit-body.md
 
@@ -314,11 +550,30 @@ HEAD=calibration/g1/required-check-current/head
       select(($runs | length) == 1) | $runs[0]' \
      b-after-edit-runs-after.json \
      > b-after-edit-run.json
+
+   jq -r '.id' b-after-edit-run.json > b-after-edit-run-id.txt
+   read -r B_AFTER_RUN_ID < b-after-edit-run-id.txt
+   read -r B_MERGE_SHA < b-after-edit-merge-sha.txt
+   read -r B_BEFORE_BODY_SHA B_BEFORE_BODY_FILE < b-before-body.sha256
+   read -r B_AFTER_BODY_SHA B_AFTER_BODY_FILE < b-after-edit-body.sha256
+   gh run view "$B_AFTER_RUN_ID" --repo "$REPO" --log > b-after-edit-run.log
+
+   rg -F '"action": "edited"' b-after-edit-run.log
+   rg -F "\"number\": $PR" b-after-edit-run.log
+   rg -F "\"headSha\": \"$B\"" b-after-edit-run.log
+   rg -F "\"remoteASha\": \"$A\"" b-after-edit-run.log
+   rg -F "\"remoteHeadSha\": \"$B\"" b-after-edit-run.log
+   rg -F "\"priorAuthorizedSha\": \"$A\"" b-after-edit-run.log
+   rg -F "\"authorizedSha\": \"$B\"" b-after-edit-run.log
+   rg -F "\"priorBodySha256\": \"$B_BEFORE_BODY_SHA\"" b-after-edit-run.log
+   rg -F "\"currentBodySha256\": \"$B_AFTER_BODY_SHA\"" b-after-edit-run.log
+   rg -F "\"remoteMergeSha\": \"$B_MERGE_SHA\"" b-after-edit-run.log
    ```
 
-   Retain the run logs and require checker `action=edited`, exact PR, B/B,
-   `remoteHeadSha=B`, and `remoteMergeSha` equal to the separately advertised
-   merge SHA. The checker already enforces `GITHUB_SHA=remoteMergeSha`.
+   These retained logs bind the event's strict `changes.body.from` parse to
+   exact A and to the SHA-256 of the pre-edit body snapshot. They also require
+   exact PR, B/B, remote A/B, and the separately advertised merge SHA. The
+   checker already enforces `GITHUB_SHA=remoteMergeSha`.
 
 6. Query exact B CheckRuns again. Require exactly one exact context/App match,
    bound to the new human run, with completed `success`. Poll GraphQL until exact
