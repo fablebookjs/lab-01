@@ -1,0 +1,43 @@
+name: Calibrate required-check state
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Fixed required-check state transition
+        required: true
+        type: choice
+        options:
+          - setup
+          - advance-head
+
+permissions:
+  contents: write
+
+concurrency:
+  group: calibration-g1-required-check-state
+  cancel-in-progress: false
+
+jobs:
+  maintain-state:
+    name: Maintain required-check calibration state
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Assert the fixed laboratory target
+        run: |
+          test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01"
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+      - name: Check out trusted main code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          ref: ${{ github.sha }}
+
+      - name: Maintain the fixed required-check graph
+        run: node scripts/calibrate-required-check-state.mjs --mode "$MODE"
+        env:
+          MODE: ${{ inputs.mode }}

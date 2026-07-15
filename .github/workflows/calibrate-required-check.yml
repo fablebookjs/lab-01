@@ -1,0 +1,40 @@
+name: Required check calibration
+
+on:
+  workflow_dispatch:
+    inputs:
+      authorized_sha:
+        description: Exact full calibration head SHA to authorize
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: calibration-g1-required-check-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  current-head-authorization:
+    name: Required calibration head
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Assert the fixed calibration head
+        run: |
+          test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01"
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          test "$GITHUB_REF" = "refs/heads/calibration/g1/required-check/head"
+
+      - name: Check out the exact dispatched calibration head
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Require the exact current explicitly authorized head
+        run: node scripts/check-required-calibration-head.mjs --authorized-sha "$AUTHORIZED_SHA"
+        env:
+          AUTHORIZED_SHA: ${{ inputs.authorized_sha }}
