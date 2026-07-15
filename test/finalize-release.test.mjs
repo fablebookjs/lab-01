@@ -1,13 +1,23 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
+  DefiniteGitHubClientError,
+  LiveGitAdapter,
   LiveGitHubAdapter,
+  LiveNpmAdapter,
+  PROPOSAL_ATTEMPT_REF,
   RECOVERY_REF,
+  RELEASE_ATTEMPT_REF,
   RELEASE_REF,
+  StaleLeaseError,
   STAGED_REF,
   TAG_REF,
+  buildLeasedPushArguments,
   classifyNextAction,
   githubReleaseBody,
   observeMaintainerPostMerge,
@@ -15,6 +25,8 @@ import {
   nextProposalBody,
   observeDurableState,
   reconciliationMessage,
+  recoveryPullBody,
+  recoveryPullTitle,
   runFinalizerInvocation,
 } from '../scripts/finalize-release.mjs';
 import {
@@ -38,6 +50,7 @@ const ids = {
   nextIntent: sha('7'),
   otherLate: sha('8'),
   main: sha('9'),
+  recoveryReconciliation: sha('f'),
 };
 const trees = {
   source: sha('a'),
@@ -45,6 +58,7 @@ const trees = {
   late: sha('c'),
   reconciliation: sha('d'),
   otherLate: sha('e'),
+  recovery: sha('0'),
 };
 const expectedPackages = PACKAGE_SPECS.map((spec, index) => ({
   name: spec.name,
@@ -78,11 +92,31 @@ function releasePull() {
     number: 12,
     state: 'closed',
     draft: false,
+    merged: true,
     merged_at: '2026-07-16T00:00:00Z',
     merge_commit_sha: ids.merge,
     html_url: 'https://github.com/fablebookjs/lab-01/pull/12',
+    title: 'release: propose v1.0.1',
+    body: 'sealed release proposal',
     head: { ref: 'staged/v1.0', sha: ids.intent, repo: { full_name: REPOSITORY } },
     base: { ref: 'releases/v1.0', sha: ids.source, repo: { full_name: REPOSITORY } },
+  };
+}
+
+function recoveryPull(overrides = {}) {
+  return {
+    number: 100,
+    state: 'open',
+    draft: true,
+    merged: false,
+    merged_at: null,
+    merge_commit_sha: null,
+    html_url: 'https://github.com/fablebookjs/lab-01/pull/100',
+    title: recoveryPullTitle(),
+    body: recoveryPullBody({ lateSha: ids.late, snapshotSha: ids.snapshot }),
+    head: { ref: 'recovery/v1.0/1.0.1', sha: ids.late, repo: { full_name: REPOSITORY } },
+    base: { ref: 'releases/v1.0', sha: ids.snapshot, repo: { full_name: REPOSITORY } },
+    ...overrides,
   };
 }
 
@@ -114,6 +148,12 @@ class MemoryGit {
         tree: trees.reconciliation,
         message: reconciliationMessage({ mergeSha: ids.merge, lateSha: ids.late, snapshotSha: ids.snapshot }),
       }],
+      [ids.recoveryReconciliation, {
+        sha: ids.recoveryReconciliation,
+        parents: [ids.snapshot, ids.late],
+        tree: trees.recovery,
+        message: 'Merge pull request #100 from fablebookjs/recovery/v1.0/1.0.1\n',
+      }],
     ]);
     this.mergeTrees = new Map([
       [`${ids.late} ${ids.snapshot}`, { clean: true, tree: trees.reconciliation }],
@@ -126,14 +166,38 @@ class MemoryGit {
       `${ids.merge} ${ids.otherLate}`,
       `${ids.late} ${ids.reconciliation}`,
       `${ids.snapshot} ${ids.reconciliation}`,
+      `${ids.snapshot} ${ids.recoveryReconciliation}`,
+      `${ids.late} ${ids.recoveryReconciliation}`,
     ]);
     this.nextCommitShas = [];
     this.durableWrites = [];
+    this.operations = [];
     this.ambiguous = false;
     this.staleWinner = null;
+    this.genericPushFailure = false;
+    this.mainCheckHook = null;
+    this.refReadHook = null;
   }
 
-  async listRefs() { return structuredClone(this.refs); }
+  async listRefs() {
+    this.operations.push({ transport: 'git', method: 'ls-remote', mutation: false, repository: REPOSITORY });
+    if (this.refReadHook) await this.refReadHook(this);
+    return structuredClone(this.refs);
+  }
+  async readStableRef(ref) {
+    this.operations.push({ transport: 'git', method: 'ls-remote', mutation: false, repository: REPOSITORY, ref });
+    return this.refs[ref]?.sha ?? null;
+  }
+  async assertTrustedMain(context) {
+    if (this.mainCheckHook) await this.mainCheckHook(this);
+    const remoteMainSha = this.refs['refs/heads/main']?.sha ?? null;
+    if (
+      remoteMainSha !== context.sourceSha ||
+      context.localSha !== context.sourceSha ||
+      context.workflowSha !== context.sourceSha
+    ) throw new Error('trusted current-main binding drifted before mutation');
+    return { remoteMainSha, localSha: context.localSha, sourceSha: context.sourceSha, workflowSha: context.workflowSha };
+  }
   async commit(value) {
     const commit = this.commits.get(value);
     if (!commit) throw new Error(`missing commit ${value}`);
@@ -181,12 +245,18 @@ class MemoryGit {
     this.commits.set(value, { sha: value, tree, parents: [...parents], message });
     return value;
   }
-  async pushRef(ref, expected, next) {
+  async pushRef(ref, expected, next, { context } = {}) {
+    if (context) await this.assertTrustedMain(context);
     this.durableWrites.push({ type: 'ref', ref, expected, next });
+    this.operations.push({ transport: 'git', method: 'push', mutation: true, repository: REPOSITORY, ref, expected, next });
+    if (this.genericPushFailure) {
+      this.genericPushFailure = false;
+      throw new Error('authentication or transport failure');
+    }
     if (this.staleWinner) {
       this.refs[ref] = { sha: this.staleWinner, type: 'commit' };
       this.staleWinner = null;
-      throw new Error('stale lease');
+      throw new StaleLeaseError(ref);
     }
     assert.equal(this.refs[ref]?.sha ?? null, expected);
     this.refs[ref] = { sha: next, type: 'commit' };
@@ -204,6 +274,7 @@ class MemoryGitHub {
       number: 99,
       state: 'open',
       draft: true,
+      merged: false,
       merged_at: null,
       merge_commit_sha: null,
       html_url: 'https://github.com/fablebookjs/lab-01/pull/99',
@@ -214,15 +285,42 @@ class MemoryGitHub {
     }];
     this.releases = [];
     this.durableWrites = [];
+    this.operations = [];
     this.ambiguousRelease = false;
     this.ambiguousPull = false;
+    this.releaseVisibilityDelay = 0;
+    this.pullVisibilityDelay = 0;
+    this.pendingReleases = [];
+    this.pendingPulls = [];
+    this.definiteReleaseRejection = false;
+    this.definitePullRejection = false;
+    this.pullReadHook = null;
   }
-  async repository() { return { full_name: REPOSITORY, default_branch: 'main' }; }
-  async listPulls() { return structuredClone(this.pulls); }
-  async listReleases() { return structuredClone(this.releases); }
+  async repository() {
+    this.operations.push({ transport: 'github', method: 'GET', mutation: false, repository: REPOSITORY, endpoint: '/' });
+    return { full_name: REPOSITORY, default_branch: 'main' };
+  }
+  async listPulls() {
+    this.operations.push({ transport: 'github', method: 'GET', mutation: false, repository: REPOSITORY, endpoint: '/pulls' });
+    if (this.pullVisibilityDelay > 0) this.pullVisibilityDelay -= 1;
+    else if (this.pendingPulls.length) this.pulls.push(...this.pendingPulls.splice(0));
+    if (this.pullReadHook) await this.pullReadHook(this);
+    return structuredClone(this.pulls);
+  }
+  async listReleases() {
+    this.operations.push({ transport: 'github', method: 'GET', mutation: false, repository: REPOSITORY, endpoint: '/releases' });
+    if (this.releaseVisibilityDelay > 0) this.releaseVisibilityDelay -= 1;
+    else if (this.pendingReleases.length) this.releases.push(...this.pendingReleases.splice(0));
+    return structuredClone(this.releases);
+  }
   async createRelease({ tagName, targetSha, body }) {
     this.durableWrites.push({ type: 'release', tagName, targetSha });
-    this.releases.push({
+    this.operations.push({ transport: 'github', method: 'POST', mutation: true, repository: REPOSITORY, endpoint: '/releases' });
+    if (this.definiteReleaseRejection) {
+      this.definiteReleaseRejection = false;
+      throw new DefiniteGitHubClientError(400, '/releases');
+    }
+    const release = {
       id: 501,
       tag_name: tagName,
       target_commitish: targetSha,
@@ -231,18 +329,28 @@ class MemoryGitHub {
       draft: false,
       prerelease: false,
       html_url: `https://github.com/fablebookjs/lab-01/releases/tag/${tagName}`,
-    });
+    };
+    if (this.releaseVisibilityDelay > 0) this.pendingReleases.push(release);
+    else this.releases.push(release);
     if (this.ambiguousRelease) {
       this.ambiguousRelease = false;
       throw new Error('lost release POST response');
     }
   }
-  async createPullRequest({ title, body, head, base, draft }) {
+  async createPullRequest({ title, body, head, base, draft, expectedHeadSha, expectedBaseSha }) {
     this.durableWrites.push({ type: 'pull', head, base });
-    this.pulls.push({
+    this.operations.push({ transport: 'github', method: 'POST', mutation: true, repository: REPOSITORY, endpoint: '/pulls' });
+    assert.equal(expectedHeadSha, this.git.refs[STAGED_REF].sha);
+    assert.equal(expectedBaseSha, this.git.refs[RELEASE_REF].sha);
+    if (this.definitePullRejection) {
+      this.definitePullRejection = false;
+      throw new DefiniteGitHubClientError(400, '/pulls');
+    }
+    const pull = {
       number: 101,
       state: 'open',
       draft,
+      merged: false,
       merged_at: null,
       merge_commit_sha: null,
       title,
@@ -250,7 +358,9 @@ class MemoryGitHub {
       html_url: 'https://github.com/fablebookjs/lab-01/pull/101',
       head: { ref: head, sha: this.git.refs[STAGED_REF].sha, repo: { full_name: REPOSITORY } },
       base: { ref: base, sha: this.git.refs[RELEASE_REF].sha, repo: { full_name: REPOSITORY } },
-    });
+    };
+    if (this.pullVisibilityDelay > 0) this.pendingPulls.push(pull);
+    else this.pulls.push(pull);
     if (this.ambiguousPull) {
       this.ambiguousPull = false;
       throw new Error('lost PR POST response');
@@ -262,8 +372,10 @@ class MemoryNpm {
   constructor(observations = [npmPresent(0), npmPresent(1)]) {
     this.observations = observations;
     this.durableWrites = [];
+    this.operations = [];
   }
   async observe(spec) {
+    this.operations.push({ transport: 'npm', method: 'GET', mutation: false, package: spec.name, resource: 'metadata+tarball' });
     return structuredClone(this.observations[PACKAGE_SPECS.findIndex((item) => item.name === spec.name)]);
   }
 }
@@ -279,6 +391,7 @@ function fixture({ npm = [npmPresent(0), npmPresent(1)] } = {}) {
     event: 'workflow_dispatch',
     runId: '700',
     sourceSha: ids.main,
+    workflowSha: ids.main,
     localSha: ids.main,
   };
   return { gitAdapter, githubAdapter, npmAdapter, context };
@@ -289,6 +402,7 @@ async function observe(value) {
 }
 
 async function installExactRelease(value) {
+  value.gitAdapter.refs[RELEASE_ATTEMPT_REF] = { sha: ids.snapshot, type: 'commit' };
   const state = await observe(value);
   value.githubAdapter.releases = [{
     id: 501,
@@ -356,8 +470,8 @@ test('M fast-forwards to V with one exact lease and preserves unrelated refs and
   assert.deepEqual(value.gitAdapter.refs['refs/heads/unrelated'], unrelated);
   assert.deepEqual(value.githubAdapter.pulls[1], calibration);
   assert.deepEqual(evidence.preservation.changedRefs, [{ name: RELEASE_REF, oldSha: ids.merge, newSha: ids.snapshot }]);
-  assert.equal(evidence.preservation.storybookMutation, false);
-  assert.equal(evidence.preservation.npmMutation, false);
+  assert.equal(evidence.preservation.assessment.allGitWritesAllowlisted, true);
+  assert.equal(evidence.preservation.assessment.npmTransportReadOnly, true);
 });
 
 test('one clean late X creates deterministic J [X,V], while a stale lease refetches a new valid H', async () => {
@@ -424,6 +538,8 @@ test('lost GitHub Release success and the retained injected fault converge witho
   const value = fixture();
   value.gitAdapter.refs[RELEASE_REF].sha = ids.snapshot;
   value.gitAdapter.refs[TAG_REF] = { sha: ids.snapshot, type: 'commit' };
+  const authorization = await runFinalizerInvocation({ adapters: value, context: value.context });
+  assert.equal(authorization.action.type, 'authorize-github-release');
   value.githubAdapter.ambiguousRelease = true;
   await assert.rejects(
     runFinalizerInvocation({ adapters: value, context: value.context, fault: 'after-github-release-post' }),
@@ -449,11 +565,12 @@ test('an exact open recovery PR may coexist with tag and Release but suppresses 
     number: 100,
     state: 'open',
     draft: true,
+    merged: false,
     merged_at: null,
     merge_commit_sha: null,
     html_url: 'https://github.com/fablebookjs/lab-01/pull/100',
-    title: 'Recover late work',
-    body: 'Recorded issue #15 recovery',
+    title: recoveryPullTitle(),
+    body: recoveryPullBody({ lateSha: ids.late, snapshotSha: ids.snapshot }),
     head: { ref: 'recovery/v1.0/1.0.1', sha: ids.late, repo: { full_name: REPOSITORY } },
     base: { ref: 'releases/v1.0', sha: ids.snapshot, repo: { full_name: REPOSITORY } },
   });
@@ -480,8 +597,11 @@ test('normal J advances the old staged intent, then creates exactly one draft wi
   assert.equal(next.message, nextIntentMessage(ids.reconciliation));
 
   value.githubAdapter.ambiguousPull = true;
+  const authorizePr = await runFinalizerInvocation({ adapters: value, context: value.context });
+  assert.equal(authorizePr.action.type, 'authorize-next-proposal');
+  value.githubAdapter.ambiguousPull = true;
   const prRun = await runFinalizerInvocation({ adapters: value, context: value.context });
-  assert.equal(prRun.action.type, 'create-next-proposal');
+  assert.equal(prRun.action.type, 'post-next-proposal');
   assert.equal(prRun.action.result, 'converged-after-ambiguous-response');
   assert.equal(value.githubAdapter.durableWrites.filter(({ type }) => type === 'pull').length, 1);
   assert.match(value.githubAdapter.pulls.at(-1).body, new RegExp(ids.late));
@@ -507,6 +627,7 @@ test('closed next proposals regenerate once, while duplicates and merged/wrong i
     number: 100,
     state: 'closed',
     draft: true,
+    merged: false,
     merged_at: null,
     merge_commit_sha: null,
     title: 'release: propose v1.0.2',
@@ -515,14 +636,19 @@ test('closed next proposals regenerate once, while duplicates and merged/wrong i
     head: { ref: 'staged/v1.0', sha: ids.nextIntent, repo: { full_name: REPOSITORY } },
     base: { ref: 'releases/v1.0', sha: ids.reconciliation, repo: { full_name: REPOSITORY } },
   });
-  assert.equal(classifyNextAction(await observe(value)).type, 'create-next-proposal');
+  value.gitAdapter.refs[PROPOSAL_ATTEMPT_REF] = { sha: ids.nextIntent, type: 'commit' };
+  assert.equal(classifyNextAction(await observe(value)).type, 'reauthorize-next-proposal-after-close');
 
   const duplicate = fixture();
   duplicate.githubAdapter.pulls.push(structuredClone(duplicate.githubAdapter.pulls[0]));
   await assert.rejects(observe(duplicate), /duplicate pull request number/);
 
   value.githubAdapter.pulls.at(-1).state = 'open';
-  value.githubAdapter.pulls.push({ ...structuredClone(value.githubAdapter.pulls.at(-1)), number: 102 });
+  value.githubAdapter.pulls.push({
+    ...structuredClone(value.githubAdapter.pulls.at(-1)),
+    number: 102,
+    html_url: 'https://github.com/fablebookjs/lab-01/pull/102',
+  });
   await assert.rejects(observe(value), /more than one open/);
 });
 
@@ -531,14 +657,14 @@ test('complete pagination is bounded, ordered, and rejects duplicate page identi
   const values = Array.from({ length: 205 }, (_, index) => ({ number: index + 1 }));
   adapter.request = async (_method, path) => {
     const page = Number(new URL(`https://example.invalid${path}`).searchParams.get('page'));
-    return { value: values.slice((page - 1) * 100, page * 100) };
+    return values.slice((page - 1) * 100, page * 100);
   };
   assert.equal((await adapter.paginate('/pulls?state=all')).length, 205);
 
   const endless = new LiveGitHubAdapter();
   endless.request = async (_method, path) => {
     const page = Number(new URL(`https://example.invalid${path}`).searchParams.get('page'));
-    return { value: Array.from({ length: 100 }, (_, index) => ({ number: (page - 1) * 100 + index + 1 })) };
+    return Array.from({ length: 100 }, (_, index) => ({ number: (page - 1) * 100 + index + 1 }));
   };
   await assert.rejects(endless.paginate('/pulls?state=all'), /exceeded/);
 });
@@ -548,19 +674,24 @@ test('wake-up ordering converges with no invocation performing more than one dur
   value.gitAdapter.refs[RELEASE_REF].sha = ids.late;
   value.gitAdapter.nextCommitShas.push(ids.reconciliation, ids.nextIntent);
   const actions = [];
-  for (let index = 0; index < 7; index += 1) {
+  for (let index = 0; index < 10; index += 1) {
     const before = allWrites(value).length;
     const evidence = await runFinalizerInvocation({ adapters: value, context: value.context });
     actions.push(evidence.action.type);
     const writes = allWrites(value).length - before;
-    assert.ok(writes <= 1, `${evidence.action.type} performed ${writes} durable writes`);
+    const posts = evidence.preservation.operations.filter((operation) => operation.method === 'POST').length;
+    assert.ok(posts <= 1, `${evidence.action.type} performed ${posts} GitHub POSTs`);
+    assert.ok(writes <= 2, `${evidence.action.type} escaped its bounded action protocol with ${writes} writes`);
   }
   assert.deepEqual(actions, [
     'create-reconciliation',
     'create-tag',
-    'create-github-release',
+    'authorize-github-release',
+    'post-github-release',
     'advance-staged-intent',
-    'create-next-proposal',
+    'authorize-next-proposal',
+    'post-next-proposal',
+    'maintain-next-proposal',
     'maintain-next-proposal',
     'maintain-next-proposal',
   ]);
@@ -621,4 +752,291 @@ test('pure maintainer observer derives H and deterministic normal J markers from
     mergeSha: ids.merge,
     snapshotSha: ids.snapshot,
   }), /structured reconciliation metadata/);
+});
+
+test('maintainer observer treats caller SHAs only as expectations and rejects ref drift', async () => {
+  const offRef = fixture();
+  offRef.gitAdapter.refs[RELEASE_REF].sha = ids.otherLate;
+  await assert.rejects(observeMaintainerPostMerge({
+    gitAdapter: offRef.gitAdapter,
+    releaseHeadSha: ids.late,
+  }), /expectation does not match current durable Git authority/);
+
+  const changing = fixture();
+  changing.gitAdapter.refs[RELEASE_REF].sha = ids.late;
+  let reads = 0;
+  changing.gitAdapter.refReadHook = async (git) => {
+    reads += 1;
+    if (reads === 2) git.refs[RELEASE_REF].sha = ids.otherLate;
+  };
+  await assert.rejects(observeMaintainerPostMerge({ gitAdapter: changing.gitAdapter }), /changed while deriving/);
+
+  const current = fixture();
+  current.gitAdapter.refs[RELEASE_REF].sha = ids.otherLate;
+  const observed = await observeMaintainerPostMerge({ gitAdapter: current.gitAdapter });
+  assert.equal(observed.headSha, ids.otherLate);
+  assert.equal(observed.verifiedMergeSha, ids.merge);
+});
+
+test('trusted main is rebound at the push and GitHub POST boundaries', async () => {
+  const pushRace = fixture();
+  let pushChecks = 0;
+  pushRace.gitAdapter.mainCheckHook = async (git) => {
+    pushChecks += 1;
+    if (pushChecks === 3) git.refs['refs/heads/main'].sha = ids.otherLate;
+  };
+  await assert.rejects(
+    runFinalizerInvocation({ adapters: pushRace, context: pushRace.context }),
+    /(?:trusted current-main binding drifted|finalizer source is not exact current default main)/,
+  );
+  assert.deepEqual(pushRace.gitAdapter.durableWrites, []);
+
+  const postRace = fixture();
+  postRace.gitAdapter.refs[RELEASE_REF].sha = ids.snapshot;
+  postRace.gitAdapter.refs[TAG_REF] = { sha: ids.snapshot, type: 'commit' };
+  await runFinalizerInvocation({ adapters: postRace, context: postRace.context });
+  postRace.gitAdapter.durableWrites.length = 0;
+  let postChecks = 0;
+  postRace.gitAdapter.mainCheckHook = async (git) => {
+    postChecks += 1;
+    if (postChecks === 4) git.refs['refs/heads/main'].sha = ids.otherLate;
+  };
+  await assert.rejects(
+    runFinalizerInvocation({ adapters: postRace, context: postRace.context }),
+    /(?:trusted current-main binding drifted|finalizer source is not exact current default main)/,
+  );
+  assert.equal(postRace.githubAdapter.durableWrites.length, 0);
+  assert.equal(postRace.gitAdapter.refs[RELEASE_ATTEMPT_REF].sha, ids.snapshot);
+});
+
+test('merged conflict recovery accepts exact J [V,H] with a conflict-resolution tree', async () => {
+  const value = fixture();
+  value.gitAdapter.refs[RELEASE_REF].sha = ids.recoveryReconciliation;
+  value.gitAdapter.refs[RECOVERY_REF] = { sha: ids.late, type: 'commit' };
+  value.gitAdapter.mergeTrees.set(`${ids.late} ${ids.snapshot}`, { clean: false, tree: null });
+  value.githubAdapter.pulls.push(recoveryPull({
+    state: 'closed',
+    draft: false,
+    merged: true,
+    merged_at: '2026-07-16T01:00:00Z',
+    merge_commit_sha: ids.recoveryReconciliation,
+  }));
+  const state = await observe(value);
+  assert.equal(state.line.kind, 'recovery-j');
+  assert.equal(state.line.commit.tree, trees.recovery);
+  assert.equal(state.recovery.pull.mergeCommitSha, ids.recoveryReconciliation);
+
+  value.gitAdapter.refs[TAG_REF] = { sha: ids.snapshot, type: 'commit' };
+  await installExactRelease(value);
+  assert.equal(classifyNextAction(await observe(value)).type, 'advance-staged-intent');
+
+  const malformed = fixture();
+  malformed.gitAdapter.refs[RECOVERY_REF] = { sha: ids.late, type: 'commit' };
+  malformed.gitAdapter.refs[RELEASE_REF].sha = ids.snapshot;
+  malformed.gitAdapter.mergeTrees.set(`${ids.late} ${ids.snapshot}`, { clean: false, tree: null });
+  malformed.githubAdapter.pulls.push(recoveryPull({ state: 'closed', draft: true }));
+  await assert.rejects(observe(malformed), /closed without merging/);
+});
+
+test('push protocol disables tag following and distinguishes generic failures from stale leases', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'finalizer-push-'));
+  try {
+    const remote = join(root, 'remote.git');
+    const work = join(root, 'work');
+    execFileSync('git', ['init', '--bare', remote], { stdio: 'ignore' });
+    execFileSync('git', ['init', work], { stdio: 'ignore' });
+    execFileSync('git', ['-C', work, 'config', 'user.name', 'Test']);
+    execFileSync('git', ['-C', work, 'config', 'user.email', 'test@example.invalid']);
+    execFileSync('git', ['-C', work, 'commit', '--allow-empty', '-m', 'seed'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', work, 'tag', '-a', 'should-not-follow', '-m', 'tag']);
+    execFileSync('git', ['-C', work, 'remote', 'add', 'origin', remote]);
+    const head = execFileSync('git', ['-C', work, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const args = buildLeasedPushArguments(RELEASE_REF, null, head);
+    assert.ok(args.includes('--no-follow-tags'));
+    execFileSync('git', ['-C', work, ...args], { stdio: 'ignore' });
+    assert.equal(execFileSync('git', ['-C', work, 'ls-remote', '--tags', 'origin'], { encoding: 'utf8' }), '');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+
+  const generic = fixture();
+  generic.gitAdapter.genericPushFailure = true;
+  await assert.rejects(
+    runFinalizerInvocation({ adapters: generic, context: generic.context }),
+    /authentication or transport failure/,
+  );
+  assert.equal(generic.gitAdapter.refs[RELEASE_REF].sha, ids.merge);
+});
+
+test('Git, GitHub, and npm adapters reject hostile configuration and destinations', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'finalizer-config-'));
+  const oldGitExecPath = process.env.GIT_EXEC_PATH;
+  const oldProxy = process.env.HTTPS_PROXY;
+  try {
+    execFileSync('git', ['init', root], { stdio: 'ignore' });
+    execFileSync('git', ['-C', root, 'remote', 'add', 'origin', 'https://github.com/fablebookjs/lab-01.git']);
+    execFileSync('git', ['-C', root, 'config', 'push.followTags', 'true']);
+    assert.throws(() => new LiveGitAdapter({ cwd: root }).assertClosedTransport(), /forbidden local Git/);
+    execFileSync('git', ['-C', root, 'config', '--unset', 'push.followTags']);
+    process.env.GIT_EXEC_PATH = '/tmp/hostile-git-exec';
+    assert.throws(() => new LiveGitAdapter({ cwd: root }).assertClosedTransport(), /GIT_EXEC_PATH/);
+    delete process.env.GIT_EXEC_PATH;
+
+    const github = new LiveGitHubAdapter();
+    assert.throws(() => github.assertRequest('DELETE', `/repos/${REPOSITORY}/releases/1`), /rejects DELETE/);
+    process.env.HTTPS_PROXY = 'http://127.0.0.1:1';
+    assert.throws(() => github.assertRequest('GET', `/repos/${REPOSITORY}`), /hostile inherited HTTP environment/);
+    await assert.rejects(new LiveNpmAdapter().observe(PACKAGE_SPECS[0]), /hostile inherited HTTP environment/);
+  } finally {
+    if (oldGitExecPath === undefined) delete process.env.GIT_EXEC_PATH;
+    else process.env.GIT_EXEC_PATH = oldGitExecPath;
+    if (oldProxy === undefined) delete process.env.HTTPS_PROXY;
+    else process.env.HTTPS_PROXY = oldProxy;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('spent POST attempts remain query-only through delayed visibility and can explicitly reauthorize definite rejection', async () => {
+  const delayed = fixture();
+  delayed.gitAdapter.refs[RELEASE_REF].sha = ids.snapshot;
+  delayed.gitAdapter.refs[TAG_REF] = { sha: ids.snapshot, type: 'commit' };
+  await runFinalizerInvocation({ adapters: delayed, context: delayed.context });
+  delayed.githubAdapter.releaseVisibilityDelay = 6;
+  delayed.githubAdapter.ambiguousRelease = true;
+  const posted = await runFinalizerInvocation({ adapters: delayed, context: delayed.context });
+  assert.equal(posted.action.result, 'post-issued-awaiting-stable-visibility');
+  assert.equal(delayed.githubAdapter.durableWrites.length, 1);
+  let converged = null;
+  for (let index = 0; index < 8; index += 1) {
+    const queryOnly = await runFinalizerInvocation({ adapters: delayed, context: delayed.context });
+    assert.equal(delayed.githubAdapter.durableWrites.length, 1);
+    if (queryOnly.action.type === 'complete') {
+      converged = queryOnly;
+      break;
+    }
+    assert.equal(queryOnly.action.type, 'await-github-release-visibility');
+  }
+  assert.ok(converged, 'delayed Release eventually became visible through query-only reruns');
+  assert.equal(converged.action.type, 'complete');
+  assert.equal(delayed.githubAdapter.durableWrites.length, 1);
+
+  const rejected = fixture();
+  rejected.gitAdapter.refs[RELEASE_REF].sha = ids.snapshot;
+  rejected.gitAdapter.refs[TAG_REF] = { sha: ids.snapshot, type: 'commit' };
+  await runFinalizerInvocation({ adapters: rejected, context: rejected.context });
+  rejected.githubAdapter.definiteReleaseRejection = true;
+  const rejection = await runFinalizerInvocation({ adapters: rejected, context: rejected.context });
+  assert.equal(rejection.action.result, 'definite-client-rejection-recorded');
+  assert.equal(rejected.gitAdapter.refs[RELEASE_ATTEMPT_REF].sha, ids.intent);
+  assert.equal((await runFinalizerInvocation({ adapters: rejected, context: rejected.context })).action.type, 'reauthorize-github-release');
+
+  const delayedProposal = fixture();
+  delayedProposal.gitAdapter.refs[RELEASE_REF].sha = ids.reconciliation;
+  delayedProposal.gitAdapter.refs[TAG_REF] = { sha: ids.snapshot, type: 'commit' };
+  await installExactRelease(delayedProposal);
+  delayedProposal.gitAdapter.refs[STAGED_REF].sha = ids.nextIntent;
+  delayedProposal.gitAdapter.commits.set(ids.nextIntent, {
+    sha: ids.nextIntent,
+    parents: [ids.reconciliation],
+    tree: trees.reconciliation,
+    message: nextIntentMessage(ids.reconciliation),
+  });
+  assert.equal(
+    (await runFinalizerInvocation({ adapters: delayedProposal, context: delayedProposal.context })).action.type,
+    'authorize-next-proposal',
+  );
+  delayedProposal.githubAdapter.pullVisibilityDelay = 6;
+  delayedProposal.githubAdapter.ambiguousPull = true;
+  const proposalPost = await runFinalizerInvocation({ adapters: delayedProposal, context: delayedProposal.context });
+  assert.equal(proposalPost.action.result, 'post-issued-awaiting-stable-visibility');
+  let proposalConverged = null;
+  for (let index = 0; index < 8; index += 1) {
+    const queryOnly = await runFinalizerInvocation({ adapters: delayedProposal, context: delayedProposal.context });
+    assert.equal(delayedProposal.githubAdapter.durableWrites.filter(({ type }) => type === 'pull').length, 1);
+    if (queryOnly.action.type === 'maintain-next-proposal') {
+      proposalConverged = queryOnly;
+      break;
+    }
+    assert.equal(queryOnly.action.type, 'await-next-proposal-visibility');
+  }
+  assert.ok(proposalConverged, 'delayed proposal eventually became visible through query-only reruns');
+});
+
+test('authoritative sweeps compare complete hydrated tuples and proposal base SHA binds the current line', async () => {
+  const adapter = new LiveGitHubAdapter();
+  let sweep = 0;
+  adapter.pullSweep = async () => {
+    sweep += 1;
+    const pull = releasePull();
+    if (sweep === 2) pull.body = 'changed between complete sweeps';
+    return [pull];
+  };
+  await assert.rejects(adapter.listPulls(), /changed across two authoritative sweeps/);
+
+  const releases = new LiveGitHubAdapter();
+  let releaseSweep = 0;
+  releases.releaseSweep = async () => {
+    releaseSweep += 1;
+    return [{
+      id: 501,
+      tag_name: 'v1.0.1',
+      target_commitish: ids.snapshot,
+      name: 'v1.0.1',
+      body: releaseSweep === 1 ? 'first body' : 'changed body',
+      draft: false,
+      prerelease: false,
+      html_url: 'https://github.com/fablebookjs/lab-01/releases/tag/v1.0.1',
+    }];
+  };
+  await assert.rejects(releases.listReleases(), /changed across two authoritative sweeps/);
+
+  const staleBase = fixture();
+  staleBase.gitAdapter.refs[RELEASE_REF].sha = ids.reconciliation;
+  staleBase.gitAdapter.refs[TAG_REF] = { sha: ids.snapshot, type: 'commit' };
+  await installExactRelease(staleBase);
+  staleBase.gitAdapter.refs[STAGED_REF].sha = ids.nextIntent;
+  staleBase.gitAdapter.refs[PROPOSAL_ATTEMPT_REF] = { sha: ids.nextIntent, type: 'commit' };
+  staleBase.gitAdapter.commits.set(ids.nextIntent, {
+    sha: ids.nextIntent,
+    parents: [ids.reconciliation],
+    tree: trees.reconciliation,
+    message: nextIntentMessage(ids.reconciliation),
+  });
+  const proposalState = await observe(staleBase);
+  staleBase.githubAdapter.pulls.push({
+    number: 101,
+    state: 'open',
+    draft: true,
+    merged: false,
+    merged_at: null,
+    merge_commit_sha: null,
+    html_url: 'https://github.com/fablebookjs/lab-01/pull/101',
+    title: 'release: propose v1.0.2',
+    body: nextProposalBody(proposalState),
+    head: { ref: 'staged/v1.0', sha: ids.nextIntent, repo: { full_name: REPOSITORY } },
+    base: { ref: 'releases/v1.0', sha: ids.snapshot, repo: { full_name: REPOSITORY } },
+  });
+  await assert.rejects(observe(staleBase), /incompatible head\/base/);
+});
+
+test('preservation evidence records full observed tuple changes and instrumented scope boundaries', async () => {
+  const value = fixture();
+  let reads = 0;
+  value.githubAdapter.pullReadHook = async (github) => {
+    reads += 1;
+    if (reads === 2) github.pulls[1].body = 'calibration changed externally';
+  };
+  const evidence = await runFinalizerInvocation({ adapters: value, context: value.context });
+  assert.equal(evidence.preservation.changedPulls.length, 1);
+  assert.equal(evidence.preservation.changedPulls[0].before.number, 99);
+  assert.equal(evidence.preservation.changedPulls[0].after.body, 'calibration changed externally');
+  assert.equal(evidence.preservation.assessment.allGitWritesAllowlisted, true);
+  assert.equal(evidence.preservation.assessment.allGitHubWritesAllowlisted, true);
+  assert.equal(evidence.preservation.assessment.npmTransportReadOnly, true);
+  assert.match(evidence.preservation.assessment.externalEpistemicBoundary, /finalizer process/);
+
+  const source = await readFile(new URL('../scripts/finalize-release.mjs', import.meta.url), 'utf8');
+  const workflow = await readFile(new URL('../.github/workflows/finalize-release.yml', import.meta.url), 'utf8');
+  assert.doesNotMatch(`${source}\n${workflow}`, /storybookjs\//i);
+  assert.doesNotMatch(`${source}\n${workflow}`, /npm\s+(?:publish|token|login|adduser)/i);
 });

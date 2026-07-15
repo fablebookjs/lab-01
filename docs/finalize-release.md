@@ -1,24 +1,33 @@
 # `1.0.1` normal-path finalizer
 
-This document is the focused operator contract for the bounded issue #19
-finalizer. It is offline implementation guidance only; it does not claim a live
-release, npm write, tag, GitHub Release, or GitHub workflow run.
+This is the focused operator contract for the bounded issue #19 finalizer. It
+describes offline implementation and proof only; it does not claim a live npm
+write, tag, GitHub Release, workflow run, or Storybook change.
 
-## Installation prerequisite
+## Installation prerequisite and maintainer seam
 
-The separately reviewed maintainer-handoff commit `576da5f` must be integrated
-before this workflow is installed or dispatched. The finalizer intentionally
-does not modify `scripts/maintain-release-draft.mjs`. The handoff prevents the
-draft maintainer from rewriting a post-merge line as another `1.0.1` proposal
-and recognizes the finalizer-owned `1.0.2` draft.
+The separately reviewed maintainer handoff must be integrated before this
+workflow is installed or dispatched. The finalizer intentionally does not edit
+`scripts/maintain-release-draft.mjs`.
 
-The concrete handoff seam is the pure exported function
-`observeMaintainerPostMerge({ gitAdapter, releaseHeadSha, mergeSha,
-snapshotSha })`. Its adapter must provide `acceptedSnapshot(sha)`,
-`commit(sha)`, `isAncestor(ancestor, descendant)`, and
-`mergeTree(first, second)`. The function reads real Git objects and validates
-the accepted V authority, H/M ancestry, J's exact `[H,V]` parents, merge tree,
-and structured reconciliation message before returning either marker:
+The handoff imports and calls the pure exported seam:
+
+```text
+observeMaintainerPostMerge({
+  gitAdapter,
+  releaseHeadSha?, // expectation only
+  mergeSha?,       // expectation only
+  snapshotSha?,    // expectation only
+})
+```
+
+The adapter provides `listRefs()`, `acceptedSnapshot(sha)`, `commit(sha)`,
+`isAncestor(ancestor, descendant)`, and `mergeTree(first, second)`. The observer
+itself reads complete stable Git advertisements, derives current
+`releases/v1.0`, derives V from current `release-snapshots/v1.0.1`, derives M
+through the accepted V adapter, validates real objects/ancestry/tree/structured
+metadata, and rechecks all advertised refs before returning. Optional caller
+SHAs never select H, J, M, or V.
 
 ```text
 late-head:
@@ -31,98 +40,144 @@ normal-reconciliation:
   metadata: { schemaVersion, line, version, mergeSha, snapshotSha, lateHeadSha }
 ```
 
-`observer` is exactly `issue-19-finalizer`, `schemaVersion` is `1`, `line` is
-`releases/v1.0`, and `version` is `1.0.1`. Callers must not manufacture this
-marker from ancestry guesses or user input.
+`observer` is `issue-19-finalizer`, schema is `1`, line is `releases/v1.0`, and
+version is `1.0.1`. A self-attested marker or arbitrary ancestry guess is not
+authority.
 
-Dispatch `.github/workflows/finalize-release.yml` only from the exact current
+## Trusted dispatch and one-action loop
+
+Dispatch `.github/workflows/finalize-release.yml` only from exact current
 default `main`. The workflow has no SHA inputs. Its only input is the fixed
 fault choice `none` or `after-github-release-post`.
 
-## One-action loop
+Every dispatch reads stable complete Git advertisements, two identical bounded
+sweeps of fully hydrated pull-request and GitHub Release history, and both
+public npm package versions. It derives accepted `S`, `I`, `M`, `V`, QA
+authority, and package hashes from `release-snapshots/v1.0.1`, classifies one
+controller action, and exactly rereads durable state.
 
-Every dispatch freshly reads all Git refs, complete paginated pull-request and
-GitHub Release history, and both public npm package versions. It derives the
-accepted `S`, `I`, `M`, `V`, QA run, and package hashes from
-`release-snapshots/v1.0.1`. It then performs at most one durable action and
-reads all durable state again.
+Immediately before every Git push and GitHub POST, the controller rebinds
+remote `main`, local `HEAD`, `GITHUB_SHA`, and `GITHUB_WORKFLOW_SHA`. Workflow
+identity must be exactly
+`fablebookjs/lab-01/.github/workflows/finalize-release.yml@refs/heads/main`.
+These checks minimize but cannot make the cross-service race atomic: remote
+main can move after the final advertisement and before GitHub accepts a
+request. Drift observed before an adapter mutation aborts. A consumed POST
+authorization remains query-only if drift occurs before its POST.
 
-The current e51f77c snapshot trailer reader is isolated inside
-`LiveGitAdapter.acceptedSnapshot(sha)`. The controller consumes only its
-normalized schema-1 authority record (`S/I/M/V`, fixed package hashes, and a QA
-authority label). This is the deliberate rebase seam for the corrected OIDC
-snapshot contract; no classifier or action relies directly on the old QA-run
-trailer identity.
+The snapshot parser is isolated inside `LiveGitAdapter.acceptedSnapshot(sha)`.
+The classifier consumes only its normalized authority record; no classifier or
+action parses snapshot trailers directly.
 
-Run the workflow repeatedly until it reports `complete`,
-`maintain-next-proposal`, or an intentional wait:
+Repeated dispatches converge in this order:
 
-1. Absent or canonically partial npm state is a successful no-op. Publication
-   remains owned by the separate tokenless OIDC workflow.
-2. With both packages exact, `M` fast-forwards to `V`, or the one clean late
-   commit `X/H` becomes deterministic normal merge `J` with parents `[H,V]`.
-3. The lightweight `v1.0.1` tag is created at `V` with an expected-absent
-   lease.
-4. One exact non-draft, non-prerelease GitHub Release is created for that tag.
-5. If late `X` exists and no recovery PR is open, `staged/v1.0` advances from
-   the sealed `1.0.1` intent to one structured empty `1.0.2` intent.
+1. Absent or canonical core-only npm publication waits successfully.
+2. With both packages exact, M fast-forwards to V, or one clean late H becomes
+   deterministic normal J with parents `[H,V]`.
+3. A lightweight `v1.0.1` tag is leased from absent to V.
+4. One exact non-draft, non-prerelease GitHub Release is created through the
+   durable attempt protocol below.
+5. With remaining late work and no open recovery PR, sealed staged intent is
+   leased to one structured empty `1.0.2` intent over current J/V.
 6. A later dispatch creates or reuses one draft `staged/v1.0` to
-   `releases/v1.0` proposal listing the ordered remaining commits.
+   `releases/v1.0` proposal over the current line SHA.
 
-Blocked or out-of-order state is reported without a write. An incompatible
-package, tag, Release, graph, ref, PR identity, or partial state fails closed.
+Blocked or out-of-order state is a successful no-op. Contradictory package,
+graph, ref, tag, Release, recovery, or PR identity fails closed.
 
 ## npm integrity boundary
 
 The finalizer has no npm permission, credential, configuration, or write path.
-For each package it independently reads exact-version metadata and downloads
-the registry tarball bytes. SHA-512, SHA-1, repository URL, monorepo directory,
-and the add-on's sole exact core dependency must all equal `V`.
+For both fixed packages it independently reads exact-version metadata and
+downloads public-registry tarball bytes. Metadata and downloaded SHA-512/SHA-1,
+repository URL/directory, and the add-on's exact core dependency must all match
+V.
 
-Only these npm shapes are recognized:
+Recognized states are both absent, exact core with absent add-on, or both exact.
+The inverse partial, byte mismatch, metadata mismatch, or any other incomplete
+identity permanently stops before reconciliation.
 
-- both absent: wait;
-- exact core present and add-on absent: canonical partial, wait;
-- both exact: reconciliation may proceed.
+## Reconciliation and recovery
 
-The inverse partial, metadata mismatch, downloaded-byte mismatch, or any other
-incomplete identity is a permanent stop.
+Normal late work is one first-parent commit H over M. H must be absent from V;
+`git merge-tree H V` must be clean. Normal J has that exact tree, ordered
+parents `[H,V]`, and deterministic structured metadata. Every push has an exact
+old-to-new lease; stale rejection refetches complete state.
 
-## Reconciliation and recovery boundary
+A real conflict is never repaired here. The finalizer points to the retained
+issue #15 proof. Recorded recovery is exact `recovery/v1.0/1.0.1 = H`, where H
+is the sole late commit over M and H/V genuinely conflicts. Its open tuple is an
+exact draft PR from H to current V with the line at V. Its merged tuple is an
+exact non-draft, merged PR whose merge commit is current J with parents `[V,H]`.
+J may have a human conflict-resolution tree and need not match a clean
+`merge-tree`. Closed-unmerged, duplicate, malformed, or unbound recovery state
+fails closed. Open recovery suppresses `1.0.2`; exact merged recovery may later
+source it. Exact calibration identities remain unrelated.
 
-Normal late work is exactly one first-parent commit `X/H` over `M`. `X` must
-not be reachable from `V`; `git merge-tree H V` must be clean. `J` has the exact
-merge tree, ordered parents `[H,V]`, and fixed metadata. A stale release-line
-lease is rejected and the complete state is re-read on the next invocation.
+## Closed mutation and transport boundary
 
-A real conflict is not repaired here. The finalizer stops and points to the
-retained issue #15 recovery proof. A valid recorded recovery branch and draft
-PR may coexist with the tag and GitHub Release; an open exact recovery PR
-suppresses the `1.0.2` proposal. Calibration refs and PRs are unrelated because
-all matching uses only the exact production-lab branch identities.
+Every ref update uses `--no-follow-tags`. Only the release line, staged line,
+lightweight tag, and two fixed attempt refs are writable. The Git adapter builds
+a closed environment and rejects URL rewrites, push URLs, tag following,
+credential helpers, askpass, alternates/replacements, and proxy/TLS/certificate
+overrides. It preserves at most checkout's single scoped GitHub authorization
+header. Exact `LC_ALL=C --porcelain` stale status is separate from auth,
+transport, policy, and malformed-output errors; only an exact post-read proves
+lost success.
 
-## Lost-success proof
+GitHub accepts only exact GET/POST methods and repository endpoints. npm accepts
+only exact public-registry metadata and tarball GETs for the fixed packages.
+Both HTTP adapters reject inherited proxy/TLS/CA overrides. Tokens, raw command
+output, temporary paths, authentication, and configuration never enter evidence
+or sanitized errors.
 
-Choose `after-github-release-post` only for the retained lost-response
-demonstration. The fault fires after the POST has succeeded and the exact
-Release is durably visible, but before a success report. The next dispatch
-reuses that Release and never posts a duplicate.
+## Durable POST attempts
+
+```text
+refs/heads/finalizer-attempts/v1.0.1/github-release
+  absent -> M (authorized) -> V (spent before POST)
+  V -> I (definite pre-creation rejection) -> M (explicit reauthorization)
+
+refs/heads/finalizer-attempts/v1.0.2/next-proposal
+  absent -> current J/V (authorized) -> exact 1.0.2 intent (spent before POST)
+  intent -> V (definite pre-creation rejection) -> current J/V (reauthorize)
+  intent -> current J/V after exact closed-unmerged PR (regenerate)
+```
+
+Every transition has an exact lease. One classified POST action is a bounded
+protocol: consume the authorization, stably reread the marker, then issue at
+most one POST. Once spent, reruns are query-only until two complete stable
+history sweeps reveal the object. Ambiguous failures never reauthorize. Only a
+definite pre-creation client rejection plus exact all-state absence records the
+explicit rejected state. A POST action therefore may contain its marker write
+and single POST while never issuing two POSTs per authorization.
+
+The optional fault fires only after the Release POST succeeds and the exact
+Release is durably visible, before reporting success. Its rerun follows the same
+spent-marker reuse path as an ordinary lost response or delayed visibility.
 
 ## Evidence and inspection
 
-Each run uploads one sanitized JSON document containing actor, event, fixed
-permissions, trusted source, release PR, `S/I/M/V`, QA run, npm identities,
-`H/X/J`, old/new action refs, tag, Release ID/URL, recovery, next intent/PR, and
-before/after preservation fingerprints. It records no token, npm config,
-temporary path, or raw command diagnostic.
+Every run uploads sanitized JSON containing actor/event/permissions/source,
+each pre-mutation main binding, release PR, S/I/M/V, QA authority, npm
+identities, H/J, action old/new refs, tag, Release ID/URL, recovery, next
+intent/PR, and full before/after canonical tuples for relevant refs, PRs,
+Releases, and packages. Instrumentation records exact methods, destinations,
+and writes.
+
+The preservation claim is deliberately scoped: it proves what this finalizer
+process asked its exact `fablebookjs/lab-01` Git/GitHub and two read-only npm
+adapters to do. Static workflow/code inspection reinforces that there is no
+Storybook target, but the run does not observe arbitrary external Storybook
+state.
 
 Useful read-only checks after convergence:
 
 ```text
 git show --no-patch --format='%H %P %T%n%B' refs/tags/v1.0.1
 git show --no-patch --format='%H %P %T%n%B' origin/releases/v1.0
-git merge-base --is-ancestor <X> refs/tags/v1.0.1   # must be false
-git merge-base --is-ancestor <X> origin/releases/v1.0 # must be true after J
+git merge-base --is-ancestor <H> refs/tags/v1.0.1       # false
+git merge-base --is-ancestor <H> origin/releases/v1.0  # true after J
 ```
 
 No instruction in this document authorizes a Storybook mutation.
