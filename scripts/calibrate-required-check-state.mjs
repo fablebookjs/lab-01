@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { Buffer } from 'node:buffer';
 import { appendFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -34,12 +35,6 @@ const SAFE_LOCAL_CONFIG = new Set([
   'user.name',
   'user.email',
 ]);
-const SAFE_AUTH_CONFIG = new Set([
-  'http.https://github.com/.extraheader',
-  'http.https://github.com/fablebookjs/lab-01.extraheader',
-  'http.https://github.com/fablebookjs/lab-01.git.extraheader',
-]);
-
 const HOSTILE_GIT_ENVIRONMENT = [
   /^GIT_ALTERNATE_OBJECT_DIRECTORIES$/,
   /^GIT_CEILING_DIRECTORIES$/,
@@ -58,6 +53,7 @@ const HOSTILE_GIT_ENVIRONMENT = [
   /^GIT_GRAFT_FILE$/,
   /^GIT_ASKPASS$/,
   /^GIT_CREDENTIAL_/,
+  /^GIT_CURL_VERBOSE$/,
   /^GIT_HTTP_PROXY_AUTHMETHOD$/,
   /^GIT_INDEX_FILE$/,
   /^GIT_NAMESPACE$/,
@@ -68,6 +64,7 @@ const HOSTILE_GIT_ENVIRONMENT = [
   /^GIT_SSL_/,
   /^GIT_SSH(?:_COMMAND|_VARIANT)?$/,
   /^GIT_TERMINAL_PROMPT$/,
+  /^GIT_TRACE/,
   /^GIT_WORK_TREE$/,
   /^GCM_/,
   /^SSH_ASKPASS(?:_REQUIRE)?$/,
@@ -91,10 +88,19 @@ export function assertSha(sha) {
 }
 
 export class Git {
-  constructor({ cwd = process.cwd(), remote = 'origin', acceptedRemoteUrls = LIVE_REMOTE_URLS } = {}) {
+  constructor({
+    cwd = process.cwd(),
+    remote = 'origin',
+    acceptedRemoteUrls = LIVE_REMOTE_URLS,
+    liveNetworkWrite = process.env.GITHUB_ACTIONS === 'true',
+    token = process.env.GITHUB_TOKEN,
+  } = {}) {
     this.cwd = cwd;
     this.remote = remote;
     this.acceptedRemoteUrls = new Set(acceptedRemoteUrls);
+    this.liveNetworkWrite = liveNetworkWrite;
+    this.token = token;
+    this.authorizationHeader = null;
     this.trustedSource = null;
   }
 
@@ -111,12 +117,41 @@ export class Git {
     }
   }
 
-  run(args, { env = {}, input, allowFailure = false } = {}) {
+  controlledNetworkEnvironment() {
+    if (this.authorizationHeader === null) return {};
+    return {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+      GIT_CONFIG_VALUE_0: this.authorizationHeader,
+    };
+  }
+
+  bindLiveWriteAuthentication() {
+    if (!this.liveNetworkWrite) return;
+    if (this.authorizationHeader !== null) return;
+    if (typeof this.token !== 'string' || !this.token || /[\r\n]/.test(this.token)) {
+      throw new Error('GITHUB_TOKEN is required for live calibration writes');
+    }
+    const encodedToken = Buffer.from(`x-access-token:${this.token}`).toString('base64');
+    this.authorizationHeader = `AUTHORIZATION: basic ${encodedToken}`;
+    this.token = null;
+  }
+
+  run(
+    args,
+    { env = {}, input, allowFailure = false, network = false, requireAuthentication = false } = {},
+  ) {
     const inherited = Object.fromEntries(
       Object.entries(process.env).filter(
-        ([key]) => !HOSTILE_GIT_ENVIRONMENT.some((pattern) => pattern.test(key)),
+        ([key]) =>
+          key !== 'GITHUB_TOKEN' &&
+          !HOSTILE_GIT_ENVIRONMENT.some((pattern) => pattern.test(key)),
       ),
     );
+    if (requireAuthentication && this.liveNetworkWrite && this.authorizationHeader === null) {
+      throw new Error('Controlled authentication is not bound for live Git network write');
+    }
+    const networkEnvironment = network ? this.controlledNetworkEnvironment() : {};
     const result = spawnSync('git', args, {
       cwd: this.cwd,
       encoding: 'utf8',
@@ -131,6 +166,7 @@ export class Git {
         GCM_INTERACTIVE: 'never',
         HOME: NULL_DEVICE,
         XDG_CONFIG_HOME: NULL_DEVICE,
+        ...networkEnvironment,
       },
       input,
     });
@@ -179,12 +215,6 @@ export class Git {
         if (!valid) throw new Error(`Unsafe repository Git config: ${key}`);
         continue;
       }
-      if (SAFE_AUTH_CONFIG.has(key)) {
-        if (!/^AUTHORIZATION: basic [A-Za-z0-9+/=]+$/i.test(value)) {
-          throw new Error(`Unsafe repository Git config: ${key}`);
-        }
-        continue;
-      }
       if (!SAFE_LOCAL_CONFIG.has(key)) throw new Error(`Unsafe repository Git config: ${key}`);
       if (key === 'remote.origin.url') {
         if (!this.acceptedRemoteUrls.has(value)) throw new Error('Untrusted repository origin URL');
@@ -210,11 +240,6 @@ export class Git {
     if (counts.get('remote.origin.url') !== 1 || originUrl === null) {
       throw new Error('Repository must have one exact origin URL');
     }
-    for (const key of SAFE_AUTH_CONFIG) {
-      if ((counts.get(key) ?? 0) > 1) throw new Error(`Duplicate scoped checkout authentication: ${key}`);
-    }
-    const authCount = [...SAFE_AUTH_CONFIG].reduce((total, key) => total + (counts.get(key) ?? 0), 0);
-    if (authCount > 1) throw new Error('Only one scoped checkout authentication entry is allowed');
     return { originUrl };
   }
 
@@ -222,6 +247,7 @@ export class Git {
     this.assertNoHostileEnvironment();
     if (this.remote !== 'origin') throw new Error(`Git operations require exact origin, got ${this.remote}`);
     const { originUrl } = this.assertSafeLocalConfig();
+    if (requirePush) this.bindLiveWriteAuthentication();
     if (requirePush && this.trustedSource !== null) this.assertTrustedSource();
     return { fetchUrl: originUrl, pushUrl: requirePush ? originUrl : null };
   }
@@ -234,7 +260,7 @@ export class Git {
     if (calibrationOnly) assertCalibrationRef(ref);
     else if (ref !== 'refs/heads/main') throw new Error(`Unsupported trusted ref: ${ref}`);
     this.assertTrustedRemote();
-    const output = this.text(['ls-remote', '--heads', this.remote, ref]);
+    const output = this.text(['ls-remote', '--heads', this.remote, ref], { network: true });
     return parseRemoteAdvertisement(output, [ref])[ref];
   }
 
@@ -307,7 +333,7 @@ export function pushWithLease(git, ref, expected, next) {
       git.remote,
       `${next}:${ref}`,
     ],
-    { allowFailure: true },
+    { allowFailure: true, network: true, requireAuthentication: true },
   );
 }
 
