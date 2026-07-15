@@ -81,6 +81,35 @@ function tree(f, sha) {
   return command(f.runner, ['show', '-s', '--format=%T', sha]);
 }
 
+function commitWithMode(f, commit, parent, mode, message) {
+  const root = mkdtempSync(join(tmpdir(), 'lab-01-forged-mode-'));
+  const index = join(root, 'index');
+  const content = join(root, 'content.txt');
+  try {
+    writeFileSync(
+      content,
+      message.includes('V')
+        ? 'release snapshot for 1.0.1\n'
+        : 'complete late work for the recovery patch\n',
+    );
+    const blob = command(f.runner, ['hash-object', '-w', content]);
+    const env = { GIT_INDEX_FILE: index };
+    command(f.runner, ['read-tree', `${commit}^{tree}`], env);
+    command(f.runner, ['update-index', '--cacheinfo', `${mode},${blob},${FILE_PATH}`], env);
+    const forgedTree = command(f.runner, ['write-tree'], env);
+    return command(f.runner, ['commit-tree', forgedTree, '-p', parent, '-m', message], {
+      GIT_AUTHOR_NAME: 'Forged Mode Test',
+      GIT_AUTHOR_EMAIL: 'forged@example.invalid',
+      GIT_AUTHOR_DATE: '2026-07-15T16:00:00Z',
+      GIT_COMMITTER_NAME: 'Forged Mode Test',
+      GIT_COMMITTER_EMAIL: 'forged@example.invalid',
+      GIT_COMMITTER_DATE: '2026-07-15T16:00:00Z',
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function topLevelBlock(yaml, key) {
   const lines = yaml.split('\n');
   const start = lines.findIndex((line) => line === `${key}:`);
@@ -95,7 +124,35 @@ function topLevelBlock(yaml, key) {
   return block.join('\n');
 }
 
+function parseWorkflowYaml(yaml) {
+  const ruby = [
+    'document = Psych.safe_load(STDIN.read, permitted_classes: [], permitted_symbols: [], aliases: false)',
+    'trigger = document.key?("on") ? document["on"] : document[true]',
+    'puts JSON.generate({"on" => trigger, "permissions" => document["permissions"], "jobs" => document["jobs"]})',
+  ].join('; ');
+  return JSON.parse(
+    execFileSync('ruby', ['-rpsych', '-rjson', '-e', ruby], { input: yaml, encoding: 'utf8' }),
+  );
+}
+
 function assertExactWorkflowAuthority(workflow) {
+  const parsed = parseWorkflowYaml(workflow);
+  assert.deepEqual(parsed.on, {
+    workflow_dispatch: {
+      inputs: {
+        mode: {
+          description: 'Fixed conflict recovery phase to exercise',
+          required: true,
+          type: 'choice',
+          options: ['inject-after-force', 'resume'],
+        },
+      },
+    },
+  });
+  assert.deepEqual(parsed.permissions, { contents: 'write', 'pull-requests': 'write' });
+  for (const [name, job] of Object.entries(parsed.jobs)) {
+    assert.ok(!Object.hasOwn(job, 'permissions'), `job ${name} must not override permissions`);
+  }
   assert.equal(
     topLevelBlock(workflow, 'on'),
     [
@@ -264,9 +321,9 @@ test('inject-after-force creates the exact conflicting graph, backs up H first, 
     const calibrationRefs = refs.filter((ref) => ref.startsWith('refs/heads/calibration/'));
     assert.deepEqual(
       calibrationRefs.sort(),
-      ['source', 'intent', 'm', 'v', 'h', 'backup', 'line'].map(conflictRef).sort(),
+      ['source', 'intent', 'm', 'v', 'h', 'backup', 'line', 'pr-attempt'].map(conflictRef).sort(),
     );
-    assert.equal(remoteRef(f, conflictRef('pr-attempt')), null);
+    assert.equal(remoteRef(f, conflictRef('pr-attempt')), first.graph.h);
 
     const pushesBeforeRerun = git.pushes.length;
     const rerun = await runConflictRecovery({ mode: 'inject-after-force', git, source: f.source, github });
@@ -398,7 +455,7 @@ test('remote main drift after marker creation fails before the first PR API call
       drifted = false;
 
       assertTrustedSource() {
-        if (!this.drifted && remoteRef(f, conflictRef('pr-attempt')) === injected.graph.v) {
+        if (!this.drifted && remoteRef(f, conflictRef('pr-attempt')) === injected.graph.h) {
           this.drifted = true;
           command(join(f.root, 'seed'), ['push', 'origin', 'main']);
         }
@@ -412,7 +469,7 @@ test('remote main drift after marker creation fails before the first PR API call
       runConflictRecovery({ mode: 'resume', git, source: f.source, github }),
       /Remote refs\/heads\/main .* is not trusted source/,
     );
-    assert.equal(remoteRef(f, conflictRef('pr-attempt')), injected.graph.v);
+    assert.equal(remoteRef(f, conflictRef('pr-attempt')), injected.graph.h);
     assert.equal(github.listCalls.length, 0);
     assert.equal(github.createCalls.length, 0);
   } finally {
@@ -451,6 +508,29 @@ test('merge-tree proof accepts only status 1 and one exact fixed-path conflict r
   }
 });
 
+test('V and H reject forged executable entries even when content and parents match', () => {
+  const f = fixture();
+  try {
+    const git = new Git(gitOptions(f));
+    const graph = createGraph(git, f.source);
+    for (const role of ['v', 'h']) {
+      const forged = commitWithMode(
+        f,
+        graph[role],
+        graph.m,
+        '100755',
+        `forged executable ${role.toUpperCase()}`,
+      );
+      assert.throws(
+        () => verifyGraph(git, { ...graph, [role]: forged }),
+        new RegExp(`${role.toUpperCase()} fixed conflict entry is not canonical 100644 blob`),
+      );
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
 test('resume forces an H line only after verifying the backup, creates one draft PR, then reuses it', async () => {
   const f = fixture();
   try {
@@ -482,6 +562,13 @@ test('resume forces an H line only after verifying the backup, creates one draft
       ['source', 'intent', 'm', 'v', 'h', 'backup', 'line', 'pr-attempt'].map(conflictRef).sort(),
     );
     assert.equal(github.createCalls.length, 1);
+    assert.ok(
+      git.pushes.some(
+        (args) =>
+          args.includes(`--force-with-lease=${conflictRef('pr-attempt')}:${first.graph.h}`) &&
+          args.at(-1) === `${first.graph.v}:${conflictRef('pr-attempt')}`,
+      ),
+    );
     assert.deepEqual(github.createCalls[0], {
       title: 'Recover conflict calibration work after 1.0.1',
       body: recoveryPullRequestBody(first.graph),
@@ -739,6 +826,54 @@ test('inject retains truthful structured evidence when backup drifts after line 
   }
 });
 
+test('rerun inject retains safety evidence when a completed V state later loses its backup', async () => {
+  for (const mutation of ['delete', 'rewrite']) {
+    const f = fixture();
+    const evidenceRoot = mkdtempSync(join(tmpdir(), 'lab-01-restart-injection-evidence-'));
+    try {
+      const git = new Git(gitOptions(f));
+      const complete = await runConflictRecovery({ mode: 'inject-after-force', git, source: f.source });
+      const refspec =
+        mutation === 'delete'
+          ? `:${complete.backupRef}`
+          : `${complete.graph.m}:${complete.backupRef}`;
+      command(f.runner, ['push', '--force', f.remote, refspec]);
+
+      const result = await runConflictRecovery({
+        mode: 'inject-after-force',
+        git: new Git(gitOptions(f)),
+        source: f.source,
+        github: {
+          async listPullRequestHistoryPage() {
+            throw new Error('restart injection must not query PR history');
+          },
+          async createPullRequest() {
+            throw new Error('restart injection must not create a PR');
+          },
+        },
+      });
+      assert.equal(result.outcome, 'safety-failure-after-durable-force-before-pr');
+      assert.equal(result.finalLine, result.graph.v);
+      assert.equal(result.remoteBackup, mutation === 'delete' ? null : result.graph.m);
+      assert.equal(result.backupVerified, false);
+      assert.equal(remoteRef(f, conflictRef('pr-attempt')), result.graph.h);
+
+      const summaryPath = join(evidenceRoot, 'summary.md');
+      const outputPath = join(evidenceRoot, 'output.txt');
+      writeFileSync(summaryPath, '');
+      writeFileSync(outputPath, '');
+      assert.equal(finalizeResult(result, { summaryPath, outputPath, writeStdout() {} }), 78);
+      assert.match(readFileSync(summaryPath, 'utf8'), /safety-failure-after-durable-force-before-pr/);
+      assert.match(readFileSync(outputPath, 'utf8'), /backup_verified=false/);
+      assert.match(readFileSync(outputPath, 'utf8'), new RegExp(`expected_backup_sha=${result.graph.h}`));
+      assert.match(readFileSync(outputPath, 'utf8'), new RegExp(`line_sha=${result.graph.v}`));
+    } finally {
+      f.cleanup();
+      rmSync(evidenceRoot, { recursive: true, force: true });
+    }
+  }
+});
+
 test('lost success of the atomic force converges to retained evidence and resume creates one PR', async () => {
   const f = fixture();
   const evidenceRoot = mkdtempSync(join(tmpdir(), 'lab-01-lost-force-evidence-'));
@@ -879,7 +1014,7 @@ test('wrong or disappearing PR-attempt markers fail closed without a second POST
       const github = new FakeGitHub(injected.graph);
       await assert.rejects(
         runConflictRecovery({ mode: 'resume', git, source: f.source, github }),
-        /PR-attempt marker .* expected exact V/,
+        /PR-attempt marker .* expected exact H or V/,
       );
       assert.equal(github.listCalls.length, 0);
       assert.equal(github.createCalls.length, 0);
@@ -914,6 +1049,28 @@ test('wrong or disappearing PR-attempt markers fail closed without a second POST
       assert.equal(github.createCalls, 1);
       assert.equal(remoteRef(f, conflictRef('pr-attempt')), null);
       assert.equal(remoteRef(f, injected.lineRef), injected.graph.v);
+      await assert.rejects(
+        runConflictRecovery({ mode: 'resume', git, source: f.source, github }),
+        /PR-attempt marker .* absent, expected exact H or V/,
+      );
+      assert.equal(github.createCalls, 1);
+    } finally {
+      f.cleanup();
+    }
+  }
+
+  {
+    const f = fixture();
+    try {
+      const git = new Git(gitOptions(f));
+      const injected = await runConflictRecovery({ mode: 'inject-after-force', git, source: f.source });
+      command(f.runner, ['push', '--force', f.remote, `${injected.graph.v}:${conflictRef('pr-attempt')}`]);
+      const github = new FakeGitHub(injected.graph);
+      await assert.rejects(
+        runConflictRecovery({ mode: 'resume', git, source: f.source, github }),
+        /marker is V but no matching PR is visible; refusing another POST/,
+      );
+      assert.equal(github.createCalls.length, 0);
     } finally {
       f.cleanup();
     }
@@ -1015,7 +1172,12 @@ test('post-create history retries are bounded, delayed visibility converges, and
     assert.equal(delayed.historyCalls, 4);
     assert.deepEqual(delayed.waits, [100, 200]);
 
-    command(f.runner, ['push', '--force', f.remote, `:${conflictRef('pr-attempt')}`]);
+    command(f.runner, [
+      'push',
+      '--force',
+      f.remote,
+      `${injected.graph.h}:${conflictRef('pr-attempt')}`,
+    ]);
 
     const absent = {
       historyCalls: 0,
@@ -1067,7 +1229,7 @@ test('ambiguous PR creation never POSTs twice while visibility remains stale, th
     );
     await assert.rejects(
       runConflictRecovery({ mode: 'resume', git, source: f.source, github }),
-      /marker exists but no matching PR is visible/,
+      /marker is V but no matching PR is visible/,
     );
     assert.equal(github.createCalls, 1);
     github.visible = true;
@@ -1269,6 +1431,56 @@ test('attacker-controlled GIT_EXEC_PATH fails before any Git subprocess or desti
   }
 });
 
+test('TLS, proxy, CA, and askpass overrides fail before Git while scoped checkout auth remains valid', async () => {
+  const f = fixture();
+  try {
+    for (const [key, value] of [
+      ['GIT_SSL_NO_VERIFY', '1'],
+      ['HTTPS_PROXY', 'http://attacker.invalid:8080'],
+      ['SSL_CERT_FILE', join(f.root, 'attacker-ca.pem')],
+      ['GIT_ASKPASS', join(f.root, 'attacker-askpass')],
+      ['GIT_PROXY_COMMAND', join(f.root, 'attacker-proxy')],
+    ]) {
+      const previous = process.env[key];
+      class CountingGit extends Git {
+        calls = 0;
+
+        run(args, options) {
+          this.calls += 1;
+          return super.run(args, options);
+        }
+      }
+      process.env[key] = value;
+      const git = new CountingGit(gitOptions(f));
+      try {
+        await assert.rejects(
+          runConflictRecovery({ mode: 'inject-after-force', git, source: f.source }),
+          new RegExp(`Hostile inherited Git environment: ${key}`),
+        );
+        assert.equal(git.calls, 0, key);
+      } finally {
+        if (previous === undefined) delete process.env[key];
+        else process.env[key] = previous;
+      }
+    }
+    assert.equal(remoteRef(f, conflictRef('source')), null);
+
+    command(f.runner, ['config', 'http.https://github.com/.extraheader', 'AUTHORIZATION: basic retained']);
+    const result = await runConflictRecovery({
+      mode: 'inject-after-force',
+      git: new Git(gitOptions(f)),
+      source: f.source,
+    });
+    assert.equal(result.backupVerified, true);
+    assert.equal(
+      command(f.runner, ['config', '--get', 'http.https://github.com/.extraheader']),
+      'AUTHORIZATION: basic retained',
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+
 test('intentional failure writes structured evidence and job summary before returning nonzero', async () => {
   const f = fixture();
   const evidenceRoot = mkdtempSync(join(tmpdir(), 'lab-01-conflict-evidence-'));
@@ -1330,7 +1542,20 @@ test('workflow is manual, trusted-main-only, fixed-concurrency, and minimally pe
     assertExactWorkflowAuthority(workflow.replace('  timeout-minutes: 10', '  timeout-minutes: 10\n    "permissions": read-all')),
   );
   assert.throws(() =>
-    assertExactWorkflowAuthority(workflow.replace('workflow_dispatch:', 'workflow_dispatch:\n  schedule:\n    - cron: "0 0 * * *"')),
+    assertExactWorkflowAuthority(
+      workflow.replace(
+        '        - resume\n\npermissions:',
+        '        - resume\n  schedule:\n    - cron: "0 0 * * *"\n\npermissions:',
+      ),
+    ),
+  );
+  assert.throws(() =>
+    assertExactWorkflowAuthority(
+      workflow.replace(
+        'jobs:\n',
+        'jobs:\n  injected: { runs-on: ubuntu-latest, permissions: { statuses: write }, steps: [] }\n',
+      ),
+    ),
   );
   assert.match(workflow, /group: calibration-g1-conflict-recovery\n/);
   assert.match(workflow, /test "\$GITHUB_REF" = "refs\/heads\/main"/);

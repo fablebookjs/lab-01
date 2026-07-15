@@ -14,6 +14,8 @@ const ROLES = ['source', 'intent', 'm', 'v', 'h', 'backup', 'line', 'pr-attempt'
 const FIXED_GRAPH_ROLES = ['source', 'intent', 'm', 'v', 'h'];
 const REF_SET = new Set(ROLES.map((role) => `${NAMESPACE}/${role}`));
 const PR_TITLE = 'Recover conflict calibration work after 1.0.1';
+const VERSION_CONTENT = 'release snapshot for 1.0.1\n';
+const LATE_CONTENT = 'complete late work for the recovery patch\n';
 const LIVE_REMOTE_URLS = [
   'https://github.com/fablebookjs/lab-01',
   'https://github.com/fablebookjs/lab-01.git',
@@ -39,12 +41,23 @@ const HOSTILE_GIT_ENVIRONMENT = [
   /^GIT_DISCOVERY_ACROSS_FILESYSTEM$/,
   /^GIT_EXEC_PATH$/,
   /^GIT_GRAFT_FILE$/,
+  /^GIT_ASKPASS$/,
+  /^GIT_CREDENTIAL_/,
+  /^GIT_HTTP_PROXY_AUTHMETHOD$/,
   /^GIT_INDEX_FILE$/,
   /^GIT_NAMESPACE$/,
   /^GIT_OBJECT_DIRECTORY$/,
+  /^GIT_PROXY_COMMAND$/,
   /^GIT_REPLACE_REF_BASE$/,
   /^GIT_SHALLOW_FILE$/,
+  /^GIT_SSL_/,
+  /^GIT_SSH(?:_COMMAND|_VARIANT)?$/,
+  /^GIT_TERMINAL_PROMPT$/,
   /^GIT_WORK_TREE$/,
+  /^SSH_ASKPASS(?:_REQUIRE)?$/,
+  /^(?:HTTP|HTTPS|ALL|NO)_PROXY$/i,
+  /^SSL_CERT_(?:FILE|DIR)$/,
+  /^CURL_CA_BUNDLE$/,
 ];
 
 const COMMIT_ENV = {
@@ -336,15 +349,32 @@ function changedPaths(git, from, to) {
   return git.text(['diff-tree', '--no-commit-id', '--name-only', '-r', from, to]).split('\n').filter(Boolean);
 }
 
+function verifyCanonicalFileEntry(git, commit, path, content, role) {
+  const output = git.text(['ls-tree', commit, '--', path]);
+  const [metadata, observedPath, extra] = output.split('\t');
+  const [mode, type, blob, extraMetadata] = (metadata ?? '').split(' ');
+  const expectedBlob = git.text(['hash-object', '--stdin'], { input: content });
+  if (
+    mode !== '100644' ||
+    type !== 'blob' ||
+    blob !== expectedBlob ||
+    observedPath !== path ||
+    extra !== undefined ||
+    extraMetadata !== undefined
+  ) {
+    throw new Error(`${role} fixed conflict entry is not canonical 100644 blob ${expectedBlob}: ${output}`);
+  }
+}
+
 export function createGraph(git, source) {
   assertSha(source);
   git.run(['cat-file', '-e', `${source}^{commit}`]);
   const sourceTree = tree(git, source);
   const intent = commitTree(git, sourceTree, [source], 'conflict calibration intent');
   const m = commitTree(git, sourceTree, [source, intent], 'conflict calibration M');
-  const versionTree = treeWithFile(git, m, FILE_PATH, 'release snapshot for 1.0.1\n');
+  const versionTree = treeWithFile(git, m, FILE_PATH, VERSION_CONTENT);
   const v = commitTree(git, versionTree, [m], 'conflict calibration V');
-  const lateTree = treeWithFile(git, m, FILE_PATH, 'complete late work for the recovery patch\n');
+  const lateTree = treeWithFile(git, m, FILE_PATH, LATE_CONTENT);
   const h = commitTree(git, lateTree, [m], 'conflict calibration H');
   return { source, intent, m, v, h };
 }
@@ -374,6 +404,8 @@ export function verifyGraph(git, graph) {
   if (git.text(['show', `${graph.h}:${FILE_PATH}`]) !== 'complete late work for the recovery patch') {
     throw new Error('H is not the complete fixed late-work head');
   }
+  verifyCanonicalFileEntry(git, graph.v, FILE_PATH, VERSION_CONTENT, 'V');
+  verifyCanonicalFileEntry(git, graph.h, FILE_PATH, LATE_CONTENT, 'H');
 
   const merge = git.run(['merge-tree', '--write-tree', graph.v, graph.h], { allowFailure: true });
   const conflictLines = merge.stdout.split('\n').filter((line) => line.startsWith('CONFLICT '));
@@ -540,35 +572,69 @@ function verifyRecoveryPullRequest(pr, graph, { requireEditableFields = false } 
   return pr;
 }
 
-function verifyPrAttemptMarker(git, graph) {
+function observePrAttemptMarker(git) {
   const ref = conflictRef('pr-attempt');
-  const observed = remoteHead(git, ref);
-  if (observed !== graph.v) {
-    throw new Error(`Recovery PR-attempt marker ${ref} is ${observed ?? 'absent'}, expected exact V ${graph.v}`);
+  return remoteHead(git, ref);
+}
+
+function requirePrAttemptMarker(git, graph, allowed) {
+  const ref = conflictRef('pr-attempt');
+  const observed = observePrAttemptMarker(git);
+  if (!allowed.includes(observed)) {
+    const expected = allowed.map((sha) => sha === graph.h ? 'H' : 'V').join(' or ');
+    throw new Error(
+      `Recovery PR-attempt marker ${ref} is ${observed ?? 'absent'}, expected exact ${expected}`,
+    );
   }
   return observed;
 }
 
-function ensurePrAttemptMarker(git, graph) {
+function ensureInjectPrAttemptMarker(git, graph, lineHead) {
   const ref = conflictRef('pr-attempt');
-  const observed = remoteHead(git, ref);
-  if (observed === graph.v) return { created: false, sha: graph.v };
-  if (observed !== null) {
-    throw new Error(`Recovery PR-attempt marker ${ref} is ${observed}, expected exact V ${graph.v}`);
+  const observed = observePrAttemptMarker(git);
+  if (observed === graph.h) return 'reused';
+  if (observed !== null || lineHead !== graph.h) {
+    throw new Error(
+      `Inject requires immutable PR-attempt marker H; observed ${observed ?? 'absent'} with line ${lineHead}`,
+    );
   }
-  const result = ensureFixedRef(git, ref, graph.v);
-  verifyPrAttemptMarker(git, graph);
-  return { created: result === 'created', sha: graph.v, result };
+  const result = ensureFixedRef(git, ref, graph.h);
+  requirePrAttemptMarker(git, graph, [graph.h]);
+  return result;
 }
 
-async function listCompletePullRequestHistory(github, git, graph, { base, head }) {
+function consumePrAttemptMarker(git, graph) {
+  const ref = conflictRef('pr-attempt');
+  requirePrAttemptMarker(git, graph, [graph.h]);
+  const push = pushWithLease(git, ref, graph.h, graph.v);
+  if (push.status !== 0) {
+    const observed = observePrAttemptMarker(git);
+    if (observed === graph.v) return { authorizesPost: false, result: 'lost-success-h-to-v' };
+    if (isExactStaleLeaseRejection(push, ref, graph.v)) {
+      throw new Error(`Stale PR-attempt H lease rejected marker transition; observed ${observed ?? 'absent'}`);
+    }
+    throw new Error(
+      `PR-attempt H-to-V transition failed without stale-lease proof; observed ${observed ?? 'absent'}: ${push.stderr.trim() || push.stdout.trim()}`,
+    );
+  }
+  requirePrAttemptMarker(git, graph, [graph.v]);
+  return { authorizesPost: true, result: 'advanced-h-to-v' };
+}
+
+async function listCompletePullRequestHistory(
+  github,
+  git,
+  graph,
+  { base, head },
+  allowedMarkers = [graph.v],
+) {
   const pulls = [];
   for (let page = 1; page <= MAX_HISTORY_PAGES; page += 1) {
     git.assertTrustedSource();
-    verifyPrAttemptMarker(git, graph);
+    requirePrAttemptMarker(git, graph, allowedMarkers);
     const values = await github.listPullRequestHistoryPage({ base, head, page });
     git.assertTrustedSource();
-    verifyPrAttemptMarker(git, graph);
+    requirePrAttemptMarker(git, graph, allowedMarkers);
     if (!Array.isArray(values)) throw new Error('GitHub did not return a pull request history page');
     if (values.length > HISTORY_PAGE_SIZE) throw new Error(`GitHub history page ${page} exceeded its fixed size`);
     pulls.push(...values);
@@ -604,20 +670,27 @@ async function ensureRecoveryPullRequest(github, git, graph) {
   const qualifiedHead = `fablebookjs:${head}`;
   const query = { base, head: qualifiedHead };
   git.assertTrustedSource();
-  const marker = ensurePrAttemptMarker(git, graph);
-  let pulls = marker.created
-    ? await listCompletePullRequestHistory(github, git, graph, query)
+  const marker = requirePrAttemptMarker(git, graph, [graph.h, graph.v]);
+  let pulls = marker === graph.h
+    ? await listCompletePullRequestHistory(github, git, graph, query, [graph.h])
     : await pollRecoveryPullRequestHistory(github, git, graph, query);
   const existing = selectRecoveryPullRequest(pulls, graph);
   if (existing) return { action: 'reused', pull: existing };
-  if (!marker.created) {
-    throw new Error('Recovery PR-attempt marker exists but no matching PR is visible; refusing another POST');
+  if (marker === graph.v) {
+    throw new Error('Recovery PR-attempt marker is V but no matching PR is visible; refusing another POST');
+  }
+  const transition = consumePrAttemptMarker(git, graph);
+  if (!transition.authorizesPost) {
+    pulls = await pollRecoveryPullRequestHistory(github, git, graph, query);
+    const recovered = selectRecoveryPullRequest(pulls, graph);
+    if (recovered) return { action: 'reused-after-marker-lost-success', pull: recovered };
+    throw new Error('Recovery PR-attempt marker reached V ambiguously; refusing POST without retained PR evidence');
   }
 
   let created;
   try {
     git.assertTrustedSource();
-    verifyPrAttemptMarker(git, graph);
+    requirePrAttemptMarker(git, graph, [graph.v]);
     created = await github.createPullRequest({
       title: PR_TITLE,
       body: recoveryPullRequestBody(graph),
@@ -626,7 +699,7 @@ async function ensureRecoveryPullRequest(github, git, graph) {
       draft: true,
     });
     git.assertTrustedSource();
-    verifyPrAttemptMarker(git, graph);
+    requirePrAttemptMarker(git, graph, [graph.v]);
   } catch (error) {
     pulls = await pollRecoveryPullRequestHistory(github, git, graph, query);
     const recovered = selectRecoveryPullRequest(pulls, graph);
@@ -653,7 +726,12 @@ export async function runConflictRecovery({ mode, git = new Git(), source, githu
   const prepared = prepareFixedGraph(git, source);
   const createEvidenceRefs = mode === 'inject-after-force';
   const line = requireCompatibleLine(git, prepared.graph, { createIfAbsent: createEvidenceRefs });
-  const backup = ensureOrRequireBackup(git, prepared.graph, { createIfAbsent: createEvidenceRefs });
+  const prAttemptResult = mode === 'inject-after-force'
+    ? ensureInjectPrAttemptMarker(git, prepared.graph, line.current)
+    : requirePrAttemptMarker(git, prepared.graph, [prepared.graph.h, prepared.graph.v]);
+  const backup = mode === 'inject-after-force' && line.current === prepared.graph.v
+    ? { result: 'observed-restart', ...observeRemoteBackup(git, prepared.graph) }
+    : ensureOrRequireBackup(git, prepared.graph, { createIfAbsent: createEvidenceRefs });
   const forced = forceLineToSnapshot(git, prepared.graph);
   const finalBackup = observeRemoteBackup(git, prepared.graph);
 
@@ -668,6 +746,7 @@ export async function runConflictRecovery({ mode, git = new Git(), source, githu
     finalLine: forced.finalHead,
     backupRef: conflictRef('backup'),
     backupResult: backup.result,
+    prAttemptResult,
     remoteBackup: finalBackup.remoteBackup,
     backupVerified: finalBackup.backupVerified,
     lateCommits: finalBackup.lateCommits,
