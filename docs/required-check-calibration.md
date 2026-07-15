@@ -270,15 +270,46 @@ be present in that current commit's rollup.
 | Phase | PR head / body authorization | Latest exact REST check | GraphQL `(mergeable, mergeStateStatus, rollup.state)` |
 | --- | --- | --- | --- |
 | `a-green` | A / A after `opened` | `(A, completed, success, APP_ID, github-actions)` | `(MERGEABLE, CLEAN, SUCCESS)` |
-| `b-failing` | B / A after authenticated human `edited` wake-up | `(B, completed, failure, APP_ID, github-actions)`; A success remains retained on A | `(MERGEABLE, UNSTABLE, FAILURE)` |
+| `b-failing` | B / A after authenticated human `edited` wake-up | `(B, completed, failure, APP_ID, github-actions)`; A success remains retained on A | `(MERGEABLE, BLOCKED, FAILURE)` |
 | `b-green` | B / B after second authenticated human `edited` authorization | newest exact B run `(B, completed, success, APP_ID, github-actions)` | `(MERGEABLE, CLEAN, SUCCESS)` |
 
-If GitHub reports `BLOCKED` rather than `UNSTABLE` for the completed B failure,
-retain that raw policy-aware result and stop: it still demonstrates policy
-blocking, but it is not the exact expected tuple and must not be rewritten as a
-successful calibration. Any timeout, pagination overflow, extra protected
-check, changed PR number, missing PR rollup, or draft/closed/merged PR also
-fails the evidence contract.
+`(MERGEABLE, BLOCKED, FAILURE)` is the one accepted `b-failing` policy tuple.
+It is retained current GitHub behavior under the exact loose protection rule,
+not a broadened alternative or an allowed set containing `UNSTABLE`. Any other
+policy tuple, timeout, pagination overflow, extra protected check, changed PR
+number, missing PR rollup, or draft/closed/merged PR fails the evidence
+contract. A success remains exact `(MERGEABLE, CLEAN, SUCCESS)`, and B success
+is expected to recover that same tuple when the still-gated B/B phase is run.
+
+## Retained v2 execution evidence
+
+The live v2 sequence reached and honored the documented stop before B
+authorization:
+
+- PR [#21](https://github.com/fablebookjs/lab-01/pull/21) remains open at exact
+  B `fc7876e24d3e55e326862c9495481eb3bc07f049`. Its body still authorizes exact
+  A `07a51d4dda009d2e60c3390f4a3e4ea9dd9a75eb`; it has not been changed to B.
+- Token-authored `synchronize` run
+  [29443682944](https://github.com/fablebookjs/lab-01/actions/runs/29443682944)
+  is retained with `action_required`. It remains observational evidence and is
+  not an acceptance dependency.
+- Authenticated human `edited` run
+  [29443714934](https://github.com/fablebookjs/lab-01/actions/runs/29443714934)
+  is the exact B/A failure. The checker retained `action=edited`,
+  `headSha=remoteHeadSha=B`, `authorizedSha=A`, and
+  `remoteMergeSha=a150bbdfb4f1afd9350020ef717206d59a56678e`.
+- The required CheckRun is exact App ID `15368`, context
+  **Required calibration head**, head B, and conclusion `failure`.
+- The policy-aware live tuple is exact
+  `(mergeable=MERGEABLE, mergeStateStatus=BLOCKED,
+  statusCheckRollup.state=FAILURE)` under the exact `strict=false`, enforced
+  admins, single context/App protection rule.
+
+The earlier stop condition was followed because the then-documented tuple
+expected `UNSTABLE`. This retained evidence resolves that documentation
+mismatch by making the observed `BLOCKED/FAILURE` tuple exact. It does not claim
+that B/B has run or succeeded. The body remains authorized at A, and the second
+human edit in step 6 remains ordered after this retained B/A evidence.
 
 ## Live operator sequence
 

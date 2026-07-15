@@ -54,6 +54,12 @@ const CHECKER_EVIDENCE_SELECTOR = `
 .remoteMergeSha == $merge and
 .authorizedSha == $authorized
 `.trim();
+const B_FAILING_POLICY_SELECTOR = `
+.repository.pullRequest as $pr |
+$pr.mergeable == "MERGEABLE" and
+$pr.mergeStateStatus == "BLOCKED" and
+$pr.commits.nodes[0].commit.statusCheckRollup.state == "FAILURE"
+`.trim();
 
 function command(cwd, args, env = {}) {
   return execFileSync('git', args, {
@@ -291,6 +297,13 @@ function runCheckerEvidenceSelector({ evidence, number, head, merge, authorized 
     ],
     { encoding: 'utf8', input: JSON.stringify(evidence) },
   );
+}
+
+function runBFailingPolicySelector(policy) {
+  return spawnSync('jq', ['-e', B_FAILING_POLICY_SELECTOR], {
+    encoding: 'utf8',
+    input: JSON.stringify(policy),
+  });
 }
 
 const EXPECTED_STATE_WORKFLOW = {
@@ -1328,6 +1341,53 @@ test('operator jq evidence distinguishes REST head B from the synthetic merge id
     }).status,
     0,
   );
+
+  const blockedFailurePolicy = {
+    repository: {
+      pullRequest: {
+        mergeable: 'MERGEABLE',
+        mergeStateStatus: 'BLOCKED',
+        commits: {
+          nodes: [{ commit: { statusCheckRollup: { state: 'FAILURE' } } }],
+        },
+      },
+    },
+  };
+  const selectedBlockedFailure = runBFailingPolicySelector(blockedFailurePolicy);
+  assert.equal(selectedBlockedFailure.status, 0, selectedBlockedFailure.stderr);
+  for (const policy of [
+    {
+      ...blockedFailurePolicy,
+      repository: {
+        pullRequest: {
+          ...blockedFailurePolicy.repository.pullRequest,
+          mergeStateStatus: 'UNSTABLE',
+        },
+      },
+    },
+    {
+      ...blockedFailurePolicy,
+      repository: {
+        pullRequest: {
+          ...blockedFailurePolicy.repository.pullRequest,
+          mergeStateStatus: 'CLEAN',
+        },
+      },
+    },
+    {
+      ...blockedFailurePolicy,
+      repository: {
+        pullRequest: {
+          ...blockedFailurePolicy.repository.pullRequest,
+          commits: {
+            nodes: [{ commit: { statusCheckRollup: { state: 'SUCCESS' } } }],
+          },
+        },
+      },
+    },
+  ]) {
+    assert.notEqual(runBFailingPolicySelector(policy).status, 0);
+  }
 });
 
 test('scripts and documentation retain the release boundary and do not claim live proof', () => {
@@ -1362,7 +1422,8 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.match(docs, /statusCheckRollup/);
   assert.match(docs, /mergeStateStatus/);
   assert.match(docs, /`\(MERGEABLE, CLEAN, SUCCESS\)`/);
-  assert.match(docs, /`\(MERGEABLE, UNSTABLE, FAILURE\)`/);
+  assert.match(docs, /`\(MERGEABLE, BLOCKED, FAILURE\)`/);
+  assert.doesNotMatch(docs, /`\(MERGEABLE, UNSTABLE, FAILURE\)`/);
   assert.match(docs, /app\.slug.*github-actions/s);
   assert.match(docs, /--paginate \\\n  --slurp/);
   assert.match(docs, /filter=all&per_page=100/);
@@ -1403,7 +1464,12 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.doesNotMatch(docs, /The PR `synchronize` run must attach/);
   const bFailingRow = docs.split('\n').find((line) => line.startsWith('| `b-failing`'));
   assert.match(bFailingRow, /authenticated human `edited` wake-up/);
+  assert.match(bFailingRow, /\(MERGEABLE, BLOCKED, FAILURE\)/);
   assert.doesNotMatch(bFailingRow, /synchronize/);
+  const aGreenRow = docs.split('\n').find((line) => line.startsWith('| `a-green`'));
+  const bGreenRow = docs.split('\n').find((line) => line.startsWith('| `b-green`'));
+  assert.match(aGreenRow, /\(MERGEABLE, CLEAN, SUCCESS\)/);
+  assert.match(bGreenRow, /\(MERGEABLE, CLEAN, SUCCESS\)/);
   assert.match(docs, /absent, awaiting approval, queued\/running, or completed/);
   assert.match(docs, /jq -e '\.login == "ndelangen"'/);
   assert.match(docs, /actor `ndelangen`/);
@@ -1420,4 +1486,17 @@ test('scripts and documentation retain the release boundary and do not claim liv
   assert.match(docs, /checker\.remoteMergeSha=advertised refs\/pull\/PR\/merge SHA/);
   assert.match(docs, /remoteMergeSha.*B_FAILING_MERGE_SHA/s);
   assert.match(docs, /--arg conclusion success/);
+  assert.match(docs, /pull\/21/);
+  assert.match(docs, /fc7876e24d3e55e326862c9495481eb3bc07f049/);
+  assert.match(docs, /07a51d4dda009d2e60c3390f4a3e4ea9dd9a75eb/);
+  assert.match(docs, /actions\/runs\/29443682944/);
+  assert.match(docs, /`action_required`/);
+  assert.match(docs, /actions\/runs\/29443714934/);
+  assert.match(docs, /a150bbdfb4f1afd9350020ef717206d59a56678e/);
+  assert.match(docs, /App ID `15368`/);
+  assert.match(docs, /context\s+\*\*Required calibration head\*\*/);
+  assert.match(docs, /not a broadened alternative or an allowed set containing `UNSTABLE`/);
+  assert.match(docs, /body still authorizes exact\s+A/s);
+  assert.match(docs, /It does not claim\s+that B\/B has run or succeeded/s);
+  assert.match(docs, /second\s+human edit in step 6 remains ordered after this retained B\/A evidence/s);
 });
