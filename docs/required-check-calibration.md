@@ -1,8 +1,8 @@
 # Current-head required-check calibration
 
 This calibration tests whether GitHub branch protection binds a successful
-required check to a pull request's current head SHA. It does not claim v3 proof
-until the complete live sequence below is observed and retained.
+required check to a pull request's current head SHA. The completed v3 live proof
+and its exact preservation snapshot are retained below.
 
 ## Retained discoveries from v1 and v2
 
@@ -65,6 +65,88 @@ This is retained negative evidence, not failure hiding. A same-name failure and
 success on one SHA aggregate to failure; an intentional failing required check
 must not be used as a reauthorization phase. V2 PR #21, its four refs,
 protection, failure, success, and final tuple must remain untouched.
+
+## V3: completed current-head binding proof
+
+V3 was installed by [PR #22](https://github.com/fablebookjs/lab-01/pull/22),
+merged at trusted `main` commit
+`581e096a5c58ce5d904bb18a99b6c1fdc594ab43`. State setup
+[run 29449811320](https://github.com/fablebookjs/lab-01/actions/runs/29449811320)
+created exactly:
+
+| Fixed ref | Retained SHA after setup |
+| --- | --- |
+| `calibration/g1/required-check-current/base` | `4c734933625e643a97928514649b1302697e86db` |
+| `calibration/g1/required-check-current/a` | `eb2aaae563a1d25d6ba16a10da69ab7e0644af6f` |
+| `calibration/g1/required-check-current/b` | `fd7773ad426f620a3e98603cb72887a705c85cbe` |
+| `calibration/g1/required-check-current/head` | initially A `eb2aaae563a1d25d6ba16a10da69ab7e0644af6f` |
+
+The retained evidence PR is
+[#23](https://github.com/fablebookjs/lab-01/pull/23). It remains open,
+non-draft, unmerged, and bound to the fixed v3 base and head refs.
+
+### A green
+
+The PR `opened` event produced
+[run 29449854427](https://github.com/fablebookjs/lab-01/actions/runs/29449854427)
+and exact successful
+[job/CheckRun 87469366909](https://github.com/fablebookjs/lab-01/actions/runs/29449854427/job/87469366909)
+on A `eb2aaae563a1d25d6ba16a10da69ab7e0644af6f`. REST bound it to App
+ID `15368` and context **Required calibration head**. Exact v3 base protection
+was `(strict=false, enforce_admins=true, checks=[{context: "Required calibration
+head", app_id: 15368}])`. GraphQL was `MERGEABLE/CLEAN/SUCCESS`.
+
+### B before authorization: stale-green rejection
+
+State [run 29449898852](https://github.com/fablebookjs/lab-01/actions/runs/29449898852)
+changed only v3 head from A
+`eb2aaae563a1d25d6ba16a10da69ab7e0644af6f` to B
+`fd7773ad426f620a3e98603cb72887a705c85cbe`. Before B authorization,
+PR #23's body still authorized exact A while its current head was exact B.
+There were zero required-workflow runs at B and zero B CheckRuns named
+**Required calibration head**, regardless of App. GraphQL was exactly
+`MERGEABLE/BLOCKED/null`.
+
+This is the completed stale-green proof: A's retained success did not authorize
+or make mergeable the newer current head B.
+
+### B authorized green
+
+Before the sole authorization edit, the retained A-authorizing PR body had
+SHA-256 `d296653cb97e435b54fdcc4cd88c6b406176199cda16a44a91099d8c745ba44f`.
+The separately advertised pull merge SHA was
+`a748e2c7a2f6774a70d0324e98b04f7cea74eab8`.
+
+One authenticated `ndelangen` body edit produced `pull_request` event
+[run 29449963241](https://github.com/fablebookjs/lab-01/actions/runs/29449963241)
+and successful
+[job/CheckRun 87469722671](https://github.com/fablebookjs/lab-01/actions/runs/29449963241/job/87469722671).
+REST bound the run to head B, exact PR #23 and its fixed base/head refs, App ID
+`15368`, and context **Required calibration head**. The trusted checker retained:
+
+- `priorAuthorizedSha=eb2aaae563a1d25d6ba16a10da69ab7e0644af6f`
+- `authorizedSha=headSha=remoteHeadSha=fd7773ad426f620a3e98603cb72887a705c85cbe`
+- `remoteASha=eb2aaae563a1d25d6ba16a10da69ab7e0644af6f`
+- `remoteMergeSha=a748e2c7a2f6774a70d0324e98b04f7cea74eab8`
+- `priorBodySha256=d296653cb97e435b54fdcc4cd88c6b406176199cda16a44a91099d8c745ba44f`
+- `currentBodySha256=6fd20fe033ed89c02e0a294043fd92a44de7e8b18728977652360847fe662858`
+
+B has exactly one same-name CheckRun, and final GraphQL is exactly
+`MERGEABLE/CLEAN/SUCCESS`. The same required context therefore recovered only
+after the exact current B authorization and B-bound success.
+
+### Retained preservation snapshot
+
+- `releases/v1.0` remains `0a9e2a9ae101ed71f83d9c4253bd7fe5c07f6e35`.
+- `staged/v1.0` remains `4e9321b895f01394f79b1377d46b5348ac59601d`.
+- PR #12 is open/draft; PR #16 is open/draft/conflicting; PR #19 is
+  open/blocked; PR #21 is open/unstable; PR #23 is open/non-draft/unmerged.
+- The only tag is `v1.0.0` at
+  `b59edf1d4c0fff51295327e8ce9e72678c336156`; GitHub Releases remain zero.
+- npm reads for `@fablebook/lab-01-core@1.0.1` and
+  `@fablebook/lab-01-addon@1.0.1` both remain `E404`.
+- All three calibration namespaces, retained PRs, and base protections remain
+  intact. No cleanup is authorized or performed.
 
 ## V3 fixed mechanism
 
@@ -392,7 +474,10 @@ jq -ce --arg head "$B" --arg context "$CONTEXT" --argjson app_id "$APP_ID" \
   -f exact-check.jq b-after-edit-check-runs.json > b-after-edit-check.json
 ```
 
-## Live v3 operator sequence
+## Retained live v3 operator sequence
+
+The evidence above records the completed execution. The commands below retain
+the exact reproduction and verification procedure.
 
 Set `REPO`, `BASE`, and `HEAD` to literal trusted values; record `PR`, A, B, and
 `BASE_SHA` from retained operator output rather than evaluating PR text:
@@ -588,7 +673,6 @@ The v3 workflows must not modify v1 or v2 namespaces, PRs 19 or 21, release PR
 #12, conflict-recovery PR #16, `releases/v1.0`, `staged/v1.0`, any other prior
 calibration ref, tags, GitHub Releases, package publication, infra policy, or
 Storybook resources. They do not create/edit/merge PRs or configure protection.
-This calibration proves current-head required-check binding if and only if the
-exact live v3 tuples are retained. It does not prove fully autonomous dependent
-dispatch, maintainer entitlement, release completion, publication, or the wider
-G1 lifecycle.
+The retained exact live v3 tuples prove current-head required-check binding.
+They do not prove fully autonomous dependent dispatch, maintainer entitlement,
+release completion, publication, or the wider G1 lifecycle.
