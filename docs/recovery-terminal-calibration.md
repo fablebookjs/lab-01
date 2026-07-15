@@ -1,8 +1,9 @@
 # Fixed-namespace recovery-terminal calibration
 
-This experiment proves only recovery completion and next-proposal suppression for
-fablebookjs/infra#15. It is deliberately separate from conflict PR #16, every
-`release/*`, `releases/*`, `staged/*`, and versioned calibration namespace.
+**Status: completed live proof.** This experiment proved recovery completion and
+next-proposal suppression for fablebookjs/infra#15. It is deliberately separate
+from conflict PR #16, every `release/*`, `releases/*`, `staged/*`, and versioned
+calibration namespace.
 
 ## Fixed namespace and authority
 
@@ -26,63 +27,35 @@ concurrency group, and check out the exact dispatch SHA without persisted checko
 credentials. Setup has only `contents: write`. Sweep has only `contents: write`
 and `pull-requests: write`.
 
-## Live operator sequence
+## Completed live proof
 
-1. Merge the installation PR normally and record the resulting exact `main` SHA.
-2. Dispatch **Set up recovery-terminal calibration** from `main` once. A safe
-   rerun before the recovery merge reuses the exact four setup refs:
+The controller was installed through normal [lab PR #25](https://github.com/fablebookjs/lab-01/pull/25),
+producing trusted `main` commit
+[`e43ec8e1fc5904dabc9bc394b804b6e0faf3ec37`](https://github.com/fablebookjs/lab-01/commit/e43ec8e1fc5904dabc9bc394b804b6e0faf3ec37).
 
-   ```sh
-   gh workflow run calibrate-recovery-terminal-setup.yml \
-     --repo fablebookjs/lab-01 --ref main
-   ```
-3. As a human operator, create the dedicated recovery PR with normal GitHub
-   mechanics. Do not reuse or modify PR #16:
+| Phase | Retained live evidence | Exact result |
+| --- | --- | --- |
+| Setup | [run 29454697392](https://github.com/fablebookjs/lab-01/actions/runs/29454697392) | `source = line = e43ec8e1fc5904dabc9bc394b804b6e0faf3ec37`; `recovery = pr-attempt = 019d79a611ee6c89a19e5369ddfb79ebd14efc62`; `proposal` absent |
+| Dedicated recovery opened | [PR #26](https://github.com/fablebookjs/lab-01/pull/26) | Clean same-repository PR from `recovery@019d79a611ee6c89a19e5369ddfb79ebd14efc62` to `line@e43ec8e1fc5904dabc9bc394b804b6e0faf3ec37` |
+| Open suppression 1 | [run 29454762852](https://github.com/fablebookjs/lab-01/actions/runs/29454762852) | `blocked-recovery-open`; proposal ref and proposal PR absent; fixed refs unchanged |
+| Open suppression 2 | [run 29454800587](https://github.com/fablebookjs/lab-01/actions/runs/29454800587) | `blocked-recovery-open`; proposal ref and proposal PR absent; fixed refs unchanged |
+| Normal recovery merge | [PR #26](https://github.com/fablebookjs/lab-01/pull/26) | `J = 77a46f4ddf7eedb097e8447b335f6c791472d15e`, ordered parents `[e43ec8e1fc5904dabc9bc394b804b6e0faf3ec37, 019d79a611ee6c89a19e5369ddfb79ebd14efc62]`, tree `0f8fa5f3455e7905e4987603477e657291833b64` |
+| Proposal creation | [run 29454848877](https://github.com/fablebookjs/lab-01/actions/runs/29454848877), [draft PR #27](https://github.com/fablebookjs/lab-01/pull/27) | `proposal = pr-attempt = b1a266b6c5b1424b336bc102b9876f2912e5c0d3`; outcome `proposal-created` |
+| Proposal reuse | [run 29454904814](https://github.com/fablebookjs/lab-01/actions/runs/29454904814) | Outcome `proposal-reused`; exact proposal ref, marker, SHA, and PR #27 unchanged |
 
-   ```sh
-   gh pr create --repo fablebookjs/lab-01 \
-     --base calibration/g1/recovery-terminal/line \
-     --head calibration/g1/recovery-terminal/recovery \
-     --title "Complete dedicated recovery-terminal calibration" \
-     --body "Dedicated clean recovery completion for fablebookjs/infra#15; no publication or finalization."
-   ```
+The [proposal commit](https://github.com/fablebookjs/lab-01/commit/b1a266b6c5b1424b336bc102b9876f2912e5c0d3)
+has the single parent `J`, the same tree
+`0f8fa5f3455e7905e4987603477e657291833b64`, and these exact trailers:
 
-4. While that PR is open, dispatch **Sweep recovery-terminal calibration** twice.
-   Both runs must report `blocked-recovery-open`. They must leave `proposal`
-   absent and must not create a proposal PR:
+```text
+Proposal-Base: calibration/g1/recovery-terminal/line
+Proposal-Version: 1.0.2
+Recovered-Line: 77a46f4ddf7eedb097e8447b335f6c791472d15e
+Recovery-Head: 019d79a611ee6c89a19e5369ddfb79ebd14efc62
+```
 
-   ```sh
-   gh workflow run calibrate-recovery-terminal-sweep.yml \
-     --repo fablebookjs/lab-01 --ref main
-   gh workflow run calibrate-recovery-terminal-sweep.yml \
-     --repo fablebookjs/lab-01 --ref main
-   ```
-
-5. Merge the dedicated recovery PR with GitHub's normal merge-commit method. Do
-   not squash or rebase it. The merge must have exact ordered parents
-   `[source, recovery]`, the exact recovery tree, equal the PR's
-   `merge_commit_sha`, and become the current fixed `line`:
-
-   ```sh
-   gh pr merge <recovery-pr-number> --repo fablebookjs/lab-01 --merge
-   ```
-
-6. Dispatch the sweep once. It creates or recovers exactly one structured empty
-   `proposal` commit and exactly one draft PR from `proposal` to `line`:
-
-   ```sh
-   gh workflow run calibrate-recovery-terminal-sweep.yml \
-     --repo fablebookjs/lab-01 --ref main
-   ```
-
-7. Dispatch the sweep again. With the canonical PR visible, it must reuse the
-   same proposal SHA and PR with no ref write or POST. Editable proposal
-   title/body changes do not change the authoritative ref, commit, or PR identity:
-
-   ```sh
-   gh workflow run calibrate-recovery-terminal-sweep.yml \
-     --repo fablebookjs/lab-01 --ref main
-   ```
+The [comparison from `J` to the proposal](https://github.com/fablebookjs/lab-01/compare/77a46f4ddf7eedb097e8447b335f6c791472d15e...b1a266b6c5b1424b336bc102b9876f2912e5c0d3)
+is exactly one commit and zero changed files.
 
 The sweep reads fully paginated, all-state PR history for exact same-repository
 base/head identities. Absent, open, or closed-unmerged recovery suppresses before
@@ -163,6 +136,11 @@ The script has no tag, GitHub Release, npm, release-ref, staged-ref, QA dispatch
 or finalization operation. It preserves PRs #12, #16, #19, #21, and #23, all
 existing calibration evidence and protections, `v1.0.0`, zero GitHub Releases,
 and the absence of npm `1.0.1`. It never accesses Storybook.
+
+The completed live read-back confirmed those preservation claims: the prior
+release and calibration PRs/refs remained intact, `v1.0.0` remained the only
+tag, GitHub Releases remained empty, npm `1.0.1` remained unpublished, and no
+Storybook resource was touched. There is no pending proof in this calibration.
 
 Integrated release finalization, tags, GitHub Releases, and public publication
 remain exclusively owned by fablebookjs/infra#19.

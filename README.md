@@ -3,6 +3,9 @@
 `lab-01` is a disposable, synthetic monorepo for proving a visible release-PR
 contract without touching Storybook resources or publishing real packages.
 
+**Demo:** follow the outcome-first [five-minute screen-share script](docs/demo.md)
+or open the public [release-state explorer](https://fablebookjs.github.io/release-state-explorer/).
+
 The `1.0.0` baseline contains:
 
 - `@fablebook/lab-01-core`;
