@@ -27,7 +27,7 @@ export class Git {
     const result = spawnSync('git', args, {
       cwd: this.cwd,
       encoding: 'utf8',
-      env: { ...process.env, ...env },
+      env: { ...process.env, LC_ALL: 'C', ...env },
       input,
     });
 
@@ -88,12 +88,22 @@ function pushWithLease(git, ref, expected, next) {
   return git.run(
     [
       'push',
+      '--porcelain',
       `--force-with-lease=${ref}:${expected ?? ''}`,
       git.remote,
       `${next}:${ref}`,
     ],
     { allowFailure: true },
   );
+}
+
+export function assertStaleLeaseRejection(push, ref, candidate) {
+  const exact = `!\t${candidate}:${ref}\t[rejected] (stale info)`;
+  if (push.status === 0 || !push.stdout.split('\n').includes(exact)) {
+    throw new Error(
+      `Expected Git to reject a stale lease for ${ref}: ${push.stdout.trim()} ${push.stderr.trim()}`,
+    );
+  }
 }
 
 function ensureFixedRef(git, ref, sha) {
@@ -263,20 +273,20 @@ export function runCalibration({ scenario, git = new Git(), source }) {
     }
   } else {
     const current = remoteHead(git, lineRef);
-    if (current === graph.h2) {
-      outcome = 'reused-concurrent-rejection';
-      stalePushRejected = true;
-    } else {
-      ensureFixedRef(git, lineRef, graph.h);
-      advanceFixedLine(git, lineRef, graph.h, graph.h2);
-      const stalePush = pushWithLease(git, lineRef, graph.h, graph.j);
-      if (stalePush.status === 0) throw new Error('Stale reconciliation unexpectedly overwrote H2');
-      if (remoteHead(git, lineRef) !== graph.h2) {
-        throw new Error('Concurrent-head rejection did not preserve H2');
-      }
-      outcome = 'stale-reconciliation-rejected';
-      stalePushRejected = true;
+    if (current === null) ensureFixedRef(git, lineRef, graph.h);
+    else if (current !== graph.h && current !== graph.h2) {
+      throw new Error(`Unexpected concurrent line head: ${current}`);
     }
+    if (remoteHead(git, lineRef) === graph.h) {
+      advanceFixedLine(git, lineRef, graph.h, graph.h2);
+    }
+    const stalePush = pushWithLease(git, lineRef, graph.h, graph.j);
+    assertStaleLeaseRejection(stalePush, lineRef, graph.j);
+    if (remoteHead(git, lineRef) !== graph.h2) {
+      throw new Error('Concurrent-head rejection did not preserve H2');
+    }
+    outcome = 'stale-reconciliation-rejected';
+    stalePushRejected = true;
   }
 
   const finalHead = remoteHead(git, lineRef);

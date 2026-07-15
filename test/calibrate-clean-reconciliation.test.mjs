@@ -8,6 +8,7 @@ import {
   Git,
   NAMESPACE,
   assertCalibrationRef,
+  assertStaleLeaseRejection,
   runCalibration,
   scenarioRef,
 } from '../scripts/calibrate-clean-reconciliation.mjs';
@@ -87,7 +88,7 @@ for (const [scenario, expectedRole] of [
       if (scenario === 'concurrent-head') {
         assert.equal(first.outcome, 'stale-reconciliation-rejected');
         assert.equal(first.stalePushRejected, true);
-        assert.equal(second.outcome, 'reused-concurrent-rejection');
+        assert.equal(second.outcome, 'stale-reconciliation-rejected');
         assert.deepEqual(parents(f, first.graph.h2), [first.graph.h]);
       }
 
@@ -122,6 +123,29 @@ test('forbidden scenarios and refs fail before a Git write', () => {
   assert.throws(() => scenarioRef('conflict', 'line'), /Unsupported scenario/);
   assert.throws(() => assertCalibrationRef('refs/heads/releases/v1.0'), /outside/);
   assert.throws(() => assertCalibrationRef(`${NAMESPACE}/../releases/v1.0`), /outside/);
+});
+
+test('only Git explicit stale-info output counts as a rejected lease', () => {
+  const ref = scenarioRef('concurrent-head', 'line');
+  const candidate = '1'.repeat(40);
+  assert.doesNotThrow(() =>
+    assertStaleLeaseRejection(
+      {
+        status: 1,
+        stdout: `To origin\n!\t${candidate}:${ref}\t[rejected] (stale info)\nDone\n`,
+        stderr: 'error: failed to push some refs',
+      },
+      ref,
+      candidate,
+    ),
+  );
+  for (const failure of [
+    { status: 1, stdout: '', stderr: 'authentication failed' },
+    { status: 1, stdout: `!\t${candidate}:${ref}\t[remote rejected] (policy)\n`, stderr: '' },
+    { status: 0, stdout: `!\t${candidate}:${ref}\t[rejected] (stale info)\n`, stderr: '' },
+  ]) {
+    assert.throws(() => assertStaleLeaseRejection(failure, ref, candidate), /Expected Git to reject/);
+  }
 });
 
 test('the workflow is manual, main-bound, and has only contents write authority', () => {
