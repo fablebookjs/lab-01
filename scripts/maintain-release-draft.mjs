@@ -8,6 +8,7 @@ const STAGED_LINE = 'staged/v1.0';
 const BASELINE_TAG = 'v1.0.0';
 const RELEASE_VERSION = '1.0.1';
 const INTENT_VERSION = '1';
+const READY_QA_WORKFLOW = 'ready-release-qa.yml';
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
 
 const git = (...args) =>
@@ -89,7 +90,7 @@ ${commits}
 
 Automatic release-PR maintenance is live. A push to \`${RELEASE_LINE}\` refreshes this same PR from the exact new release-line head while preserving its number, base, head, and draft-or-ready review state.
 
-Ready-state exact-version QA is implemented. Once that workflow is present on the \`${RELEASE_LINE}\` base, ready and synchronize events run it against the current PR; no GitHub-current QA evidence has been captured yet. Its manual-dispatch fallback and close-and-regenerate remain offline until their workflows are installed on the default branch and GitHub authority is calibrated. Publication, branch reconciliation, a \`v1.0.1\` tag, and a GitHub Release are not implemented. Do not close this PR for a lifecycle demonstration until close-and-regenerate is installed and calibrated. Do not merge this release PR.
+Ready-state exact-version QA is live. Marking the current proposal ready runs QA for that exact head. When a ready proposal refreshes, release-PR maintenance explicitly dispatches QA for the new staged head because GitHub leaves token-authored synchronize runs approval-required. The first GitHub-current proof is [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684); every refreshed head needs its own successful proof. Close-and-regenerate is installed, but replacement creation remains blocked until the Fablebook organization allows Actions-created PRs. Publication, branch reconciliation, a \`v1.0.1\` tag, and a GitHub Release are not implemented. Do not merge this release PR.
 
 See [docs/release-process.md](https://github.com/${REPOSITORY}/blob/${RELEASE_LINE}/docs/release-process.md) for the current contract and safety boundary.`;
 }
@@ -193,7 +194,24 @@ export function assertMatchingReleasePull(pull) {
   }
 }
 
-async function findDraftPull() {
+export async function dispatchReadyQaIfNeeded({ pull, intent, request }) {
+  assertMatchingReleasePull(pull);
+  if (!SHA_PATTERN.test(intent ?? '')) fail('ready QA dispatch has an invalid intent SHA');
+  if (pull.draft) return { action: 'not-dispatched-draft' };
+  if (pull.head?.sha !== intent) {
+    fail('ready release PR head does not equal the dispatched intent');
+  }
+  if (typeof request !== 'function') fail('ready QA dispatch requires a request function');
+
+  await request(`/repos/${REPOSITORY}/actions/workflows/${READY_QA_WORKFLOW}/dispatches`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ref: STAGED_LINE }),
+  });
+  return { action: 'dispatched-ready-qa', intent };
+}
+
+async function findReleasePull() {
   const pulls = await github(
     `/repos/${REPOSITORY}/pulls?state=open&base=${encodeURIComponent(RELEASE_LINE)}&per_page=100`,
   );
@@ -246,7 +264,7 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
     fail('remote refs changed while reading state; a later wake-up must reconcile them');
   }
 
-  const pull = await findDraftPull();
+  const pull = await findReleasePull();
   if (pull.head.sha !== previousIntent) fail('release PR head does not equal the staged ref');
 
   const baseline = validateBaseline(releaseSource);
@@ -277,14 +295,23 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
   }
 
   const commits = includedCommits(baseline, releaseSource);
+  let qaDispatch = {
+    action: pull.draft ? 'not-dispatched-draft' : 'would-dispatch-ready-qa',
+    ...(pull.draft ? {} : { intent: alreadyCurrent ? intent : null }),
+  };
   if (!dryRun) {
-    await waitForPullHead(pull.number, intent);
+    const currentPull = await waitForPullHead(pull.number, intent);
 
     const body = buildPullRequestBody({ source: releaseSource, intent, includedCommits: commits });
     await github(`/repos/${REPOSITORY}/pulls/${pull.number}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ body }),
+    });
+    qaDispatch = await dispatchReadyQaIfNeeded({
+      pull: currentPull,
+      intent,
+      request: github,
     });
   }
 
@@ -303,6 +330,7 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
     releaseSource,
     previousIntent,
     intent: alreadyCurrent || !dryRun ? intent : null,
+    qaDispatch,
     includedCommits: commits.map(({ sha }) => sha),
   };
   console.log(JSON.stringify(summary, null, 2));

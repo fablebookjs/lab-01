@@ -6,7 +6,6 @@ on:
       - releases/v1.0
     types:
       - ready_for_review
-      - synchronize
   workflow_dispatch:
 
 permissions:
@@ -14,7 +13,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: ready-release-qa-${{ github.event.pull_request.number || github.run_id }}
+  group: ready-release-qa-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:

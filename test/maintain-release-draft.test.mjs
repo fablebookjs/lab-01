@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
   assertMatchingReleasePull,
   buildPullRequestBody,
+  dispatchReadyQaIfNeeded,
   parseIntentMessage,
   validateIntent,
 } from '../scripts/maintain-release-draft.mjs';
@@ -91,6 +93,51 @@ test('accepts the same open release PR after it becomes ready', () => {
   );
 });
 
+test('explicitly dispatches exact-head QA only for a ready release PR', async () => {
+  const calls = [];
+  const request = async (...args) => calls.push(args);
+  const ready = { ...releasePull(false), head: { ...releasePull(false).head, sha: intent } };
+  const draft = { ...releasePull(true), head: { ...releasePull(true).head, sha: intent } };
+
+  assert.deepEqual(
+    await dispatchReadyQaIfNeeded({ pull: draft, intent, request }),
+    { action: 'not-dispatched-draft' },
+  );
+  assert.deepEqual(calls, []);
+
+  assert.deepEqual(
+    await dispatchReadyQaIfNeeded({ pull: ready, intent, request }),
+    { action: 'dispatched-ready-qa', intent },
+  );
+  assert.deepEqual(calls, [
+    [
+      '/repos/fablebookjs/lab-01/actions/workflows/ready-release-qa.yml/dispatches',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ref: 'staged/v1.0' }),
+      },
+    ],
+  ]);
+
+  await assert.rejects(
+    dispatchReadyQaIfNeeded({ pull: ready, intent: source, request }),
+    /ready release PR head does not equal the dispatched intent/,
+  );
+});
+
+test('release-PR maintenance has only the authority needed for guarded refresh and QA dispatch', async () => {
+  const workflow = await readFile(
+    new URL('../.github/workflows/maintain-release-draft.yml', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    workflow,
+    /permissions:\n  actions: write\n  contents: write\n  pull-requests: write/,
+  );
+  assert.match(workflow, /node scripts\/maintain-release-draft\.mjs/);
+});
+
 test('renders the exact current intent and honest lifecycle limits', () => {
   assert.equal(
     buildPullRequestBody({
@@ -115,7 +162,7 @@ The structured empty commit is authoritative. This editable title and body are p
 
 Automatic release-PR maintenance is live. A push to \`releases/v1.0\` refreshes this same PR from the exact new release-line head while preserving its number, base, head, and draft-or-ready review state.
 
-Ready-state exact-version QA is implemented. Once that workflow is present on the \`releases/v1.0\` base, ready and synchronize events run it against the current PR; no GitHub-current QA evidence has been captured yet. Its manual-dispatch fallback and close-and-regenerate remain offline until their workflows are installed on the default branch and GitHub authority is calibrated. Publication, branch reconciliation, a \`v1.0.1\` tag, and a GitHub Release are not implemented. Do not close this PR for a lifecycle demonstration until close-and-regenerate is installed and calibrated. Do not merge this release PR.
+Ready-state exact-version QA is live. Marking the current proposal ready runs QA for that exact head. When a ready proposal refreshes, release-PR maintenance explicitly dispatches QA for the new staged head because GitHub leaves token-authored synchronize runs approval-required. The first GitHub-current proof is [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684); every refreshed head needs its own successful proof. Close-and-regenerate is installed, but replacement creation remains blocked until the Fablebook organization allows Actions-created PRs. Publication, branch reconciliation, a \`v1.0.1\` tag, and a GitHub Release are not implemented. Do not merge this release PR.
 
 See [docs/release-process.md](https://github.com/fablebookjs/lab-01/blob/releases/v1.0/docs/release-process.md) for the current contract and safety boundary.`,
   );
