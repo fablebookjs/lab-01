@@ -13,15 +13,16 @@ This repository currently demonstrates only the first visible release intent:
    the editable PR title and body are not.
 4. A push to `releases/v1.0` automatically refreshes `staged/v1.0` with a new
    empty intent based on the exact current line head and updates the existing
-   draft PR in place. A manual workflow dispatch is the recovery wake-up.
+   PR in place while preserving whether it is draft or ready. A manual workflow
+   dispatch is the recovery wake-up.
 5. The close-and-regenerate handler is implemented for later installation on
    the default branch. When installed, closing the current release PR without
    merging creates a fresh structured empty intent commit and one new draft PR.
    The closed PR remains untouched as the historical review and comment record.
 
-The maintainer re-reads both remote refs and the matching open draft PR before
+The maintainer re-reads both remote refs and the matching open release PR before
 acting. It accepts only this repository, release line, staged line, fixed
-`1.0.1` target, and one matching open draft PR. A stale staged intent is
+`1.0.1` target, and one matching open draft-or-ready PR. A stale staged intent is
 replaced using an expected-old guarded ref update; a concurrent release-line
 advance causes the run to stop so a later wake-up can include the newer fix.
 `node scripts/maintain-release-draft.mjs --dry-run` validates and reports the

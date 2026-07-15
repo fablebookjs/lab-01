@@ -87,7 +87,7 @@ ${commits}
 
 ## Current lifecycle state
 
-Automatic draft maintenance is live. A push to \`${RELEASE_LINE}\` refreshes this same draft PR from the exact new release-line head while preserving its number, base, head, and draft state.
+Automatic release-PR maintenance is live. A push to \`${RELEASE_LINE}\` refreshes this same PR from the exact new release-line head while preserving its number, base, head, and draft-or-ready review state.
 
 Ready-state exact-version QA is implemented. Once that workflow is present on the \`${RELEASE_LINE}\` base, ready and synchronize events run it against the current PR; no GitHub-current QA evidence has been captured yet. Its manual-dispatch fallback and close-and-regenerate remain offline until their workflows are installed on the default branch and GitHub authority is calibrated. Publication, branch reconciliation, a \`v1.0.1\` tag, and a GitHub Release are not implemented. Do not close this PR for a lifecycle demonstration until close-and-regenerate is installed and calibrated. Do not merge this release PR.
 
@@ -180,16 +180,16 @@ async function github(path, options = {}) {
   return body;
 }
 
-function assertMatchingDraft(pull) {
+export function assertMatchingReleasePull(pull) {
   if (
     pull.state !== 'open' ||
-    pull.draft !== true ||
+    typeof pull.draft !== 'boolean' ||
     pull.base?.ref !== RELEASE_LINE ||
     pull.base?.repo?.full_name !== REPOSITORY ||
     pull.head?.ref !== STAGED_LINE ||
     pull.head?.repo?.full_name !== REPOSITORY
   ) {
-    fail('the matching release PR is not the expected open draft');
+    fail('the matching release PR is not the expected open lifecycle PR');
   }
 }
 
@@ -201,14 +201,14 @@ async function findDraftPull() {
     (pull) => pull.head?.ref === STAGED_LINE && pull.head?.repo?.full_name === REPOSITORY,
   );
   if (matching.length !== 1) fail(`expected one matching open release PR, found ${matching.length}`);
-  assertMatchingDraft(matching[0]);
+  assertMatchingReleasePull(matching[0]);
   return matching[0];
 }
 
 async function waitForPullHead(pullNumber, intent) {
   for (let attempt = 1; attempt <= 5; attempt += 1) {
     const pull = await github(`/repos/${REPOSITORY}/pulls/${pullNumber}`);
-    assertMatchingDraft(pull);
+    assertMatchingReleasePull(pull);
     if (pull.head.sha === intent) return pull;
     if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
   }
