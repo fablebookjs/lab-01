@@ -1,5 +1,15 @@
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import {
+  access,
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
@@ -13,6 +23,7 @@ export const BOOTSTRAP = Object.freeze({
   ]),
   tag: 'v1.0.0',
   commit: 'b59edf1d4c0fff51295327e8ce9e72678c336156',
+  tree: 'c17e4b63e8fd8b0bff28e1b9e24caa203d29d80e',
   registry: 'https://registry.npmjs.org/',
   packages: Object.freeze([
     Object.freeze({ name: '@fablebook/lab-01-core', version: '1.0.0', path: 'packages/core' }),
@@ -23,77 +34,141 @@ export const BOOTSTRAP = Object.freeze({
 export const CONFIRMATION =
   'publish @fablebook/lab-01-core@1.0.0 then @fablebook/lab-01-addon@1.0.0';
 
-const fail = (message) => {
-  throw new Error(message);
-};
+const TERMINATION_SIGNALS = Object.freeze(['SIGINT', 'SIGTERM', 'SIGHUP']);
+const SIGNAL_NUMBERS = Object.freeze({ SIGHUP: 1, SIGINT: 2, SIGTERM: 15 });
+const INTEGRITY_PATTERN = /^sha512-[A-Za-z0-9+/]{86}==$/;
+const SHASUM_PATTERN = /^[0-9a-f]{40}$/;
 
-const safeAmbientEnvironmentName = (name) => {
-  const lower = name.toLowerCase();
-  return (
-    ['path', 'shell', 'term', 'colorterm', 'lang', 'tz', 'tmpdir', 'tmp', 'temp'].includes(lower) ||
-    lower.startsWith('lc_') ||
-    ['browser', 'display', 'wayland_display', 'xdg_runtime_dir', 'no_color', 'force_color'].includes(
-      lower,
-    )
-  );
-};
-
-export function buildNpmEnvironment(ambient, { userConfig, globalConfig, home, cache }) {
-  const clean = {};
-  for (const [name, value] of Object.entries(ambient)) {
-    if (safeAmbientEnvironmentName(name)) clean[name] = value;
+class BootstrapError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'BootstrapError';
+    this.safeToReport = true;
   }
+}
+
+export class BootstrapInterrupted extends Error {
+  constructor(signal, phase) {
+    super(`bootstrap interrupted by ${signal}`);
+    this.name = 'BootstrapInterrupted';
+    this.signal = signal;
+    this.phase = phase ?? 'between-operations';
+    this.exitCode = 128 + SIGNAL_NUMBERS[signal];
+    this.safeToReport = true;
+  }
+}
+
+const fail = (message) => {
+  throw new BootstrapError(message);
+};
+
+const hashesEqual = (left, right) =>
+  left?.integrity === right?.integrity && left?.shasum === right?.shasum;
+
+export function hashBytes(bytes) {
   return {
-    ...clean,
-    HOME: home,
-    NPM_CONFIG_CACHE: cache,
-    NPM_CONFIG_GLOBALCONFIG: globalConfig,
-    NPM_CONFIG_LOGLEVEL: 'error',
-    NPM_CONFIG_REGISTRY: BOOTSTRAP.registry,
-    NPM_CONFIG_USERCONFIG: userConfig,
+    integrity: `sha512-${createHash('sha512').update(bytes).digest('base64')}`,
+    shasum: createHash('sha1').update(bytes).digest('hex'),
   };
 }
 
-export function validateArtifacts(artifacts) {
-  if (artifacts.repository !== BOOTSTRAP.repository) fail('unexpected repository identity');
-  if (artifacts.tag !== BOOTSTRAP.tag || artifacts.commit !== BOOTSTRAP.commit) {
-    fail('publish inputs are not the fixed v1.0.0 baseline');
-  }
-  if (artifacts.packages.length !== BOOTSTRAP.packages.length) {
-    fail('unexpected package count');
+export async function hashTarball(path) {
+  return hashBytes(await readFile(path));
+}
+
+class SignalController {
+  constructor({ processObject = process, graceMilliseconds = 2_000 } = {}) {
+    this.processObject = processObject;
+    this.graceMilliseconds = graceMilliseconds;
+    this.active = null;
+    this.interruption = null;
+    this.handlers = new Map();
+    this.abortController = new AbortController();
   }
 
-  for (let index = 0; index < BOOTSTRAP.packages.length; index += 1) {
-    const expected = BOOTSTRAP.packages[index];
-    const actual = artifacts.packages[index];
-    if (
-      actual.name !== expected.name ||
-      actual.version !== expected.version ||
-      actual.path !== expected.path
-    ) {
-      fail(`unexpected package at publish position ${index + 1}`);
+  install() {
+    for (const signal of TERMINATION_SIGNALS) {
+      const handler = () => this.interrupt(signal);
+      this.handlers.set(signal, handler);
+      this.processObject.on(signal, handler);
     }
-    if (!actual.tarball || !actual.integrity || !actual.shasum) {
-      fail(`incomplete packed artifact for ${expected.name}@${expected.version}`);
+  }
+
+  dispose() {
+    for (const [signal, handler] of this.handlers) {
+      this.processObject.off(signal, handler);
     }
+    this.handlers.clear();
+    if (this.active?.timer) clearTimeout(this.active.timer);
+  }
+
+  interrupt(signal) {
+    if (this.interruption) return;
+    const phase = this.active?.phase ?? 'between-operations';
+    this.interruption = new BootstrapInterrupted(signal, phase);
+    this.abortController.abort(this.interruption);
+    if (this.active) this.forward(this.active, signal);
+  }
+
+  forward(active, signal) {
+    const { child } = active;
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    let forwarded = false;
+    if (process.platform !== 'win32' && Number.isInteger(child.pid)) {
+      try {
+        process.kill(-child.pid, signal);
+        forwarded = true;
+      } catch {
+        // Fall back to the direct child when process-group signalling is unavailable.
+      }
+    }
+    if (!forwarded) child.kill(signal);
+    active.timer = setTimeout(() => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      if (process.platform !== 'win32' && Number.isInteger(child.pid)) {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+          return;
+        } catch {
+          // Fall back to the direct child.
+        }
+      }
+      child.kill('SIGKILL');
+    }, this.graceMilliseconds);
+    active.timer.unref();
+  }
+
+  attach(child, phase) {
+    if (this.active) fail('bootstrap attempted overlapping subprocesses');
+    this.active = { child, phase, timer: null };
+    if (this.interruption) this.forward(this.active, this.interruption.signal);
+  }
+
+  detach(child) {
+    if (this.active?.child !== child) return;
+    if (this.active.timer) clearTimeout(this.active.timer);
+    this.active = null;
+  }
+
+  throwIfInterrupted() {
+    if (this.interruption) throw this.interruption;
+  }
+
+  get signal() {
+    return this.abortController.signal;
   }
 }
 
-export function classifyExisting(artifact, existing) {
-  if (existing === null) return 'missing';
-  if (existing.integrity !== artifact.integrity || existing.shasum !== artifact.shasum) {
-    fail(`existing ${artifact.name}@${artifact.version} does not match the baseline artifact`);
-  }
-  return 'matching';
-}
-
-function run(file, args, options = {}) {
+function runCommand(controller, file, args, options = {}) {
+  controller.throwIfInterrupted();
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(file, args, {
       cwd: options.cwd,
       env: options.env,
+      detached: process.platform !== 'win32',
       stdio: options.interactive ? 'inherit' : ['ignore', 'pipe', 'pipe'],
     });
+    controller.attach(child, options.phase ?? file);
     let stdout = '';
     let stderr = '';
     if (!options.interactive) {
@@ -106,11 +181,18 @@ function run(file, args, options = {}) {
         stderr += chunk;
       });
     }
-    child.on('error', rejectPromise);
-    child.on('close', (code) => {
-      if (code === 0) resolvePromise({ stdout, stderr });
-      else {
-        const error = new Error(`${file} exited with status ${code}`);
+    child.once('error', (error) => {
+      controller.detach(child);
+      rejectPromise(error);
+    });
+    child.once('close', (code, signal) => {
+      controller.detach(child);
+      if (controller.interruption) {
+        rejectPromise(controller.interruption);
+      } else if (code === 0) {
+        resolvePromise({ stdout, stderr });
+      } else {
+        const error = new BootstrapError(`${file} exited with status ${code ?? signal}`);
         error.stdout = stdout;
         error.stderr = stderr;
         rejectPromise(error);
@@ -119,14 +201,82 @@ function run(file, args, options = {}) {
   });
 }
 
-const git = async (root, ...args) =>
-  (await run('git', args, { cwd: root, env: process.env })).stdout.trim();
+const safeAmbientEnvironmentName = (name) => {
+  const lower = name.toLowerCase();
+  return (
+    ['path', 'shell', 'term', 'colorterm', 'lang', 'tz', 'tmpdir', 'tmp', 'temp'].includes(lower) ||
+    lower.startsWith('lc_') ||
+    [
+      'browser',
+      'display',
+      'wayland_display',
+      'xdg_runtime_dir',
+      'no_color',
+      'force_color',
+    ].includes(lower)
+  );
+};
+
+export function buildNpmEnvironment(
+  ambient,
+  { userConfig, globalConfig, home, cache, temporary },
+) {
+  const clean = {};
+  for (const [name, value] of Object.entries(ambient)) {
+    if (safeAmbientEnvironmentName(name)) clean[name] = value;
+  }
+  return {
+    ...clean,
+    HOME: home,
+    USERPROFILE: home,
+    TMPDIR: temporary,
+    TMP: temporary,
+    TEMP: temporary,
+    NPM_CONFIG_AUDIT: 'false',
+    NPM_CONFIG_CACHE: cache,
+    NPM_CONFIG_FETCH_RETRIES: '0',
+    NPM_CONFIG_FUND: 'false',
+    NPM_CONFIG_GLOBALCONFIG: globalConfig,
+    NPM_CONFIG_LOGLEVEL: 'error',
+    NPM_CONFIG_PROVENANCE: 'false',
+    NPM_CONFIG_REGISTRY: BOOTSTRAP.registry,
+    NPM_CONFIG_UPDATE_NOTIFIER: 'false',
+    NPM_CONFIG_USERCONFIG: userConfig,
+    NPM_CONFIG_WORKSPACES: 'false',
+  };
+}
+
+export function validatePublishConfig(manifest, label) {
+  const publishConfig = manifest.publishConfig;
+  if (publishConfig === undefined) return;
+  if (!publishConfig || typeof publishConfig !== 'object' || Array.isArray(publishConfig)) {
+    fail(`${label} has malformed publishConfig`);
+  }
+  const prohibited = ['registry', 'access', 'provenance'].filter((key) =>
+    Object.hasOwn(publishConfig, key),
+  );
+  if (prohibited.length > 0) {
+    fail(`${label} has prohibited publishConfig overrides: ${prohibited.join(', ')}`);
+  }
+}
+
+export async function rejectProjectNpmConfigs(directory, relative = '') {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    const display = relative ? `${relative}/${entry.name}` : entry.name;
+    if (entry.name.toLowerCase() === '.npmrc') {
+      fail(`v1.0.0 contains prohibited project npm configuration at ${display}`);
+    }
+    if (entry.isDirectory()) await rejectProjectNpmConfigs(path, display);
+  }
+}
 
 async function readJson(path) {
   return JSON.parse(await readFile(path, 'utf8'));
 }
 
 async function validateBaselineTree(source) {
+  await rejectProjectNpmConfigs(source);
   const rootManifest = await readJson(join(source, 'package.json'));
   if (
     rootManifest.name !== '@fablebook/lab-01' ||
@@ -135,12 +285,14 @@ async function validateBaselineTree(source) {
   ) {
     fail('v1.0.0 has an unexpected root manifest');
   }
+  validatePublishConfig(rootManifest, 'v1.0.0 root manifest');
 
   for (const expected of BOOTSTRAP.packages) {
     const manifest = await readJson(join(source, expected.path, 'package.json'));
     if (manifest.name !== expected.name || manifest.version !== expected.version) {
       fail(`v1.0.0 has an unexpected manifest at ${expected.path}`);
     }
+    validatePublishConfig(manifest, `${expected.name}@${expected.version}`);
   }
 
   const addon = await readJson(join(source, 'packages/addon/package.json'));
@@ -149,153 +301,390 @@ async function validateBaselineTree(source) {
   }
 }
 
-async function prepareArtifacts(context) {
-  const root = resolve(await git(context.root, 'rev-parse', '--show-toplevel'));
-  const remote = await git(root, 'config', '--get', 'remote.origin.url');
+export function validatePackedManifest(manifest, expected) {
+  if (manifest.name !== expected.name || manifest.version !== expected.version) {
+    fail(`packed manifest is not ${expected.name}@${expected.version}`);
+  }
+  validatePublishConfig(manifest, `packed ${expected.name}@${expected.version}`);
+  if (
+    expected.name === '@fablebook/lab-01-addon' &&
+    manifest.dependencies?.['@fablebook/lab-01-core'] !== '1.0.0'
+  ) {
+    fail('packed add-on does not depend on the exact baseline core version');
+  }
+}
+
+export function validateArtifacts(artifacts) {
+  if (artifacts.repository !== BOOTSTRAP.repository) fail('unexpected repository identity');
+  if (
+    artifacts.source?.tag !== BOOTSTRAP.tag ||
+    artifacts.source?.commit !== BOOTSTRAP.commit ||
+    artifacts.source?.tree !== BOOTSTRAP.tree
+  ) {
+    fail('publish inputs are not the fixed v1.0.0 commit and tree');
+  }
+  if (artifacts.packages.length !== BOOTSTRAP.packages.length) fail('unexpected package count');
+
+  for (let index = 0; index < BOOTSTRAP.packages.length; index += 1) {
+    const expected = BOOTSTRAP.packages[index];
+    const actual = artifacts.packages[index];
+    if (
+      actual.name !== expected.name ||
+      actual.version !== expected.version ||
+      actual.path !== expected.path
+    ) {
+      fail(`unexpected package at publish position ${index + 1}`);
+    }
+    if (
+      !actual.tarball ||
+      !INTEGRITY_PATTERN.test(actual.integrity ?? '') ||
+      !SHASUM_PATTERN.test(actual.shasum ?? '')
+    ) {
+      fail(`incomplete packed artifact for ${expected.name}@${expected.version}`);
+    }
+  }
+}
+
+export function classifyExisting(artifact, existing) {
+  if (existing === null) return 'missing';
+  if (
+    !hashesEqual(artifact, existing.metadata) ||
+    !hashesEqual(artifact, existing.tarball) ||
+    !hashesEqual(existing.metadata, existing.tarball)
+  ) {
+    fail(`existing ${artifact.name}@${artifact.version} does not match the baseline artifact`);
+  }
+  return 'matching';
+}
+
+const npmArguments = (context, args) => [
+  ...args,
+  `--@fablebook:registry=${BOOTSTRAP.registry}`,
+  `--globalconfig=${context.globalConfig}`,
+  `--registry=${BOOTSTRAP.registry}`,
+  `--userconfig=${context.userConfig}`,
+  '--workspaces=false',
+];
+
+export async function prepareArtifacts(context) {
+  const git = async (...args) =>
+    (
+      await context.run('git', args, {
+        cwd: context.root,
+        env: process.env,
+        phase: 'git-read',
+      })
+    ).stdout.trim();
+  const root = resolve(await git('rev-parse', '--show-toplevel'));
+  const remote = await git('config', '--get', 'remote.origin.url');
   if (!BOOTSTRAP.remoteUrls.includes(remote)) fail('refusing an unexpected repository remote');
 
-  const commit = await git(root, 'rev-parse', `${BOOTSTRAP.tag}^{commit}`);
-  if (commit !== BOOTSTRAP.commit) fail(`${BOOTSTRAP.tag} does not identify the fixed baseline commit`);
+  const commit = await git('rev-parse', `${BOOTSTRAP.tag}^{commit}`);
+  if (commit !== BOOTSTRAP.commit) {
+    fail(`${BOOTSTRAP.tag} does not identify the fixed baseline commit`);
+  }
+  const tree = await git('rev-parse', `${commit}^{tree}`);
+  if (tree !== BOOTSTRAP.tree) fail(`${BOOTSTRAP.tag} does not identify the fixed baseline tree`);
+  await context.testHooks?.afterBaselineResolved?.({ root, commit, tree });
 
   const archive = join(context.temporaryDirectory, 'baseline.tar');
-  await run('git', ['archive', '--format=tar', `--output=${archive}`, BOOTSTRAP.tag], {
+  await context.run('git', ['archive', '--format=tar', `--output=${archive}`, commit], {
     cwd: root,
     env: process.env,
+    phase: 'archive-baseline',
   });
-  await run('tar', ['-xf', archive, '-C', context.source], { env: process.env });
+  await context.run('tar', ['-xf', archive, '-C', context.source], {
+    cwd: context.commandDirectory,
+    env: process.env,
+    phase: 'extract-baseline',
+  });
   await validateBaselineTree(context.source);
 
   const packages = [];
   for (const expected of BOOTSTRAP.packages) {
-    const result = await run(
+    const result = await context.run(
       'npm',
-      [
+      npmArguments(context, [
         'pack',
         '--json',
         '--ignore-scripts',
         `--pack-destination=${context.packs}`,
         join(context.source, expected.path),
-      ],
-      { cwd: context.source, env: context.npmEnvironment },
+      ]),
+      {
+        cwd: context.commandDirectory,
+        env: context.npmEnvironment,
+        phase: `pack:${expected.name}`,
+      },
     );
     const packed = JSON.parse(result.stdout);
-    if (!Array.isArray(packed) || packed.length !== 1) fail(`npm pack returned unexpected output`);
-    const [artifact] = packed;
-    packages.push({
-      ...expected,
-      tarball: join(context.packs, basename(artifact.filename)),
-      integrity: artifact.integrity,
-      shasum: artifact.shasum,
+    if (!Array.isArray(packed) || packed.length !== 1) fail('npm pack returned unexpected output');
+    const [metadata] = packed;
+    if (
+      metadata.name !== expected.name ||
+      metadata.version !== expected.version ||
+      basename(metadata.filename ?? '') !== metadata.filename ||
+      !INTEGRITY_PATTERN.test(metadata.integrity ?? '') ||
+      !SHASUM_PATTERN.test(metadata.shasum ?? '')
+    ) {
+      fail(`npm pack produced an unexpected artifact for ${expected.name}@${expected.version}`);
+    }
+    const tarball = join(context.packs, metadata.filename);
+    const manifestResult = await context.run('tar', ['-xOf', tarball, 'package/package.json'], {
+      cwd: context.commandDirectory,
+      env: process.env,
+      phase: `inspect-pack:${expected.name}`,
     });
+    validatePackedManifest(JSON.parse(manifestResult.stdout), expected);
+    const hashes = await hashTarball(tarball);
+    if (!hashesEqual(hashes, metadata)) {
+      fail(
+        `npm pack hashes do not match the packed bytes for ${expected.name}@${expected.version}`,
+      );
+    }
+    packages.push({ ...expected, tarball, ...hashes });
   }
 
-  return { repository: BOOTSTRAP.repository, tag: BOOTSTRAP.tag, commit, packages };
+  return {
+    repository: BOOTSTRAP.repository,
+    source: { tag: BOOTSTRAP.tag, commit, tree },
+    packages,
+  };
 }
 
-const npmArguments = (context, args) => [
-  ...args,
-  `--globalconfig=${context.globalConfig}`,
-  `--registry=${BOOTSTRAP.registry}`,
-  `--userconfig=${context.userConfig}`,
-];
+function validateRegistryTarballUrl(value, artifact) {
+  const url = new URL(value);
+  const registry = new URL(BOOTSTRAP.registry);
+  if (url.origin !== registry.origin || url.protocol !== 'https:') {
+    fail(`registry tarball for ${artifact.name}@${artifact.version} escaped npmjs`);
+  }
+  return url;
+}
 
 async function queryVersion(context, artifact) {
   try {
-    const result = await run(
+    const result = await context.run(
       'npm',
       npmArguments(context, ['view', `${artifact.name}@${artifact.version}`, '--json']),
-      { cwd: context.source, env: context.npmEnvironment },
+      {
+        cwd: context.commandDirectory,
+        env: context.npmEnvironment,
+        phase: `view:${artifact.name}`,
+      },
     );
     const manifest = JSON.parse(result.stdout);
-    if (!manifest.dist?.integrity || !manifest.dist?.shasum) {
+    if (
+      manifest.name !== artifact.name ||
+      manifest.version !== artifact.version ||
+      !INTEGRITY_PATTERN.test(manifest.dist?.integrity ?? '') ||
+      !SHASUM_PATTERN.test(manifest.dist?.shasum ?? '') ||
+      typeof manifest.dist?.tarball !== 'string'
+    ) {
       fail(`registry metadata is incomplete for ${artifact.name}@${artifact.version}`);
     }
-    return { integrity: manifest.dist.integrity, shasum: manifest.dist.shasum };
+    const tarballUrl = validateRegistryTarballUrl(manifest.dist.tarball, artifact);
+    const response = await fetch(tarballUrl, { signal: context.signal });
+    if (!response.ok) fail(`registry tarball read failed for ${artifact.name}@${artifact.version}`);
+    return {
+      metadata: { integrity: manifest.dist.integrity, shasum: manifest.dist.shasum },
+      tarball: hashBytes(Buffer.from(await response.arrayBuffer())),
+    };
   } catch (error) {
+    context.throwIfInterrupted();
     const diagnostic = `${error.stdout ?? ''}\n${error.stderr ?? ''}`;
     if (/\bE404\b/.test(diagnostic)) return null;
-    if (error.message.startsWith('registry metadata is incomplete')) throw error;
+    if (error instanceof BootstrapError && error.message.startsWith('registry ')) throw error;
     fail(`read-only registry query failed for ${artifact.name}@${artifact.version}`);
   }
 }
 
 async function login(context) {
-  await run(
+  await context.run(
     'npm',
     npmArguments(context, ['login', '--auth-type=web', '--scope=@fablebook']),
-    { cwd: context.source, env: context.npmEnvironment, interactive: true },
+    {
+      cwd: context.commandDirectory,
+      env: context.npmEnvironment,
+      interactive: true,
+      phase: 'npm-login',
+    },
   );
   try {
-    await run('npm', npmArguments(context, ['whoami']), {
-      cwd: context.source,
+    await context.run('npm', npmArguments(context, ['whoami']), {
+      cwd: context.commandDirectory,
       env: context.npmEnvironment,
+      phase: 'npm-whoami',
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof BootstrapInterrupted) throw error;
     fail('isolated npm authentication could not be verified');
   }
 }
 
+async function verifyBeforePublish(_context, artifact) {
+  const hashes = await hashTarball(artifact.tarball);
+  if (!hashesEqual(hashes, artifact)) {
+    fail(`packed bytes changed before publishing ${artifact.name}@${artifact.version}`);
+  }
+  return hashes;
+}
+
 async function publish(context, artifact) {
-  await run(
+  await context.run(
     'npm',
-    npmArguments(context, ['publish', artifact.tarball, '--access=public', '--ignore-scripts']),
-    { cwd: context.source, env: context.npmEnvironment },
+    npmArguments(context, [
+      'publish',
+      artifact.tarball,
+      '--access=public',
+      '--ignore-scripts',
+      '--provenance=false',
+    ]),
+    {
+      cwd: context.commandDirectory,
+      env: context.npmEnvironment,
+      phase: `npm-publish:${artifact.name}`,
+    },
   );
 }
 
-const defaultOperations = { prepareArtifacts, queryVersion, login, publish };
+export const bootstrapOperations = {
+  prepareArtifacts,
+  queryVersion,
+  login,
+  verifyBeforePublish,
+  publish,
+};
 
-async function terminalPrompt(question) {
+async function terminalPrompt(question, context) {
   const terminal = createInterface({ input: process.stdin, output: process.stdout });
   try {
-    return await terminal.question(question);
+    return await terminal.question(question, { signal: context.signal });
+  } catch {
+    context.throwIfInterrupted();
+    throw new BootstrapError('operator confirmation was interrupted');
   } finally {
     terminal.close();
   }
 }
 
-function safeSummary(mode, artifacts, states) {
+function packageRecords() {
+  return new Map(
+    BOOTSTRAP.packages.map((package_, index) => [
+      package_.name,
+      {
+        name: package_.name,
+        version: package_.version,
+        order: index + 1,
+        expected: null,
+        observed: null,
+        state: 'not-checked',
+      },
+    ]),
+  );
+}
+
+function observe(records, artifact, existing, state) {
+  const record = records.get(artifact.name);
+  record.observed = existing;
+  record.state = state;
+}
+
+function safeEvidence({ mode, outcome, artifacts, records, interruption, cleanupRemoved }) {
   return {
+    schemaVersion: 1,
     mode,
-    repository: artifacts.repository,
-    source: { tag: artifacts.tag, commit: artifacts.commit },
+    outcome,
+    repository: BOOTSTRAP.repository,
+    source: artifacts?.source ?? {
+      tag: BOOTSTRAP.tag,
+      commit: BOOTSTRAP.commit,
+      tree: BOOTSTRAP.tree,
+    },
     registry: BOOTSTRAP.registry,
-    packages: artifacts.packages.map((artifact, index) => ({
-      name: artifact.name,
-      version: artifact.version,
-      order: index + 1,
-      integrity: artifact.integrity,
-      state: states.get(artifact.name),
-    })),
+    packages: [...records.values()],
+    interruption: interruption
+      ? {
+          signal: interruption.signal,
+          phase: interruption.phase,
+          registryState: 'unknown-requires-integrity-readback-before-resume',
+        }
+      : null,
+    cleanup: { temporaryStateRemoved: cleanupRemoved },
   };
+}
+
+function markInterruptedRecord(records, interruption) {
+  const prefix = 'npm-publish:';
+  if (interruption.phase.startsWith(prefix)) {
+    const name = interruption.phase.slice(prefix.length);
+    const record = records.get(name);
+    if (record) record.state = 'interrupted-unknown-registry-state';
+  }
+}
+
+async function assertRemoved(path) {
+  try {
+    await access(path);
+    return false;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    return true;
+  }
 }
 
 export async function runBootstrap({
   mode = 'preflight',
   root = process.cwd(),
   ambientEnvironment = process.env,
-  operations = defaultOperations,
+  operations = bootstrapOperations,
   prompt = terminalPrompt,
   interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY),
   log = (value) => console.log(JSON.stringify(value, null, 2)),
   temporaryBase = tmpdir(),
+  testHooks = {},
+  signalController = new SignalController(),
 } = {}) {
   if (!['preflight', 'publish'].includes(mode)) fail(`unsupported mode ${mode}`);
 
-  const temporaryDirectory = await mkdtemp(join(temporaryBase, 'fablebook-npm-bootstrap-'));
-  await chmod(temporaryDirectory, 0o700);
-  const source = join(temporaryDirectory, 'source');
-  const packs = join(temporaryDirectory, 'packs');
-  const home = join(temporaryDirectory, 'home');
-  const cache = join(temporaryDirectory, 'cache');
-  const userConfig = join(temporaryDirectory, 'npmrc');
-  const globalConfig = join(temporaryDirectory, 'global-npmrc');
+  const records = packageRecords();
+  let artifacts;
+  let outcome = 'failed';
+  let caught;
+  let cleanupRemoved = false;
+  let temporaryDirectory;
+  signalController.install();
 
   try {
-    await Promise.all([mkdir(source), mkdir(packs), mkdir(home), mkdir(cache)]);
+    temporaryDirectory = await mkdtemp(join(temporaryBase, 'fablebook-npm-bootstrap-'));
+    signalController.throwIfInterrupted();
+    await chmod(temporaryDirectory, 0o700);
+    const source = join(temporaryDirectory, 'source');
+    const packs = join(temporaryDirectory, 'packs');
+    const home = join(temporaryDirectory, 'home');
+    const cache = join(temporaryDirectory, 'cache');
+    const temporary = join(temporaryDirectory, 'tmp');
+    const commandDirectory = join(temporaryDirectory, 'command');
+    const userConfig = join(temporaryDirectory, 'npmrc');
+    const globalConfig = join(temporaryDirectory, 'global-npmrc');
+    await Promise.all([
+      mkdir(source),
+      mkdir(packs),
+      mkdir(home),
+      mkdir(cache),
+      mkdir(temporary),
+      mkdir(commandDirectory),
+    ]);
     await writeFile(
       userConfig,
-      `registry=${BOOTSTRAP.registry}\n@fablebook:registry=${BOOTSTRAP.registry}\n`,
+      [
+        `registry=${BOOTSTRAP.registry}`,
+        `@fablebook:registry=${BOOTSTRAP.registry}`,
+        'audit=false',
+        'fund=false',
+        'provenance=false',
+        'update-notifier=false',
+        '',
+      ].join('\n'),
       { mode: 0o600 },
     );
     await writeFile(globalConfig, '', { mode: 0o600 });
@@ -304,6 +693,7 @@ export async function runBootstrap({
       globalConfig,
       home,
       cache,
+      temporary,
     });
     const context = {
       root,
@@ -312,64 +702,154 @@ export async function runBootstrap({
       packs,
       home,
       cache,
+      temporary,
+      commandDirectory,
       userConfig,
       globalConfig,
       npmEnvironment,
+      signal: signalController.signal,
+      throwIfInterrupted: () => signalController.throwIfInterrupted(),
+      run: (file, args, options) => runCommand(signalController, file, args, options),
+      testHooks,
     };
 
-    const artifacts = await operations.prepareArtifacts(context);
+    artifacts = await operations.prepareArtifacts(context);
+    signalController.throwIfInterrupted();
     validateArtifacts(artifacts);
-    const states = new Map();
     for (const artifact of artifacts.packages) {
-      states.set(artifact.name, classifyExisting(artifact, await operations.queryVersion(context, artifact)));
+      records.get(artifact.name).expected = {
+        integrity: artifact.integrity,
+        shasum: artifact.shasum,
+      };
+      const existing = await operations.queryVersion(context, artifact);
+      signalController.throwIfInterrupted();
+      observe(records, artifact, existing, existing === null ? 'missing' : 'observed-unverified');
+      const state = classifyExisting(artifact, existing);
+      observe(records, artifact, existing, state === 'matching' ? 'existing-verified' : 'missing');
     }
 
     if (mode === 'preflight') {
-      log(safeSummary('preflight', artifacts, states));
-      return safeSummary('preflight', artifacts, states);
-    }
-
-    const missing = artifacts.packages.filter((artifact) => states.get(artifact.name) === 'missing');
-    if (missing.length === 0) {
-      log(safeSummary('already-complete', artifacts, states));
-      return safeSummary('already-complete', artifacts, states);
-    }
-    if (!interactive) fail('publication requires an interactive operator terminal');
-    const answer = await prompt(`Type exactly \"${CONFIRMATION}\" to continue: `);
-    if (answer !== CONFIRMATION) fail('operator confirmation did not match; nothing was published');
-
-    await operations.login(context);
-    for (const artifact of artifacts.packages) {
-      const immediatelyExisting = await operations.queryVersion(context, artifact);
-      if (classifyExisting(artifact, immediatelyExisting) === 'matching') {
-        states.set(artifact.name, 'matching');
-        continue;
-      }
-
-      try {
-        await operations.publish(context, artifact);
-      } catch {
-        const raced = await operations.queryVersion(context, artifact);
-        if (classifyExisting(artifact, raced) === 'matching') {
-          states.set(artifact.name, 'matching');
-          continue;
+      outcome = 'preflight';
+    } else {
+      const missing = artifacts.packages.filter(
+        (artifact) => records.get(artifact.name).state === 'missing',
+      );
+      if (missing.length === 0) {
+        outcome = 'already-complete';
+      } else {
+        if (!interactive) fail('publication requires an interactive operator terminal');
+        const answer = await prompt(`Type exactly \"${CONFIRMATION}\" to continue: `, context);
+        signalController.throwIfInterrupted();
+        if (answer !== CONFIRMATION) {
+          fail('operator confirmation did not match; nothing was published');
         }
-        fail(`publication stopped at ${artifact.name}@${artifact.version}; rerun to resume safely`);
-      }
 
-      if (
-        classifyExisting(artifact, await operations.queryVersion(context, artifact)) !== 'matching'
-      ) {
-        fail(`published ${artifact.name}@${artifact.version} was not verified by registry read-back`);
+        await operations.login(context);
+        signalController.throwIfInterrupted();
+        for (const artifact of artifacts.packages) {
+          const immediatelyExisting = await operations.queryVersion(context, artifact);
+          signalController.throwIfInterrupted();
+          observe(
+            records,
+            artifact,
+            immediatelyExisting,
+            immediatelyExisting === null ? 'missing' : 'observed-unverified',
+          );
+          if (classifyExisting(artifact, immediatelyExisting) === 'matching') {
+            observe(records, artifact, immediatelyExisting, 'existing-verified');
+            continue;
+          }
+          observe(records, artifact, null, 'ready-to-publish');
+
+          const immediateHashes = await operations.verifyBeforePublish(context, artifact);
+          signalController.throwIfInterrupted();
+          if (!hashesEqual(immediateHashes, artifact)) {
+            fail(`packed bytes changed before publishing ${artifact.name}@${artifact.version}`);
+          }
+          records.get(artifact.name).state = 'publishing-unknown-registry-state';
+          try {
+            await operations.publish(context, artifact);
+            signalController.throwIfInterrupted();
+          } catch (error) {
+            if (error instanceof BootstrapInterrupted) throw error;
+            records.get(artifact.name).state = 'publish-failed-unknown-registry-state';
+            const raced = await operations.queryVersion(context, artifact);
+            signalController.throwIfInterrupted();
+            observe(
+              records,
+              artifact,
+              raced,
+              raced === null ? 'publish-failed-unknown-registry-state' : 'observed-unverified',
+            );
+            if (classifyExisting(artifact, raced) === 'matching') {
+              observe(records, artifact, raced, 'existing-verified-after-publish-error');
+              continue;
+            }
+            fail(
+              `publication stopped at ${artifact.name}@${artifact.version}; rerun to resume safely`,
+            );
+          }
+
+          const published = await operations.queryVersion(context, artifact);
+          signalController.throwIfInterrupted();
+          observe(
+            records,
+            artifact,
+            published,
+            published === null ? 'published-but-unverified' : 'observed-unverified',
+          );
+          if (classifyExisting(artifact, published) !== 'matching') {
+            observe(records, artifact, published, 'published-but-unverified');
+            fail(
+              `published ${artifact.name}@${artifact.version} was not verified by registry read-back`,
+            );
+          }
+          observe(records, artifact, published, 'published-and-verified');
+        }
+        outcome = 'published';
       }
-      states.set(artifact.name, 'published-and-verified');
     }
-
-    log(safeSummary('published', artifacts, states));
-    return safeSummary('published', artifacts, states);
+  } catch (error) {
+    caught = error;
+    if (error instanceof BootstrapInterrupted) {
+      outcome = 'interrupted';
+      markInterruptedRecord(records, error);
+    }
   } finally {
-    await rm(temporaryDirectory, { recursive: true, force: true });
+    try {
+      if (temporaryDirectory) {
+        await rm(temporaryDirectory, { recursive: true, force: true });
+        cleanupRemoved = await assertRemoved(temporaryDirectory);
+      } else {
+        cleanupRemoved = true;
+      }
+    } catch (error) {
+      cleanupRemoved = false;
+      if (!caught) caught = error;
+      outcome = caught instanceof BootstrapInterrupted ? 'interrupted' : 'failed';
+    }
+    signalController.dispose();
   }
+
+  if (signalController.interruption) {
+    caught = signalController.interruption;
+    outcome = 'interrupted';
+    markInterruptedRecord(records, caught);
+  }
+  const evidence = safeEvidence({
+    mode,
+    outcome,
+    artifacts,
+    records,
+    interruption: caught instanceof BootstrapInterrupted ? caught : null,
+    cleanupRemoved,
+  });
+  log(evidence);
+  if (caught) {
+    caught.evidence = evidence;
+    throw caught;
+  }
+  return evidence;
 }
 
 function parseMode(arguments_) {
@@ -380,9 +860,18 @@ function parseMode(arguments_) {
   fail('usage: node scripts/bootstrap-npm-baseline.mjs [--preflight|--publish]');
 }
 
+export function exitForInterruption(error) {
+  if (!(error instanceof BootstrapInterrupted)) return false;
+  process.kill(process.pid, error.signal);
+  return true;
+}
+
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   runBootstrap({ mode: parseMode(process.argv.slice(2)) }).catch((error) => {
-    console.error(error.message);
+    if (exitForInterruption(error)) return;
+    console.error(
+      error.safeToReport ? error.message : 'bootstrap failed closed; inspect sanitized evidence',
+    );
     process.exitCode = 1;
   });
 }

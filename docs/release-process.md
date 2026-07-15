@@ -71,11 +71,22 @@ the non-mutating plan first:
 node scripts/bootstrap-npm-baseline.mjs --preflight
 ```
 
-The script rejects any repository, tag commit, package, version, or package
-order outside its fixed allowlist. It archives the exact `v1.0.0` commit—not
-the current release branch—packs core before add-on, binds the default registry
-and `@fablebook` scope to `https://registry.npmjs.org/`, and compares any
-existing version's integrity and shasum with the locally packed artifact.
+The script resolves `v1.0.0` once and requires exact commit
+`b59edf1d4c0fff51295327e8ce9e72678c336156` and tree
+`c17e4b63e8fd8b0bff28e1b9e24caa203d29d80e`. It archives only that resolved
+commit—not the mutable tag name or current release branch—and rejects any
+repository, package, version, package order, project `.npmrc`, or package
+publication override outside its fixed contract. Core is packed before the
+add-on. The default registry and `@fablebook` scope are both bound to
+`https://registry.npmjs.org/` in isolated config and command arguments.
+
+Each packed manifest is re-read from its tarball. SHA-512 SRI and SHA-1 are
+calculated from the actual packed bytes, compared with `npm pack` metadata,
+and recalculated immediately before publication. Existing or newly published
+versions are accepted only when both registry metadata and a freshly
+downloaded tarball match those expected hashes. Sanitized output retains the
+expected and observed hashes and state without npm credentials, configuration
+contents, raw npm diagnostics, or temporary paths.
 
 Only the operator may start the mutating mode in an interactive terminal:
 
@@ -89,6 +100,15 @@ does not accept inherited npm configuration or credential variables and
 removes its config, cache, packed artifacts, and login material on success or
 failure. It never writes the repository or the normal `~/.npmrc`.
 
+On `SIGINT`, `SIGTERM`, or `SIGHUP`, the script forwards the signal to the
+active login/publish process group where supported, awaits its exit, removes
+all temporary npm state, records an interrupted/unknown-registry-state result,
+and exits with the same signal semantics. A restart always begins with npm
+integrity read-back; it never assumes whether an interrupted publish completed.
+`SIGKILL`, host loss, or storage failure cannot guarantee in-process cleanup,
+so an operator must remove any surviving `fablebook-npm-bootstrap-*` directory
+and rerun `--preflight` before resuming.
+
 Publication is bounded to `@fablebook/lab-01-core@1.0.0` followed by
 `@fablebook/lab-01-addon@1.0.0`, always with public access. If core exists and
 matches, a rerun skips it and continues with the add-on. An existing mismatch
@@ -96,6 +116,10 @@ or incomplete registry response stops without overwrite; after any failure,
 rerun `--preflight` before deciding whether to resume. This bootstrap does not
 publish `1.0.1`, merge the release PR, or alter any Git ref, tag, Release,
 workflow, Pages setting, or Storybook resource.
+
+This operator-only `1.0.0` bootstrap is the only current public npm write in
+the repository. No workflow invokes it, no workflow publishes a package, and
+no `1.0.1` publication automation exists yet.
 
 ## Ready-state exact-version QA
 
