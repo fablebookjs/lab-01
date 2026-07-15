@@ -16,9 +16,10 @@ npm install
 npm test
 ```
 
-The first draft release PR proposes `1.0.1` from a structured empty commit on
-`staged/v1.0`. Its base is `releases/v1.0`, which initially points to the same
-commit as `main` and tag `v1.0.0`.
+The draft release PR proposes `1.0.1` from a structured empty commit on
+`staged/v1.0`. Its base is `releases/v1.0`, which started at the same commit as
+`main` and tag `v1.0.0`. Pushes to the release line now automatically refresh
+that same draft PR from the exact current release-line head.
 
 See [the release-process note](docs/release-process.md) for the current contract
 and explicit automation limits.
