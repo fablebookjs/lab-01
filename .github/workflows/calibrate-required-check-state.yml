@@ -1,4 +1,4 @@
-name: Calibrate required-check PR state
+name: Calibrate current required-check state
 
 on:
   workflow_dispatch:
@@ -15,12 +15,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: calibration-g1-required-check-pr-state
+  group: calibration-g1-required-check-current-state
   cancel-in-progress: false
 
 jobs:
   maintain-state:
-    name: Maintain required-check PR calibration state
+    name: Maintain current required-check calibration state
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

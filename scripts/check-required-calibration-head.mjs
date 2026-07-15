@@ -7,6 +7,7 @@ import {
   readFileSync,
 } from 'node:fs';
 import { Buffer } from 'node:buffer';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   Git,
@@ -17,10 +18,10 @@ import {
 } from './calibrate-required-check-state.mjs';
 
 export const AUTHORIZATION_PREFIX = 'Authorized-Head-SHA:';
-export const PULL_REQUEST_ACTIONS = ['opened', 'synchronize', 'reopened', 'edited'];
-export const PROTECTED_PULL_REQUESTS = new Set([12, 16, 19]);
+export const PULL_REQUEST_ACTIONS = ['opened', 'reopened', 'edited'];
+export const PROTECTED_PULL_REQUESTS = new Set([12, 16, 19, 21]);
 
-const BRANCH_NAMESPACE = 'calibration/g1/required-check-pr';
+const BRANCH_NAMESPACE = 'calibration/g1/required-check-current';
 const BASE_REF = `${BRANCH_NAMESPACE}/base`;
 const HEAD_REF = `${BRANCH_NAMESPACE}/head`;
 const MAX_EVENT_BYTES = 1024 * 1024;
@@ -34,6 +35,10 @@ function requireObject(value, description) {
 
 function requireExact(value, expected, description) {
   if (value !== expected) throw new Error(`${description} must be exact ${expected}`);
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
 export function parseAuthorizedHead(body) {
@@ -87,16 +92,9 @@ export function readPullRequestEvent(path) {
   return requireObject(parsed, 'GitHub event payload');
 }
 
-function assertActionCoherence(event, action, headSha, body) {
-  if (action === 'synchronize') {
-    assertSha(event.before);
-    assertSha(event.after);
-    if (event.before === event.after) throw new Error('Synchronize event must change the head SHA');
-    if (event.after !== headSha) throw new Error('Synchronize event after SHA is not current PR head');
-    return;
-  }
+function assertActionCoherence(event, action, body) {
   if (Object.hasOwn(event, 'before') || Object.hasOwn(event, 'after')) {
-    throw new Error(`${action} event must not carry synchronize SHA fields`);
+    throw new Error(`${action} event must not carry head-transition SHA fields`);
   }
   if (action === 'edited') {
     const changes = requireObject(event.changes, 'Edited event changes');
@@ -104,9 +102,14 @@ function assertActionCoherence(event, action, headSha, body) {
     if (typeof bodyChange.from !== 'string' || bodyChange.from === body) {
       throw new Error('Edited event must carry a changed prior pull request body');
     }
+    return {
+      priorAuthorizedSha: parseAuthorizedHead(bodyChange.from),
+      priorBodySha256: sha256(bodyChange.from),
+    };
   } else if (Object.hasOwn(event, 'changes')) {
     throw new Error(`${action} event must not carry edited change fields`);
   }
+  return null;
 }
 
 export function evaluatePullRequestHead({
@@ -148,14 +151,23 @@ export function evaluatePullRequestHead({
   requireExact(requireObject(head.repo, 'Pull request head repository').full_name, REPOSITORY, 'Head repository');
   assertSha(base.sha);
   assertSha(head.sha);
-  assertActionCoherence(event, event.action, head.sha, pullRequest.body);
+  const priorAuthorization = assertActionCoherence(
+    event,
+    event.action,
+    pullRequest.body,
+  );
+  const priorAuthorizedSha = priorAuthorization?.priorAuthorizedSha ?? null;
+  const priorBodySha256 = priorAuthorization?.priorBodySha256 ?? null;
+  const authorizedSha = parseAuthorizedHead(pullRequest.body);
+  const currentBodySha256 = sha256(pullRequest.body);
 
   git.assertNoHostileEnvironment();
   git.assertTrustedRemote();
   const baseRemoteRef = calibrationRef('base');
+  const aRemoteRef = calibrationRef('a');
   const headRemoteRef = calibrationRef('head');
   const mergeRemoteRef = `refs/pull/${number}/merge`;
-  const remoteRefs = [baseRemoteRef, headRemoteRef, mergeRemoteRef];
+  const remoteRefs = [baseRemoteRef, aRemoteRef, headRemoteRef, mergeRemoteRef];
   const advertisement = parseRemoteAdvertisement(
     git.text(['ls-remote', '--refs', git.remote, ...remoteRefs], { network: true }),
     remoteRefs,
@@ -177,7 +189,17 @@ export function evaluatePullRequestHead({
     throw new Error(`Local HEAD ${localHead} is not trusted event base SHA ${base.sha}`);
   }
 
-  const authorizedSha = parseAuthorizedHead(pullRequest.body);
+  if (event.action === 'edited') {
+    if (priorAuthorizedSha !== advertisement[aRemoteRef]) {
+      throw new Error('Edited prior authorization is not exact remote calibration A');
+    }
+    if (authorizedSha !== advertisement[headRemoteRef]) {
+      throw new Error('Edited current authorization is not exact current remote head');
+    }
+    if (priorAuthorizedSha === authorizedSha) {
+      throw new Error('Edited event did not change the authorized SHA');
+    }
+  }
   const authorized = authorizedSha === head.sha;
   return {
     authorized,
@@ -187,8 +209,12 @@ export function evaluatePullRequestHead({
     baseSha: base.sha,
     headSha: head.sha,
     authorizedSha,
+    priorAuthorizedSha,
+    priorBodySha256,
+    currentBodySha256,
     localHead,
     remoteBaseSha: advertisement[baseRemoteRef],
+    remoteASha: advertisement[aRemoteRef],
     remoteHeadSha: advertisement[headRemoteRef],
     remoteMergeSha: advertisement[mergeRemoteRef],
   };
@@ -204,6 +230,9 @@ export function buildCheckSummary(result) {
     `- Trusted base SHA: \`${result.baseSha}\`\n` +
     `- Current head SHA: \`${result.headSha}\`\n` +
     `- PR-body authorized SHA: \`${result.authorizedSha}\`\n` +
+    `- Prior PR-body authorized SHA: \`${result.priorAuthorizedSha ?? 'not-applicable'}\`\n` +
+    `- Prior PR-body SHA-256: \`${result.priorBodySha256 ?? 'not-applicable'}\`\n` +
+    `- Current PR-body SHA-256: \`${result.currentBodySha256}\`\n` +
     `- Current remote merge SHA: \`${result.remoteMergeSha}\`\n` +
     `- Permission used: \`contents: read\` only\n`
   );
