@@ -17,6 +17,7 @@ import {
   StaleLeaseError,
   STAGED_REF,
   TAG_REF,
+  buildRefAdvertisementArguments,
   buildLeasedPushArguments,
   classifyNextAction,
   githubReleaseBody,
@@ -1221,6 +1222,53 @@ test('push protocol disables tag following and distinguishes generic failures fr
     /authentication or transport failure/,
   );
   assert.equal(generic.gitAdapter.refs[RELEASE_REF].sha, ids.merge);
+});
+
+test('remote ref advertisement requests only heads and tags while retaining strict namespace parsing', async () => {
+  assert.deepEqual(
+    buildRefAdvertisementArguments(),
+    ['ls-remote', '--refs', 'origin', 'refs/heads/*', 'refs/tags/*'],
+  );
+
+  const root = await mkdtemp(join(tmpdir(), 'finalizer-advertisement-'));
+  try {
+    const remote = join(root, 'remote.git');
+    const work = join(root, 'work');
+    execFileSync('git', ['init', '--bare', remote], { stdio: 'ignore' });
+    execFileSync('git', ['init', work], { stdio: 'ignore' });
+    execFileSync('git', ['-C', work, 'config', 'user.name', 'Test']);
+    execFileSync('git', ['-C', work, 'config', 'user.email', 'test@example.invalid']);
+    execFileSync('git', ['-C', work, 'commit', '--allow-empty', '-m', 'seed'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', work, 'remote', 'add', 'origin', remote]);
+    const head = execFileSync('git', ['-C', work, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    execFileSync('git', ['-C', work, 'push', 'origin', `HEAD:refs/heads/main`], { stdio: 'ignore' });
+    execFileSync('git', ['-C', remote, 'update-ref', 'refs/heads/unrelated', head]);
+    execFileSync('git', ['-C', remote, 'update-ref', 'refs/tags/v1.0.1', head]);
+    execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/12/head', head]);
+    execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/999/merge', head]);
+
+    const output = execFileSync('git', ['-C', work, ...buildRefAdvertisementArguments()], { encoding: 'utf8' });
+    const rows = output.trim().split('\n');
+    assert.deepEqual(rows, [
+      `${head}\trefs/heads/main`,
+      `${head}\trefs/heads/unrelated`,
+      `${head}\trefs/tags/v1.0.1`,
+    ]);
+    assert.doesNotMatch(output, /refs\/pull\//);
+
+    const adapter = new LiveGitAdapter({ cwd: work });
+    assert.deepEqual(adapter.parseAdvertisement(output), {
+      'refs/heads/main': { sha: head, type: null },
+      'refs/heads/unrelated': { sha: head, type: null },
+      'refs/tags/v1.0.1': { sha: head, type: null },
+    });
+    assert.throws(
+      () => adapter.parseAdvertisement(`${output}${head}\trefs/pull/12/head\n`),
+      /remote advertisement contained a malformed ref tuple/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('Git, GitHub, and npm adapters reject hostile configuration and destinations', async () => {
