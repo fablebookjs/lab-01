@@ -12,7 +12,9 @@ import {
 import {
   buildExpectedOldRefUpdate,
   classifyCloseEvent,
+  completeRegenerationState,
   reconcileClosedPull,
+  requiresLegacyClosedPullRegeneration,
   runRegenerationWakeup,
 } from '../scripts/regenerate-release-draft.mjs';
 
@@ -271,6 +273,69 @@ test('a latest merged release pull request is a no-op after durable event valida
   );
   assert.deepEqual(harness.calls.updateStagedRef, []);
   assert.deepEqual(harness.calls.createPull, []);
+
+  const emitted = [];
+  const summary = await runRegenerationWakeup({
+    eventName: 'workflow_dispatch',
+    event: { repository: repositoryIdentity, sender: liveActor },
+    operate: async () => ({ action: 'ignored-merged', pullRequest: 7 }),
+    emit: async (value) => emitted.push(value),
+  });
+  assert.equal(summary.action, 'ignored-merged');
+  assert.deepEqual(emitted, [{ summary, maintain: true }]);
+});
+
+test('merged, open, and absent lifecycle ownership bypass obsolete manifest regeneration', () => {
+  const merged = pull({
+    number: 7,
+    merged: true,
+    mergedAt: '2026-07-16T10:00:00Z',
+  });
+  const open = pull({ number: 8, state: 'open', draft: true });
+  const closed = pull({ number: 9 });
+  let legacyReads = 0;
+  const deriveLegacyState = () => {
+    legacyReads += 1;
+    return { stagedCurrent: true, includedCommits: [{ sha: sourceA }] };
+  };
+
+  for (const pulls of [[], [merged], [merged, open]]) {
+    assert.equal(requiresLegacyClosedPullRegeneration(pulls), false);
+    assert.deepEqual(
+      completeRegenerationState({
+        releaseSource: sourceA,
+        stagedIntent: closedIntent,
+        pulls,
+        deriveLegacyState,
+      }),
+      {
+        releaseSource: sourceA,
+        stagedIntent: closedIntent,
+        stagedCurrent: false,
+        includedCommits: [],
+        pulls,
+      },
+    );
+  }
+  assert.equal(legacyReads, 0);
+
+  assert.equal(requiresLegacyClosedPullRegeneration([merged, closed]), true);
+  assert.deepEqual(
+    completeRegenerationState({
+      releaseSource: sourceA,
+      stagedIntent: closedIntent,
+      pulls: [merged, closed],
+      deriveLegacyState,
+    }),
+    {
+      releaseSource: sourceA,
+      stagedIntent: closedIntent,
+      stagedCurrent: true,
+      includedCommits: [{ sha: sourceA }],
+      pulls: [merged, closed],
+    },
+  );
+  assert.equal(legacyReads, 1);
 });
 
 test('unrelated closes are ignored while suspicious release identities fail closed', async () => {
