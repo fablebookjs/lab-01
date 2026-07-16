@@ -485,6 +485,34 @@ function workflowAdapter({ rebind }) {
   };
 }
 
+export async function runRegenerationWakeup({ eventName, event, operate, emit }) {
+  const wakeup = validateMaintainerWakeup({ eventName, event });
+  if (wakeup.action === 'ignored-unrelated-signal') {
+    const summary = {
+      repository: REPOSITORY,
+      event: wakeup.event,
+      actor: wakeup.actor,
+      runId: wakeup.runId,
+      action: wakeup.action,
+    };
+    await emit({ summary, maintain: false });
+    return summary;
+  }
+  if (typeof operate !== 'function') fail('trusted regeneration requires an operation');
+  const summary = {
+    repository: REPOSITORY,
+    event: wakeup.event,
+    actor: wakeup.actor,
+    runId: wakeup.runId,
+    ...(await operate()),
+  };
+  await emit({
+    summary,
+    maintain: ['maintenance-required', 'ignored-merged'].includes(summary.action),
+  });
+  return summary;
+}
+
 export async function main(argv = process.argv.slice(2)) {
   if (process.env.GITHUB_REPOSITORY !== REPOSITORY) {
     fail(`refusing to write outside ${REPOSITORY}`);
@@ -494,27 +522,26 @@ export async function main(argv = process.argv.slice(2)) {
   if (!process.env.GITHUB_TOKEN) fail('GITHUB_TOKEN is required');
 
   const event = JSON.parse(await readFile(process.env.GITHUB_EVENT_PATH, 'utf8'));
-  const wakeup = validateMaintainerWakeup({ eventName: process.env.GITHUB_EVENT_NAME, event });
-  assertSafeGitConfiguration(process.cwd());
-  const rebind = async () => assertTrustedMaintainerMain();
-  await rebind();
-  const summary = {
-    repository: REPOSITORY,
-    event: wakeup.event,
-    actor: wakeup.actor,
-    ...(await reconcileClosedPull({ adapter: workflowAdapter({ rebind }) })),
-  };
-  console.log(JSON.stringify(summary, null, 2));
-  if (process.env.GITHUB_OUTPUT) {
-    const maintain = ['maintenance-required', 'ignored-merged'].includes(summary.action);
-    await appendFile(process.env.GITHUB_OUTPUT, `maintain=${maintain}\n`);
-  }
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    await appendFile(
-      process.env.GITHUB_STEP_SUMMARY,
-      `## Closed release draft reconciliation\n\n\`\`\`json\n${JSON.stringify(summary, null, 2)}\n\`\`\`\n`,
-    );
-  }
+  return runRegenerationWakeup({
+    eventName: process.env.GITHUB_EVENT_NAME,
+    event,
+    operate: async () => {
+      assertSafeGitConfiguration(process.cwd());
+      const rebind = async () => assertTrustedMaintainerMain();
+      await rebind();
+      return reconcileClosedPull({ adapter: workflowAdapter({ rebind }) });
+    },
+    emit: async ({ summary, maintain }) => {
+      console.log(JSON.stringify(summary, null, 2));
+      if (process.env.GITHUB_OUTPUT) await appendFile(process.env.GITHUB_OUTPUT, `maintain=${maintain}\n`);
+      if (process.env.GITHUB_STEP_SUMMARY) {
+        await appendFile(
+          process.env.GITHUB_STEP_SUMMARY,
+          `## Closed release draft reconciliation\n\n\`\`\`json\n${JSON.stringify(summary, null, 2)}\n\`\`\`\n`,
+        );
+      }
+    },
+  });
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {

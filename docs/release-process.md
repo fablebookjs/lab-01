@@ -70,6 +70,27 @@ The trusted-main signal/controller replacement described here is offline only
 and has not produced a live run. The historical run is not evidence for the new
 architecture.
 
+## Preserved post-installation no-op failure
+
+After the trusted-main controller was installed, unrelated trusted-main install
+PR [#29](https://github.com/fablebookjs/lab-01/pull/29) closed and triggered the
+fixed read-only [Release regeneration signal run 29480861541](https://github.com/fablebookjs/lab-01/actions/runs/29480861541).
+That signal was successful with `pull_request_target`, same-repository actor and
+head repository, and head branch `codex/issue-19-main-install`; it was not the
+`staged/v1.0` lifecycle proposal. The controller then failed in preserved
+[run 29480870852](https://github.com/fablebookjs/lab-01/actions/runs/29480870852)
+with `release maintenance signal wake-up identity is invalid`, before release
+maintenance. Release/staged/tag/PR #12/npm state remained unchanged.
+
+The corrected controller contract treats a structurally valid regeneration
+signal from any same-repository non-`staged/v1.0` branch as the successful
+`ignored-unrelated-signal` no-op: it emits `maintain=false` before any durable
+state, GitHub API, ref, PR, or QA action. Malformed identity and contradictory
+lifecycle state still fail closed. The workflow-level branch filter only avoids
+unnecessary runner use; the controller-level no-op is the safety boundary.
+This local correction has not yet been rerun on GitHub, so it makes no live
+success claim.
+
 The new issue #19 surfaces described below are present only in this offline
 integration. The manual operator-only exact `1.0.0` bootstrap exists but has
 not published. The trusted-main maintainer and Ready-QA signal/controller

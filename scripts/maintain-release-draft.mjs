@@ -13,6 +13,7 @@ import {
 } from './release-publication.mjs';
 
 const REPOSITORY = 'fablebookjs/lab-01';
+const REPOSITORY_ID = 1301358254;
 const RELEASE_LINE = 'releases/v1.0';
 const STAGED_LINE = 'staged/v1.0';
 const BASELINE_TAG = 'v1.0.0';
@@ -42,8 +43,34 @@ function validActor(actor) {
   return Number.isInteger(actor?.id) && actor.id > 0 && /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(actor.login ?? '');
 }
 
+function validRepository(repository) {
+  return repository?.full_name === REPOSITORY && repository.id === REPOSITORY_ID;
+}
+
+function validHeadBranch(branch) {
+  if (typeof branch !== 'string' || branch.length === 0 || branch.length > 1024) return false;
+  if (
+    branch === '@' ||
+    branch.startsWith('-') ||
+    branch.endsWith('/') ||
+    branch.endsWith('.') ||
+    branch.includes('//') ||
+    branch.includes('..') ||
+    branch.includes('@{') ||
+    [...branch].some((character) => {
+      const code = character.codePointAt(0);
+      return code <= 32 || code === 127 || '~^:?*[\\'.includes(character);
+    })
+  ) {
+    return false;
+  }
+  return branch
+    .split('/')
+    .every((component) => !component.startsWith('.') && !component.endsWith('.lock'));
+}
+
 export function validateMaintainerWakeup({ eventName, event }) {
-  if (event?.repository?.full_name !== REPOSITORY || !Number.isInteger(event.repository.id) || event.repository.id < 1) {
+  if (!validRepository(event?.repository)) {
     fail('maintainer wake-up repository identity is invalid');
   }
   if (!validActor(event.sender)) fail('maintainer wake-up sender identity is invalid');
@@ -55,21 +82,38 @@ export function validateMaintainerWakeup({ eventName, event }) {
     fail('maintainer event is not an allowed wake-up');
   }
   const run = event.workflow_run;
-  const releasePush = run?.name === MAINTENANCE_SIGNAL && run.event === 'push' && run.head_branch === RELEASE_LINE;
-  const releaseClose = run?.name === REGENERATION_SIGNAL && run.event === 'pull_request_target' &&
-    [RELEASE_LINE, STAGED_LINE].includes(run.head_branch);
   if (
     !Number.isInteger(run?.id) || run.id < 1 ||
-    (!releasePush && !releaseClose) ||
     run.status !== 'completed' ||
     run.conclusion !== 'success' ||
-    run.repository?.full_name !== REPOSITORY ||
-    run.head_repository?.full_name !== REPOSITORY ||
+    !validRepository(run.repository) ||
+    !validRepository(run.head_repository) ||
     !validActor(run.actor) ||
     !validActor(run.triggering_actor)
   ) {
     fail('release maintenance signal wake-up identity is invalid');
   }
+
+  if (run.name === MAINTENANCE_SIGNAL) {
+    if (run.event !== 'push' || run.head_branch !== RELEASE_LINE) {
+      fail('release maintenance signal wake-up identity is invalid');
+    }
+  } else if (run.name === REGENERATION_SIGNAL) {
+    if (run.event !== 'pull_request_target' || !validHeadBranch(run.head_branch)) {
+      fail('release maintenance signal wake-up identity is invalid');
+    }
+    if (run.head_branch !== STAGED_LINE) {
+      return {
+        event: eventName,
+        actor: run.triggering_actor.login,
+        runId: run.id,
+        action: 'ignored-unrelated-signal',
+      };
+    }
+  } else {
+    fail('release maintenance signal wake-up identity is invalid');
+  }
+
   return { event: eventName, actor: run.triggering_actor.login, runId: run.id };
 }
 
