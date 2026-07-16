@@ -27,10 +27,12 @@ The draft release PR proposes `1.0.1` from a structured empty commit on
 demonstrated refreshing that same PR and regenerating a closed proposal. Its first live transition
 closed PR #1 and created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12);
 rerunning the same delivery recognized the existing replacement without
-creating another PR. Those runs do not prove the trusted-main replacement in
-this offline changeset.
+creating another PR. The trusted-main replacement was installed by PR #29 and
+its unrelated-close correction by PR #30; a current staged lifecycle run is
+still required after this release source is installed.
 
-This offline integration gives the maintainer an explicit ownership handoff for
+The installed default-main controller and this release-line candidate give the
+maintainer an explicit ownership handoff for
 the issue #19 finalizer. With no open proposal, it accepts only the uniquely
 latest merged `staged/v1.0` lifecycle PR, its exact ordered merge `M`, the
 concrete deterministic `V` snapshot, one exact late `H`, or deterministic
@@ -40,7 +42,7 @@ snapshots; caller-authored markers are not authority. The maintainer performs
 no ref, PR-body, or QA dispatch write in those states. It also recognizes one
 exact draft `1.0.2` intent without applying its fixed `1.0.1` behavior. The
 trusted-main signal/controller maintainer, finalizer workflow, and H/J handoff
-are implemented locally but are not installed or live.
+are installed on default `main`; none has yet completed the real release path.
 
 See [the release-process note](docs/release-process.md) for the current contract
 and explicit automation limits.
@@ -77,8 +79,8 @@ manual dispatch supplies no SHA authority. Local proofs must instead pass
 `--authority local`; their evidence is explicitly non-GitHub-current. The prior
 installed architecture produced the first GitHub-current proof,
 [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684).
-It is historical evidence only: no live run of the new signal/controller split
-is claimed. Its controller always retains sanitized evidence named for the
+It is historical evidence only: no successful current staged run of the new
+signal/controller split is claimed. Its controller always retains sanitized evidence named for the
 durably rederived staged SHA.
 
 The pinned Verdaccio toolchain is bootstrapped separately from the candidate.
@@ -100,15 +102,15 @@ allowed tree from `M`, and can publish or reuse only `core` first and then
 `addon`. The npm trusted-publisher workflow filename remains exactly
 `.github/workflows/publish-npm.yml`. It cannot execute candidate code, move the release line, tag, create a
 GitHub Release, or create the next proposal. Late descendants of `M` do not
-block incomplete package publication. A third offline-only finalizer controller
-handles later reconciliation, tag, GitHub Release, and next-proposal actions;
-it is not installed or live.
+block incomplete package publication. A third installed but unexecuted
+finalizer controller handles later reconciliation, tag, GitHub Release, and
+next-proposal actions.
 
-The issue #19 additions in this branch are offline-only. The manual
-operator-only exact `1.0.0` bootstrap exists but has not published. The
-trusted-main maintainer and Ready-QA signal/controller splits, `V` preparation,
-direct-OIDC publisher, finalizer, and H/J handoff exist locally but are not
-installed or live. No public package, finalization, authoritative QA run,
-or new live-workflow state is claimed. The external operator gate therefore
-remains closed until the baseline packages, both npm trusted publishers, the
-`npm-publish` environment, and refreshed current-head QA are all present.
+The issue #19 controllers are installed on default `main`, and this branch is
+their accepted release-line source candidate. The manual operator-only exact
+`1.0.0` bootstrap exists but has not published. The `npm-publish` environment
+exists with no secrets or reviewers and permits only `main`; both npm trusted
+publishers remain impossible to configure until the package pages exist. No
+public package, finalization, or current-head QA success is claimed. The
+external operator gate remains closed until the baseline packages, both npm
+trusted publishers, and refreshed current-head QA are all present.
