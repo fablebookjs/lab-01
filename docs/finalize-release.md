@@ -35,6 +35,13 @@ through the accepted V adapter, validates real objects/ancestry/tree/structured
 metadata, and rechecks all advertised refs before returning. Optional caller
 SHAs never select H, J, M, or V.
 
+Before any Git advertisement, GitHub API request, or npm read, the live
+finalizer rejects ambient/local Git redirection, `refs/replace`, and
+`.git/objects/info/alternates`. Every object, tree, commit, ancestry, merge,
+fetch, advertisement, and push command uses `--no-replace-objects` plus a
+closed Git environment. Guarded writes inject only one transient scoped GitHub
+authorization header and never persist checkout credentials.
+
 ```text
 late-head:
   observer, schemaVersion, line, version, kind,
@@ -183,6 +190,12 @@ refs/heads/finalizer-attempts/v1.0.2/next-proposal
   intent -> V (definite pre-creation rejection) -> current J/V (reauthorize)
   intent -> current J/V after exact closed-unmerged PR (regenerate)
 ```
+
+A closed-unmerged same-lineage `1.0.2` proposal may retain `draft: true` or may
+report `draft: false` after having been marked ready before closure. Its exact
+state, merged tuple, base/head SHAs, structured intent version, title, and body
+must still match. Only the one active open `1.0.2` proposal is required to be a
+draft; closed history never becomes authority for a different lineage.
 
 Every transition has an exact lease. One classified POST action is a bounded
 protocol: consume the authorization, stably reread the marker, then issue at

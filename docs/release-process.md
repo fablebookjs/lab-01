@@ -11,11 +11,11 @@ This repository currently demonstrates only the first visible release intent:
 3. A draft PR from `staged/v1.0` to `releases/v1.0` presents that intent for
    review. The commit trailers, parent, and unchanged tree are authoritative;
    the editable PR title and body are not.
-4. A push to `releases/v1.0` automatically refreshes `staged/v1.0` with a new
+4. Historical installed automation proved that a push to `releases/v1.0` can refresh `staged/v1.0` with a new
    empty intent based on the exact current line head and updates the existing
    PR in place while preserving whether it is draft or ready. A manual workflow
    dispatch is the recovery wake-up.
-5. Closing the current release PR without merging creates a fresh structured
+5. Historical installed automation also proved that closing the current release PR without merging can create a fresh structured
    empty intent commit and one new draft PR. The closed PR remains untouched as
    the historical review and comment record. The first live transition closed
    PR #1 and created draft PR #12.
@@ -37,10 +37,11 @@ advance causes the run to stop so a later wake-up can include the newer fix.
 `node scripts/maintain-release-draft.mjs --dry-run` validates and reports the
 current action without creating a commit, changing a ref, or editing the PR.
 
-The close handler treats `pull_request_target` deliveries only as wake-ups. It
-accepts the exact same-repository `staged/v1.0` to `releases/v1.0` identity,
-checks out only trusted `releases/v1.0` code, and re-reads the refs and current
-PR history. A merged release PR never regenerates. Unrelated events do nothing;
+The offline replacement makes both release pushes and `pull_request_target`
+close deliveries fixed read-only/no-checkout signals. One default-main
+maintainer controller validates the exact completed signal shape only as a
+wake-up, checks out exact current trusted `main`, and re-reads the refs and
+complete current PR history. A merged release PR never regenerates. Unrelated events do nothing;
 ordinary fix PRs whose head is not `staged/v1.0` are unrelated even when they
 target the release line. A staged head with the wrong base or repository, a
 fork, and ambiguous state fail closed. After the
@@ -58,18 +59,23 @@ concurrent release or staged advance restarts state derivation. Replacement PR
 creation always sends `draft: true` and uses the same generated body as normal
 draft maintenance.
 
-The workflow is live from the default branch. With organization-level
+The earlier workflow was live from the default branch. With organization-level
 Actions-created PR authority enabled, [run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336)
 closed historical PR #1, moved `staged/v1.0` from the closed intent to a fresh
 expected-old guarded empty intent, and created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12).
 Attempt 2 of the same run returned `replacement-exists`; exactly one matching
 open release PR remained.
 
+The trusted-main signal/controller replacement described here is offline only
+and has not produced a live run. The historical run is not evidence for the new
+architecture.
+
 The new issue #19 surfaces described below are present only in this offline
 integration. The manual operator-only exact `1.0.0` bootstrap exists but has
-not published. The trusted-main `V` preparation, direct-OIDC publisher,
-finalizer, and maintainer H/J handoff also exist locally but are not installed
-or live. No public package, finalization, or new live-workflow state is claimed
+not published. The trusted-main maintainer and Ready-QA signal/controller
+splits, `V` preparation, direct-OIDC publisher, finalizer, and maintainer H/J
+handoff also exist locally but are not installed or live. No authoritative run
+of those controllers, public package, finalization, or new live-workflow state is claimed
 by this changeset.
 
 ## One-time public baseline bootstrap
@@ -183,33 +189,32 @@ every exact identity; a created, closed, reordered, or changed PR fails the run.
 
 ## Ready-state exact-version QA
 
-Ready or refreshed-ready proposals may run the read-only `Ready release QA`
-workflow. The workflow treats its event only as a wake-up. For pull-request
-events it requires a non-draft, same-repository `staged/v1.0` head and
-`releases/v1.0` base. For both pull-request and manual wake-ups it then uses the
-read-only GitHub API to rederive the current refs and require exactly one
-matching current ready PR. Manual dispatch accepts no SHA inputs. The staged
+Ready proposals use a fixed `Ready release QA signal` with `permissions: {}`,
+no checkout, and no candidate/controller code. The default-main `Ready release
+QA controller` treats that exact completed signal, or a manual dispatch, only
+as a wake-up. It checks out exact current trusted `main`, performs two complete
+stable PR sweeps, and rederives the current refs and exactly one matching
+current ready PR. Manual dispatch accepts no SHA inputs. The staged
 commit must be the structured one-parent empty intent for exact version
 `1.0.1`; PR title and body are never inputs.
 
-The workflow pins checkout and artifact upload by reviewed full action SHAs. It
-first materializes trusted release-line controller code with no persisted
-credentials, closes the npm/Git environment, and then checks out the exact PR
-head (or current staged branch for manual recovery) with full history as
-candidate data. No anonymous post-checkout Git fetch is used.
+The controller pins checkout and artifact upload by reviewed full action SHAs.
+It fetches exact staged/source objects into the current-main repository only as
+inert data; it never checks out or executes a controller or toolchain from the
+release line, staged line, PR, or snapshot.
 
 The workflow bootstraps exact npm and the locked Verdaccio development
 toolchain from public npm in a neutral directory with scripts disabled and an
 empty isolated environment/config. The runner then creates a detached temporary
 worktree at the exact source. Its only
 candidate changes are the root, core, and add-on manifest versions; the exact
-add-on-to-core dependency; and the corresponding lockfile fields. It installs,
-tests with an explicit `LAB_01_EXPECTED_PACKAGE_VERSION=1.0.1` contract, runs
-any declared builds, and packs the two allowlisted packages. Candidate install
+add-on-to-core dependency; and the corresponding lockfile fields. It installs
+with scripts disabled and packs the two allowlisted packages. Candidate install
 uses `npm ci --omit=dev --offline` with an empty isolated cache and loopback
 configuration, so it does not reinstall or contact public npm for the QA
-toolchain. Ordinary source tests default to
-strict `1.0.0` assertions; candidate QA does not skip them. A pinned
+toolchain. It does not execute candidate-provided test or build scripts; the
+trusted controller validates, transforms, packs, publishes to loopback, and
+exercises the inert package bytes through the fixed external consumer. A pinned
 `verdaccio@6.8.0` listens only on `127.0.0.1`, has no uplink, and accepts only
 `@fablebook/lab-01-core` and `@fablebook/lab-01-addon`. Both packages are
 published there at exact version `1.0.1`, then their metadata and downloaded
@@ -242,21 +247,19 @@ persist checkout credentials, and performs no GitHub or public npm write. All wo
 storage, generated credentials/configuration, packages, and consumer files are
 temporary; only sanitized evidence is retained.
 
-## Live QA and remaining gate
+## Historical QA evidence and remaining gate
 
-Ready-state exact-version QA is live. A human `ready_for_review` event runs it
-for that exact staged head. A staged update made with the built-in token creates
-an approval-required synchronize run, so release-PR maintenance explicitly
-dispatches the fixed `ready-release-qa.yml` workflow at `staged/v1.0` after the
-new head and PR body converge. `workflow_dispatch` is the documented GitHub
-exception that creates a run from a built-in-token request. The first
-GitHub-current proof is
+The old Ready-QA architecture produced the first GitHub-current proof,
 [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684);
-every refreshed ready head needs its own successful proof.
+it does not prove the offline trusted-main replacement. After installation, the
+maintainer dispatches `ready-release-qa-controller.yml` at `main`; that
+controller derives current state without caller SHAs and retains sanitized
+evidence named for the exact staged SHA. A real successful post-installation run
+remains required before any live QA claim.
 
-Close-and-regenerate is live. [Run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336)
-created the clean draft replacement, and its duplicate attempt converged on the
-same PR without another ref or PR write.
+The old close-and-regenerate workflow is historically proven by [run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336), which
+created the clean draft replacement and converged on rerun. The offline
+read-only signal/default-main controller replacement is not installed or live.
 
 Branch reconciliation, tagging `v1.0.1`, and creating a GitHub Release remain
 outside the installed/live state. The offline finalizer implements the bounded
@@ -281,15 +284,18 @@ Snapshot preparation and npm publication are separate workflows:
 1. `.github/workflows/prepare-release-snapshot.yml` is manually dispatched
    from exact current default `main` with the expected latest merged release-PR
    number. An optional ready-QA run ID is only an expectation. The trusted
-   controller re-reads all matching lifecycle PRs, successful ready-QA runs,
-   the release line, and snapshot ref. Older merged PRs and older equivalent
-   successful runs are rejected.
+   controller reads complete bounded all-state PR and successful Ready-QA run
+   histories, hydrates every canonical identity, and compares two stable full
+   sweeps before reading the release line and snapshot ref. Older merged PRs,
+   duplicate identities, pagination overflow, moving history, and older caller
+   expectations are rejected; unrelated PRs are ignored.
 2. The unique latest merged PR must be the same-repository `staged/v1.0` to
    `releases/v1.0` proposal. Its merge `M` has ordered parents `[S, I]`; `I` is
    the one-parent empty structured intent for `S`; and `M` has the sealed source
    tree. Squash, rebase, wrong-parent, wrong-tree, stale-QA, and ambiguous state
    fail closed.
-3. The latest successful exact-`I` ready-QA run is retained pre-merge
+3. The latest successful trusted-main Ready-QA controller run whose retained
+   sanitized evidence artifact is named for exact `I` is pre-merge
    authorization evidence, not recoverability authority. Preparation reruns the
    full isolated candidate QA from verified `S` with trusted tooling and then
    independently reconstructs the exact four-file transform from `M`. The Git
@@ -343,6 +349,15 @@ exact npm `11.18.0` from a neutral directory with empty isolated user/global
 configuration, fixed default and `@fablebook` public registries, and no
 traditional token. Git advertisement, fetch, and the one snapshot-ref push
 likewise use a closed transport/config environment and no tag following.
+
+The OIDC npm child receives only the exact npm `11.18.0` GitHub provenance
+inputs: token-request URL/token, Actions flag, manual event, main ref/name,
+exact repository plus immutable repository and owner IDs, run ID/number/attempt,
+`https://github.com`, source/workflow SHA, exact `publish-npm.yml` workflow
+name/ref, and GitHub-hosted runner identity. Server URL, repository owner ID,
+workflow path/ref, run numbers, and SHAs are strictly validated before the child
+starts. No broad `process.env` spread, traditional auth, ambient config, actor,
+or proxy field enters that environment.
 
 The publisher revalidates the current line before and after npm work. A clean
 or conflicting late descendant `H`/`X` does not block publication; containing

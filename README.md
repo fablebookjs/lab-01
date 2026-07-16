@@ -20,13 +20,12 @@ npm test
 
 The draft release PR proposes `1.0.1` from a structured empty commit on
 `staged/v1.0`. Its base is `releases/v1.0`, which started at the same commit as
-`main` and tag `v1.0.0`. Pushes to the release line now automatically refresh
-that same PR from the exact current release-line head while preserving whether
-it is draft or ready. Closing an unmerged release PR now automatically creates
-one fresh empty intent and a new draft replacement. The first live transition
+`main` and tag `v1.0.0`. The previously installed release-line automation
+demonstrated refreshing that same PR and regenerating a closed proposal. Its first live transition
 closed PR #1 and created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12);
 rerunning the same delivery recognized the existing replacement without
-creating another PR.
+creating another PR. Those runs do not prove the trusted-main replacement in
+this offline changeset.
 
 This offline integration gives the maintainer an explicit ownership handoff for
 the issue #19 finalizer. With no open proposal, it accepts only the uniquely
@@ -37,8 +36,8 @@ from stable Git facts and then reclassified in two complete ownership
 snapshots; caller-authored markers are not authority. The maintainer performs
 no ref, PR-body, or QA dispatch write in those states. It also recognizes one
 exact draft `1.0.2` intent without applying its fixed `1.0.1` behavior. The
-finalizer workflow and H/J handoff are implemented locally but are not
-installed or live.
+trusted-main signal/controller maintainer, finalizer workflow, and H/J handoff
+are implemented locally but are not installed or live.
 
 See [the release-process note](docs/release-process.md) for the current contract
 and explicit automation limits.
@@ -50,19 +49,19 @@ non-workspace consumer, records sanitized identity and integrity evidence, and
 then removes the worktree, registry process, and registry storage. It does not
 publish to public npm or mutate GitHub state.
 
-The checked-in workflow first checks out pinned trusted QA-controller code from
-the release line and bootstraps its closed toolchain. It then materializes the
-exact staged commit as candidate data with full history and rederives the one
-current ready PR and both current refs through the read-only GitHub API. A
+The checked-in release/PR-side workflow is only a read-only, no-checkout signal.
+The write-capable maintainer and read-only authoritative QA controllers are
+discovered on default `main`, check out exact current-main controller code, and
+treat signal fields only as wake-ups. The QA controller fetches staged/source
+objects as inert data and rederives the one current ready PR and all current
+refs from durable state. A
 manual dispatch supplies no SHA authority. Local proofs must instead pass
-`--authority local`; their evidence is explicitly non-GitHub-current. Marking
-the current proposal ready runs the automatic QA path. When a ready proposal is
-refreshed by the built-in token, release-PR maintenance explicitly dispatches
-QA for the new staged head because the resulting synchronize run otherwise
-requires human approval. The first GitHub-current proof is
+`--authority local`; their evidence is explicitly non-GitHub-current. The prior
+installed architecture produced the first GitHub-current proof,
 [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684).
-Close-and-regenerate is live; its first replacement proof created PR #12 and
-converged on that same replacement during a duplicate attempt.
+It is historical evidence only: no live run of the new signal/controller split
+is claimed. Its controller always retains sanitized evidence named for the
+durably rederived staged SHA.
 
 The pinned Verdaccio toolchain is bootstrapped separately from the candidate.
 Candidate, publish, and consumer npm subprocesses receive closed environments,
@@ -80,7 +79,8 @@ ID is not part of `V`, so equivalent current QA runs converge. `Publish npm
 package` is the one stable OIDC publisher identity. It also runs only exact
 current-main code, treats `V` as inert Git data, independently reconstructs the
 allowed tree from `M`, and can publish or reuse only `core` first and then
-`addon`. It cannot execute candidate code, move the release line, tag, create a
+`addon`. The npm trusted-publisher workflow filename remains exactly
+`.github/workflows/publish-npm.yml`. It cannot execute candidate code, move the release line, tag, create a
 GitHub Release, or create the next proposal. Late descendants of `M` do not
 block incomplete package publication. A third offline-only finalizer controller
 handles later reconciliation, tag, GitHub Release, and next-proposal actions;
@@ -88,8 +88,9 @@ it is not installed or live.
 
 The issue #19 additions in this branch are offline-only. The manual
 operator-only exact `1.0.0` bootstrap exists but has not published. The
-trusted-main `V` preparation, direct-OIDC publisher, finalizer, and H/J handoff
-exist locally but are not installed or live. No public package, finalization,
+trusted-main maintainer and Ready-QA signal/controller splits, `V` preparation,
+direct-OIDC publisher, finalizer, and H/J handoff exist locally but are not
+installed or live. No public package, finalization, authoritative QA run,
 or new live-workflow state is claimed. The external operator gate therefore
 remains closed until the baseline packages, both npm trusted publishers, the
 `npm-publish` environment, and refreshed current-head QA are all present.
