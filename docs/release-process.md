@@ -2,7 +2,7 @@
 
 ## Current proof slice
 
-This repository currently demonstrates only the first visible release intent:
+This repository now retains the complete public `1.0.1` patch-release proof:
 
 1. `main` and tag `v1.0.0` identify the synthetic `1.0.0` baseline;
    `releases/v1.0` contains that baseline and the fixes proposed for `1.0.1`.
@@ -37,7 +37,7 @@ advance causes the run to stop so a later wake-up can include the newer fix.
 `node scripts/maintain-release-draft.mjs --dry-run` validates and reports the
 current action without creating a commit, changing a ref, or editing the PR.
 
-The offline replacement makes both release pushes and `pull_request_target`
+The trusted-main replacement makes both release pushes and `pull_request_target`
 close deliveries fixed read-only/no-checkout signals. One default-main
 maintainer controller validates the exact completed signal shape only as a
 wake-up, checks out exact current trusted `main`, and re-reads the refs and
@@ -108,10 +108,10 @@ and skipped controller [run 29482694854](https://github.com/fablebookjs/lab-01/a
 with release/staged/tag/PR #12/npm state unchanged.
 
 The issue #19 trusted-main surfaces described below are installed on default
-`main`; this branch carries their accepted release-line source. Both exact
-public `1.0.0` baseline packages and current staged QA now exist. No `1.0.1`
-snapshot, publication, reconciliation, tag, GitHub Release, or next proposal
-is claimed.
+`main` and completed the live path. Both exact public `1.0.0` baselines remain;
+public `1.0.1` core and add-on match deterministic `V`, the release line is
+reconciled at `J`, tag and GitHub Release `v1.0.1` resolve to `V`, and draft
+`1.0.2` PR #44 carries the deliberately late work.
 
 ## One-time public baseline bootstrap
 
@@ -194,11 +194,10 @@ and the resumable preflight. A clean external consumer resolved the add-on's
 exact core dependency and imported both packages. No workflow invokes the
 bootstrap, and it remains incapable of publishing `1.0.1`.
 
-A validated release-PR merge is the intended authorization input for a
-separately reviewed issue #19 finalizer. This maintainer does not publish or
-reconcile. The finalizer is installed, but publication and finalization remain
-unavailable until the current ready release PR is merged and exact `M` and `V`
-are observed.
+A validated release-PR merge was the authorization input for the separately
+reviewed issue #19 finalizer. This maintainer does not publish or reconcile.
+PR #12 merged as exact `M`; deterministic `V` was observed and used for the
+completed public package and GitHub finalization path.
 
 ## Maintainer-to-finalizer ownership handoff
 
@@ -299,25 +298,24 @@ persist checkout credentials, and performs no GitHub or public npm write. All wo
 storage, generated credentials/configuration, packages, and consumer files are
 temporary; only sanitized evidence is retained.
 
-## Historical QA evidence and remaining gate
+## Live QA and finalization evidence
 
-The old Ready-QA architecture produced the first GitHub-current proof,
-[run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684);
-it does not prove the offline trusted-main replacement. After installation, the
-maintainer dispatches `ready-release-qa-controller.yml` at `main`; that
-controller derives current state without caller SHAs and retains sanitized
-evidence named for the exact staged SHA. A real successful post-installation run
-remains required before any live QA claim.
+The old Ready-QA architecture produced the first GitHub-current proof in
+[run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684).
+The current trusted-main controller then proved the final exact staged/source
+tuple in [run 29487012788](https://github.com/fablebookjs/lab-01/actions/runs/29487012788)
+and retained the artifact named for exact staged intent `b67d0d8…`.
 
 The old close-and-regenerate workflow is historically proven by [run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336), which
 created the clean draft replacement and converged on rerun. The replacement
 read-only signal/default-main controller is installed; PR #30 proved unrelated
 closes skip cleanly, while an exact staged close remains unexercised.
 
-Branch reconciliation, tagging `v1.0.1`, and creating a GitHub Release remain
-unexecuted. The installed finalizer implements the bounded controller but has
-not run. The draft maintainer does not execute
-pull-request-head code, and no workflow may mutate a Storybook resource.
+Branch reconciliation, tagging, the GitHub Release, lost-success convergence,
+and the next proposal all completed. The exact ledger is in
+[`docs/issue-19-live-evidence.md`](issue-19-live-evidence.md). The draft
+maintainer does not execute pull-request-head code, and no workflow may mutate
+a Storybook resource.
 
 ## Trusted-publishing preparation
 
@@ -327,7 +325,7 @@ an exact `main` deployment branch policy. The package-specific npm trusted
 publishers are configured on both package pages for `fablebookjs/lab-01`,
 workflow filename `publish-npm.yml`, environment `npm-publish`, and `npm
 publish` only. Both packages require 2FA and disallow traditional tokens. The
-public `1.0.0` baselines exist; no public `1.0.1` write has occurred.
+public `1.0.0` baselines and exact OIDC-published `1.0.1` versions exist.
 
 Both publishable package manifests carry the same exact Git repository URL,
 their monorepo directory, and the minimal `src` files allowlist. They contain no
@@ -463,10 +461,11 @@ normal reconciliation or conflict recovery begins. Consequently this slice
 never reconciles the release line while either package is absent and never
 creates `v1.0.1`, a GitHub Release, or a `1.0.2` proposal.
 
-The issue #19 public-package finalizer and maintainer H/J handoff are installed
-on default `main` but have not run. The maintainer
-validates the open `1.0.1` proposal, exact `M`, deterministic `V`, concrete `H`,
-deterministic `J`, and the exact draft `1.0.2` proposal, then yields without
-publication, reconciliation, tag, Release, or Storybook writes. The draft
-maintainer does not execute pull-request-head code. The finalizer's full
-offline operator contract is in [`docs/finalize-release.md`](finalize-release.md).
+The issue #19 public-package finalizer and maintainer H/J handoff completed on
+default `main`. The maintainer validated exact `M`, deterministic `V`, ordinary
+late merge `X`, deterministic `J`, and exact draft `1.0.2` proposal #44, then
+yielded without publication, reconciliation, tag, Release, or Storybook writes
+of its own. The draft maintainer does not execute pull-request-head code. The
+finalizer contract and completed evidence are in
+[`docs/finalize-release.md`](finalize-release.md) and
+[`docs/issue-19-live-evidence.md`](issue-19-live-evidence.md).

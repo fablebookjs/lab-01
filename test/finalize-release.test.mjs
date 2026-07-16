@@ -743,8 +743,14 @@ test('normal J advances the old staged intent, then creates exactly one draft wi
     { expectedHeadSha: ids.nextIntent, expectedBaseSha: ids.reconciliation },
   );
   assert.match(value.githubAdapter.pulls.at(-1).body, new RegExp(ids.late));
+  assert.match(value.githubAdapter.pulls.at(-1).body, /Release line: `releases\/v1\.0`/);
+  assert.match(value.githubAdapter.pulls.at(-1).body, /Proposed version: `1\.0\.2`/);
+  assert.ok(value.githubAdapter.pulls.at(-1).body.includes(`Exact release source: \`${ids.reconciliation}\``));
+  assert.ok(value.githubAdapter.pulls.at(-1).body.includes(`Structured intent commit: \`${ids.nextIntent}\``));
+  assert.match(value.githubAdapter.pulls.at(-1).body, /structured empty commit is authoritative/i);
   assert.match(value.githubAdapter.pulls.at(-1).body, /Mark this draft ready/);
   assert.match(value.githubAdapter.pulls.at(-1).body, /Close an unmerged proposal/);
+  assert.match(value.githubAdapter.pulls.at(-1).body, /https:\/\/github\.com\/fablebookjs\/lab-01\/blob\/releases\/v1\.0\/docs\/release-process\.md/);
 
   const rerun = await runFinalizerInvocation({ adapters: value, context: value.context });
   assert.equal(rerun.action.type, 'maintain-next-proposal');

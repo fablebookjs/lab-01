@@ -1,12 +1,13 @@
 # Fablebook `lab-01`
 
 `lab-01` is a disposable, synthetic monorepo for proving a visible release-PR
-contract without touching Storybook resources. The bounded G1 proof uses only
-the two public synthetic packages named below. Public-package finalization is
-a separately gated issue #19 concern; the release-PR maintainer never publishes.
+contract without touching Storybook resources. The bounded G1 proof now
+includes the completed public `1.0.1` release of the two synthetic packages,
+while the release-PR maintainer itself remains separate from publication.
 
-**Demo:** follow the outcome-first [five-minute screen-share script](docs/demo.md)
-or open the public [release-state explorer](https://fablebookjs.github.io/release-state-explorer/).
+**Demo:** follow the outcome-first [five-minute screen-share script](docs/demo.md),
+inspect the [complete issue #19 evidence](docs/issue-19-live-evidence.md), or open
+the public [release-state explorer](https://fablebookjs.github.io/release-state-explorer/).
 
 The `1.0.0` baseline contains:
 
@@ -21,15 +22,12 @@ npm install
 npm test
 ```
 
-The draft release PR proposes `1.0.1` from a structured empty commit on
-`staged/v1.0`. Its base is `releases/v1.0`, which started at the same commit as
-`main` and tag `v1.0.0`. The previously installed release-line automation
-demonstrated refreshing that same PR and regenerating a closed proposal. Its first live transition
-closed PR #1 and created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12);
-rerunning the same delivery recognized the existing replacement without
-creating another PR. The trusted-main replacement was installed by PR #29 and
-its unrelated-close correction by PR #30; a current staged lifecycle run is
-still required after this release source is installed.
+The `1.0.1` lifecycle began as a structured empty intent on `staged/v1.0`.
+[PR #12](https://github.com/fablebookjs/lab-01/pull/12) refreshed in place,
+received exact current Ready QA, and merged as ordered release merge `M`. The
+completed finalizer published immutable snapshot `V`, reconciled the deliberate
+late fix as `J=[X,V]`, and created [draft PR #44](https://github.com/fablebookjs/lab-01/pull/44)
+as the zero-file `1.0.2` carry-forward proposal.
 
 The installed default-main controller and this release-line candidate give the
 maintainer an explicit ownership handoff for
@@ -42,7 +40,7 @@ snapshots; caller-authored markers are not authority. The maintainer performs
 no ref, PR-body, or QA dispatch write in those states. It also recognizes one
 exact draft `1.0.2` intent without applying its fixed `1.0.1` behavior. The
 trusted-main signal/controller maintainer, finalizer workflow, and H/J handoff
-are installed on default `main`; none has yet completed the real release path.
+are installed on default `main` and completed the real lab release path.
 
 See [the release-process note](docs/release-process.md) for the current contract
 and explicit automation limits.
@@ -59,11 +57,11 @@ PR without targeting the live release line or proposal.
 Recovery completion and terminal next-proposal suppression use a third,
 [dedicated fixed namespace](docs/recovery-terminal-calibration.md). That probe
 requires a human-created, normally merged recovery PR and stops after one draft
-empty proposal; it is independent from the issue #19 offline-only finalization
-and publication preparations.
+empty proposal; it remains independent from the completed issue #19 live
+publication and finalization path.
 
 Ready-state package QA is implemented as a read-only exact-snapshot check. It
-materializes `1.0.1` only in a temporary worktree, publishes only the two
+materializes candidate `1.0.1` only in a temporary worktree, publishes only the two
 synthetic candidates to loopback Verdaccio, installs them into a temporary
 non-workspace consumer, records sanitized identity and integrity evidence, and
 then removes the worktree, registry process, and registry storage. It does not
@@ -76,12 +74,10 @@ treat signal fields only as wake-ups. The QA controller fetches staged/source
 objects as inert data and rederives the one current ready PR and all current
 refs from durable state. A
 manual dispatch supplies no SHA authority. Local proofs must instead pass
-`--authority local`; their evidence is explicitly non-GitHub-current. The prior
-installed architecture produced the first GitHub-current proof,
-[run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684).
-It is historical evidence only: no successful current staged run of the new
-signal/controller split is claimed. Its controller always retains sanitized evidence named for the
-durably rederived staged SHA.
+`--authority local`; their evidence is explicitly non-GitHub-current. Exact
+current trusted-main [run 29487012788](https://github.com/fablebookjs/lab-01/actions/runs/29487012788)
+proved the staged/source tuple used by `V`. Its controller retained sanitized
+evidence named for the durably rederived staged SHA.
 
 The pinned Verdaccio toolchain is bootstrapped separately from the candidate.
 Candidate, publish, and consumer npm subprocesses receive closed environments,
@@ -102,9 +98,9 @@ allowed tree from `M`, and can publish or reuse only `core` first and then
 `addon`. The npm trusted-publisher workflow filename remains exactly
 `.github/workflows/publish-npm.yml`. It cannot execute candidate code, move the release line, tag, create a
 GitHub Release, or create the next proposal. Late descendants of `M` do not
-block incomplete package publication. A third installed but unexecuted
-finalizer controller handles later reconciliation, tag, GitHub Release, and
-next-proposal actions.
+block incomplete package publication. The separate finalizer controller
+completed reconciliation, tag, GitHub Release, and next-proposal actions only
+after both public packages matched `V`.
 
 The issue #19 controllers are installed on default `main`, and this branch is
 their accepted release-line source candidate. The manual operator-only exact
@@ -115,5 +111,6 @@ reviewers and permits only `main`. Current staged QA is successful; configuring
 the exact trusted publisher on both npm package pages is complete. Each package
 allows only `npm publish` from `fablebookjs/lab-01` workflow `publish-npm.yml`
 and environment `npm-publish`, and requires 2FA while disallowing traditional
-tokens. No `1.0.1` snapshot, publication, reconciliation, tag, GitHub Release,
-or next proposal is claimed.
+tokens. Both public `1.0.1` packages now match `V` and carry provenance; tag
+`v1.0.1`, the GitHub Release, reconciliation `J`, and draft PR #44 are retained
+as the completed live proof.
