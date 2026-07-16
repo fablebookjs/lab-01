@@ -209,6 +209,24 @@ const trustedReconciliationObservation = () => ({
   },
 });
 
+const trustedMergedReconciliationObservation = () => ({
+  ...trustedMergedLateObservation(),
+  releaseHeadSha: RECONCILIATION,
+  commits: {
+    ...trustedMergedLateObservation().commits,
+    [RECONCILIATION]: commit({
+      sha: RECONCILIATION,
+      parents: [MERGED_LATE, SNAPSHOT],
+      tree: RECONCILIATION_TREE,
+      message: reconciliationMessage({
+        mergeSha: MERGE,
+        lateSha: MERGED_LATE,
+        snapshotSha: SNAPSHOT,
+      }),
+    }),
+  },
+});
+
 const toFinalizerCommit = (value) => ({
   sha: value.sha,
   parents: [...value.parents],
@@ -249,7 +267,11 @@ function acceptedSnapshotAuthority(observation) {
 
 function durableGitAdapter(observation, { driftOnRead = null, mergeClean = true } = {}) {
   let reads = 0;
-  const commits = new Map(Object.values(observation.commits).map((value) => [value.sha, toFinalizerCommit(value)]));
+  const commits = new Map(
+    [...Object.values(observation.commits), observation.snapshot?.commit]
+      .filter(Boolean)
+      .map((value) => [value.sha, toFinalizerCommit(value)]),
+  );
   return {
     async listRefs() {
       reads += 1;
@@ -351,8 +373,10 @@ test('concrete finalizer observer accepts exact H and deterministic J then recla
   assert.doesNotThrow(() => assertStableOwnershipSnapshots(lateSnapshot, repeatedLateSnapshot));
 
   const mergedLate = trustedMergedLateObservation();
+  const mergedLateWithoutPatch = structuredClone(mergedLate);
+  delete mergedLateWithoutPatch.commits[PATCH];
   const mergedLateSnapshot = await classifyMaintainerOwnershipWithDurableObserver({
-    observation: mergedLate,
+    observation: mergedLateWithoutPatch,
     gitAdapter: durableGitAdapter(mergedLate),
   });
   assert.deepEqual(mergedLateSnapshot.decision, {
@@ -360,6 +384,10 @@ test('concrete finalizer observer accepts exact H and deterministic J then recla
     state: 'late-head',
     mergeSha: MERGE,
     headSha: MERGED_LATE,
+  });
+  assert.deepEqual(mergedLateSnapshot.observation.commits[PATCH], {
+    ...mergedLate.commits[PATCH],
+    parentTree: '',
   });
 
   const reconciled = trustedReconciliationObservation();
@@ -375,6 +403,25 @@ test('concrete finalizer observer accepts exact H and deterministic J then recla
     lateHeadSha: LATE,
   });
   assert.equal(reconciledSnapshot.observation.postMerge.kind, 'normal-reconciliation');
+
+  const mergedReconciled = trustedMergedReconciliationObservation();
+  const mergedReconciledWithoutPatch = structuredClone(mergedReconciled);
+  delete mergedReconciledWithoutPatch.commits[PATCH];
+  const mergedReconciledSnapshot = await classifyMaintainerOwnershipWithDurableObserver({
+    observation: mergedReconciledWithoutPatch,
+    gitAdapter: durableGitAdapter(mergedReconciled),
+  });
+  assert.deepEqual(mergedReconciledSnapshot.decision, {
+    owner: 'finalizer-owns-release',
+    state: 'normal-reconciliation',
+    mergeSha: MERGE,
+    headSha: RECONCILIATION,
+    lateHeadSha: MERGED_LATE,
+  });
+  assert.deepEqual(mergedReconciledSnapshot.observation.commits[PATCH], {
+    ...mergedReconciled.commits[PATCH],
+    parentTree: '',
+  });
 });
 
 test('concrete finalizer observer rejects ref drift and malformed/conflicting H/J shapes', async () => {

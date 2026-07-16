@@ -879,6 +879,18 @@ function assertSameCommitShape(first, second, label) {
   }
 }
 
+async function hydrateImmediateCommitParents({ commits, commit, gitAdapter, label }) {
+  for (const parentSha of commit.parents) {
+    const parent = maintainerCommitShape(await gitAdapter.commit(parentSha));
+    if (parent.sha !== parentSha) fail(`${label} parent commit identity is invalid`);
+    if (commits[parentSha]) {
+      assertSameCommitShape(commits[parentSha], parent, `${label} parent`);
+      continue;
+    }
+    commits[parentSha] = parent;
+  }
+}
+
 export async function classifyMaintainerOwnershipWithDurableObserver({ observation, gitAdapter }) {
   const initial = classifyMaintainerOwnershipInternal(observation, { allowPostMergePending: true });
   if (initial.owner !== 'post-merge-observer-required') return { observation, decision: initial };
@@ -907,9 +919,21 @@ export async function classifyMaintainerOwnershipWithDurableObserver({ observati
     'post-M release head',
   );
   commits[rereadHead.sha] = rereadHead;
+  await hydrateImmediateCommitParents({
+    commits,
+    commit: rereadHead,
+    gitAdapter,
+    label: 'post-M release head',
+  });
   if (marker.kind === 'normal-reconciliation') {
     const late = maintainerCommitShape(await gitAdapter.commit(marker.lateHeadSha));
     commits[late.sha] = late;
+    await hydrateImmediateCommitParents({
+      commits,
+      commit: late,
+      gitAdapter,
+      label: 'post-M late head',
+    });
   }
   const enriched = { ...observation, commits, postMerge: marker };
   const decision = classifyMaintainerOwnershipInternal(enriched, { trustedPostMerge: marker });
