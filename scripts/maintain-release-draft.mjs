@@ -963,6 +963,15 @@ export function assertStableOwnershipSnapshots(first, second) {
   }
 }
 
+export function durablePullCommitShas(pull) {
+  if (pull === null || pull === undefined) return [];
+  return [
+    pull.base?.sha,
+    pull.head?.sha,
+    ...(pull.merged === true ? [pull.merge_commit_sha] : []),
+  ];
+}
+
 async function readOwnershipSnapshot() {
   const { releaseHeadSha, stagedSha } = refreshObservedRefs();
   let pulls = await readCompletePullHistory({ request: github });
@@ -976,9 +985,7 @@ async function readOwnershipSnapshot() {
   }
   const snapshot = readSnapshotObservation();
   const commits = commitEvidence([
-    detail?.base?.sha,
-    detail?.head?.sha,
-    detail?.merge_commit_sha,
+    ...durablePullCommitShas(detail),
     snapshot?.sha,
     releaseHeadSha,
   ]);
