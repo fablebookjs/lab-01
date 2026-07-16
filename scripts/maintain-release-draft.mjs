@@ -455,12 +455,24 @@ function classifyPostMergeOwnershipFromDurableGit(marker, { releaseHeadSha, merg
   }
 
   const head = requireCommit(observation, releaseHeadSha, 'post-M release head');
+  const isExactOneLateHead = (candidate) => {
+    if (candidate.parents.length === 1 && candidate.parents[0] === merge.sha) return true;
+    if (candidate.parents.length !== 2 || candidate.parents[0] !== merge.sha) return false;
+    const patch = requireCommit(observation, candidate.parents[1], 'post-M ordinary late patch');
+    if (
+      patch.parents.length !== 1 ||
+      patch.parents[0] !== merge.sha ||
+      patch.commitTree !== candidate.commitTree
+    ) {
+      fail('post-M ordinary late merge is not one exact patch over M');
+    }
+    return true;
+  };
   if (marker.kind === 'late-head') {
     assertExactKeys(marker, [...Object.keys(common), 'kind', 'verifiedMergeSha'], 'post-M H observation');
     if (
       marker.verifiedMergeSha !== merge.sha ||
-      head.parents.length !== 1 ||
-      head.parents[0] !== merge.sha ||
+      !isExactOneLateHead(head) ||
       head.sha === snapshot.sha
     ) {
       fail('post-M H observation is not one exact late head over M');
@@ -481,8 +493,7 @@ function classifyPostMergeOwnershipFromDurableGit(marker, { releaseHeadSha, merg
       'post-M J metadata',
     );
     if (
-      late.parents.length !== 1 ||
-      late.parents[0] !== merge.sha ||
+      !isExactOneLateHead(late) ||
       head.parents.length !== 2 ||
       head.parents[0] !== late.sha ||
       head.parents[1] !== snapshot.sha ||

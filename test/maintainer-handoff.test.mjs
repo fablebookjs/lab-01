@@ -18,6 +18,8 @@ const LATE = '4'.repeat(40);
 const SNAPSHOT = '5'.repeat(40);
 const RECONCILIATION = '6'.repeat(40);
 const NEXT_INTENT = '7'.repeat(40);
+const PATCH = 'e'.repeat(40);
+const MERGED_LATE = 'f'.repeat(40);
 const CORE_SHASUM = '8'.repeat(40);
 const ADDON_SHASUM = '9'.repeat(40);
 const SNAPSHOT_TREE = 'a'.repeat(40);
@@ -167,6 +169,28 @@ const trustedLateObservation = () => ({
   commits: {
     ...baseObservation().commits,
     [LATE]: commit({ sha: LATE, parents: [MERGE], tree: RECONCILIATION_TREE, message: 'fix: late work' }),
+  },
+  postMerge: null,
+});
+
+const trustedMergedLateObservation = () => ({
+  ...baseObservation(),
+  releaseHeadSha: MERGED_LATE,
+  snapshot: snapshot(),
+  commits: {
+    ...baseObservation().commits,
+    [PATCH]: commit({
+      sha: PATCH,
+      parents: [MERGE],
+      tree: RECONCILIATION_TREE,
+      message: 'fix: ordinary late patch',
+    }),
+    [MERGED_LATE]: commit({
+      sha: MERGED_LATE,
+      parents: [MERGE, PATCH],
+      tree: RECONCILIATION_TREE,
+      message: 'Merge pull request #37',
+    }),
   },
   postMerge: null,
 });
@@ -325,6 +349,18 @@ test('concrete finalizer observer accepts exact H and deterministic J then recla
     gitAdapter: durableGitAdapter(late),
   });
   assert.doesNotThrow(() => assertStableOwnershipSnapshots(lateSnapshot, repeatedLateSnapshot));
+
+  const mergedLate = trustedMergedLateObservation();
+  const mergedLateSnapshot = await classifyMaintainerOwnershipWithDurableObserver({
+    observation: mergedLate,
+    gitAdapter: durableGitAdapter(mergedLate),
+  });
+  assert.deepEqual(mergedLateSnapshot.decision, {
+    owner: 'finalizer-owns-release',
+    state: 'late-head',
+    mergeSha: MERGE,
+    headSha: MERGED_LATE,
+  });
 
   const reconciled = trustedReconciliationObservation();
   const reconciledSnapshot = await classifyMaintainerOwnershipWithDurableObserver({
