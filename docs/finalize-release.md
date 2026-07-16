@@ -2,13 +2,14 @@
 
 This is the focused operator contract for the bounded issue #19 finalizer. The
 controller is installed on default `main` but has not been dispatched; this
-document does not claim a live npm write, tag, GitHub Release, or Storybook
-change.
+document does not claim a live `1.0.1` npm write, tag, GitHub Release, or
+Storybook change.
 
-The manual exact `1.0.0` bootstrap exists but has not published. Trusted-main
+The manual exact `1.0.0` bootstrap completed on 2026-07-16, and both public
+baseline tarballs match immutable tag `v1.0.0`. Trusted-main
 `V` preparation, the direct-OIDC publisher, this finalizer, and the maintainer
 H/J handoff are installed on default `main` but remain unexecuted. Public
-package and finalization state remain unchanged.
+`1.0.1` package and finalization state remain unchanged.
 
 ## Installation prerequisite and maintainer seam
 

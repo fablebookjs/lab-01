@@ -472,6 +472,29 @@ test('requires exact TTY confirmation before isolated web login or publication',
   }
 });
 
+test('runs direct publication interactively so npm can complete its 2FA challenge', async () => {
+  const [artifact] = artifacts().packages;
+  let invocation;
+  const context = {
+    commandDirectory: '/isolated/command',
+    globalConfig: '/isolated/global.npmrc',
+    npmEnvironment: { PATH: '/bin' },
+    userConfig: '/isolated/user.npmrc',
+    async run(file, args, options) {
+      invocation = { file, args, options };
+    },
+  };
+
+  await bootstrapOperations.publish(context, artifact);
+
+  assert.equal(invocation.file, 'npm');
+  assert.equal(invocation.options.interactive, true);
+  assert.equal(invocation.options.phase, `npm-publish:${artifact.name}`);
+  assert.ok(invocation.args.includes('publish'));
+  assert.ok(invocation.args.includes(artifact.tarball));
+  assert.ok(invocation.args.includes('--access=public'));
+});
+
 test('publishes missing packages core then add-on and retains complete hash evidence', async () => {
   const base = await temporaryBase();
   const published = new Set();
