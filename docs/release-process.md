@@ -72,6 +72,18 @@ current staged intent `06c824c25ae9aca248f70bcdb54216d8d14b562d` received
 successful trusted-main Ready QA in
 [run 29483729087](https://github.com/fablebookjs/lab-01/actions/runs/29483729087).
 
+After the final pre-merge refresh, the maintainer's repository-token dispatch
+created controller run
+[29486639443](https://github.com/fablebookjs/lab-01/actions/runs/29486639443)
+with exact sender `github-actions[bot]` ID `41898282`. The earlier generic
+human-login parser rejected the bracketed bot login before authority
+observation. Manual current-state run
+[29487012788](https://github.com/fablebookjs/lab-01/actions/runs/29487012788)
+then proved the exact staged/source tuple. The controller now accepts that one
+immutable GitHub Actions bot tuple only for `workflow_dispatch`; every other
+bot-like login, wrong ID, and all existing PR-signal actor constraints remain
+fail-closed.
+
 ## Preserved post-installation no-op failure
 
 After the trusted-main controller was installed, unrelated trusted-main install

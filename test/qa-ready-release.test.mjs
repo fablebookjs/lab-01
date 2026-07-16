@@ -293,6 +293,23 @@ test('GitHub authority requires the one current same-repository release PR and r
   dispatch.event = { repository: snapshot.event.repository, sender: snapshot.event.sender, inputs: {} };
   assert.equal(validateGitHubAuthoritySnapshot(dispatch).event, 'workflow_dispatch');
   assert.deepEqual(validateReadyQaWakeup({ eventName: 'workflow_dispatch', event: dispatch.event }), { event: 'workflow_dispatch', actor: 'maintainer' });
+
+  const tokenDispatch = structuredClone(dispatch);
+  tokenDispatch.event.sender = { id: 41898282, login: 'github-actions[bot]' };
+  assert.equal(validateGitHubAuthoritySnapshot(tokenDispatch).event, 'workflow_dispatch');
+  assert.deepEqual(
+    validateReadyQaWakeup({ eventName: 'workflow_dispatch', event: tokenDispatch.event }),
+    { event: 'workflow_dispatch', actor: 'github-actions[bot]' },
+  );
+
+  for (const sender of [
+    { id: 41898283, login: 'github-actions[bot]' },
+    { id: 41898282, login: 'other-actions[bot]' },
+  ]) {
+    const spoofed = structuredClone(tokenDispatch);
+    spoofed.event.sender = sender;
+    assert.throws(() => validateGitHubAuthoritySnapshot(spoofed));
+  }
 });
 
 test('isolated npm environment ignores ambient registry, auth, proxy, and config inputs', async () => {
