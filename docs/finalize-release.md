@@ -1,21 +1,42 @@
 # `1.0.1` normal-path finalizer
 
-This is the focused operator contract for the bounded issue #19 finalizer. The
-controller is installed on default `main` but has not been dispatched; this
-document does not claim a live `1.0.1` npm write, tag, GitHub Release, or
-Storybook change.
+This is the focused operator contract and completed live record for the bounded
+issue #19 finalizer. The controller is installed on default `main` and the exact
+normal path completed on 2026-07-16. The complete identity/run ledger is in
+[`docs/issue-19-live-evidence.md`](issue-19-live-evidence.md).
 
 The manual exact `1.0.0` bootstrap completed on 2026-07-16, and both public
 baseline tarballs match immutable tag `v1.0.0`. Trusted-main
 `V` preparation, the direct-OIDC publisher, this finalizer, and the maintainer
-H/J handoff are installed on default `main` but remain unexecuted. Public
-`1.0.1` package and finalization state remain unchanged.
+H/J handoff are installed on default `main` and executed successfully. Both
+public `1.0.1` packages match `V`; `J`, tag `v1.0.1`, the GitHub Release, and
+draft `1.0.2` PR #44 are retained.
+
+## Completed live result
+
+- `M=c3061c74b52aea7b9ee47b99950f4fee13bce911` and
+  `V=30fb7cf66944462d56edf9d64198377a4b0d2f4c` bind the approved package bytes.
+- Late ordinary merge `X=bc2c99750191ccdb14662c139ba9ea725d3a8a12`
+  landed while only core `1.0.1` was public.
+- [Run 29489041168](https://github.com/fablebookjs/lab-01/actions/runs/29489041168)
+  created `J=5469d7a4d12abde629ba5384aaac2f0f19fb5b96` with parents `[X,V]`.
+- [Run 29489692288](https://github.com/fablebookjs/lab-01/actions/runs/29489692288)
+  created lightweight `v1.0.1 -> V`.
+- [Run 29489970777](https://github.com/fablebookjs/lab-01/actions/runs/29489970777)
+  created and hydrated the one GitHub Release, then intentionally failed.
+  [Run 29490136244](https://github.com/fablebookjs/lab-01/actions/runs/29490136244)
+  issued no duplicate Release POST and continued from durable state.
+- [Run 29490413923](https://github.com/fablebookjs/lab-01/actions/runs/29490413923)
+  created exact draft [PR #44](https://github.com/fablebookjs/lab-01/pull/44);
+  [run 29490566032](https://github.com/fablebookjs/lab-01/actions/runs/29490566032)
+  made zero mutations on convergence.
 
 ## Installation prerequisite and maintainer seam
 
 This release-line candidate integrates the separately reviewed maintainer
-handoff with the installed finalizer observer. Neither the finalizer workflow
-nor the H/J handoff has run, and this document does not authorize dispatch.
+handoff with the installed finalizer observer. The workflow and both H/J and
+next-proposal handoffs have now run; the remaining sections preserve the exact
+operator contract and rerun semantics.
 
 The handoff imports and calls the pure exported seam:
 

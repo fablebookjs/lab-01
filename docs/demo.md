@@ -1,87 +1,75 @@
-# Five-minute release-state demo
+# Five-minute public patch-release demo
 
 ## 60-second summary
 
-The outcome is a visible, fail-closed release-state contract proven against a
-disposable GitHub repository. Start with the public
-[release-state explorer](https://fablebookjs.github.io/release-state-explorer/),
-then show that the same draft proposal is refreshed, required checks bind to the
-current head, conflict recovery retains late work, and an open recovery blocks
-the next proposal until a normal merge authorizes exactly one active draft.
+`fablebookjs/lab-01` now demonstrates a complete public `1.0.1` patch release:
+a reviewed empty release intent, exact Ready QA, deterministic immutable
+snapshot `V`, OIDC publication with a deliberate core-only pause, an ordinary
+late fix, clean reconciliation, tag and GitHub Release creation, lost-success
+recovery, and one draft `1.0.2` proposal carrying the late work.
 
-The explorer and package names are simulated laboratory material. The linked
-GitHub refs, pull requests, checks, workflow runs, lease failures, and recovery
-graphs are live retained evidence in `fablebookjs/lab-01`.
+Start with the public [GitHub Release](https://github.com/fablebookjs/lab-01/releases/tag/v1.0.1),
+the npm pages for [core](https://www.npmjs.com/package/@fablebook/lab-01-core/v/1.0.1)
+and [add-on](https://www.npmjs.com/package/@fablebook/lab-01-addon/v/1.0.1),
+and [draft PR #44](https://github.com/fablebookjs/lab-01/pull/44). The complete
+identity and run ledger is in the [issue #19 live evidence](issue-19-live-evidence.md).
 
 ## Five-minute click order
 
-### 0:00 — Orient with the state explorer
+### 0:00 — Show the public outcome
 
-Open the [release-state explorer](https://fablebookjs.github.io/release-state-explorer/).
-Use it to name the states—draft, current-head validation, reconciliation,
-recovery, and next proposal. This is an interactive visualization of the policy,
-not the production controller.
+Open the [v1.0.1 GitHub Release](https://github.com/fablebookjs/lab-01/releases/tag/v1.0.1).
+Its lightweight tag resolves to exact snapshot `V=30fb7cf…`. Open both npm
+packages and point out their provenance, repository identity, and exact
+`1.0.1` versions.
 
-### 0:40 — Keep one visible draft fresh
+### 0:50 — Show partial publication and continuation
 
-Open live [release PR #12](https://github.com/fablebookjs/lab-01/pull/12).
-Its empty structured proposal commit makes intent visible while the guarded
-staged ref can refresh the same draft instead of creating PR churn. The
-[authority baseline](https://github.com/fablebookjs/infra/blob/main/docs/evidence/lab-01-github-authority-baseline.md)
-records the live same-draft refresh and close/regenerate mechanics.
+[Core run 29487214563](https://github.com/fablebookjs/lab-01/actions/runs/29487214563)
+published and verified only core, then stopped with add-on absent. An ordinary
+late release-line fix landed while that partial state was durable.
+[Add-on run 29488397580](https://github.com/fablebookjs/lab-01/actions/runs/29488397580)
+reverified core and published only the missing add-on. Neither job had a
+traditional npm token or a finalization permission.
 
-### 1:20 — Prove checks follow the current head
+### 1:50 — Separate published bytes from late work
 
-Open [required-check PR #23](https://github.com/fablebookjs/lab-01/pull/23).
-Show [A succeeding in run 29449854427](https://github.com/fablebookjs/lab-01/actions/runs/29449854427),
-then explain that moving A to B left the old green result stale and the PR
-blocked. [B succeeds in run 29449963241](https://github.com/fablebookjs/lab-01/actions/runs/29449963241)
-only after exact current-head authorization. The complete read-back is in the
-[required-check evidence document](https://github.com/fablebookjs/infra/blob/main/docs/evidence/lab-01-required-check-calibration.md).
+Open [reconciliation run 29489041168](https://github.com/fablebookjs/lab-01/actions/runs/29489041168).
+`V` contains only the four version-transform files. Late merge `X=bc2c997…` is
+not reachable from `V`. The controller created exact `J=5469d7a…` with ordered
+parents `[X,V]`, so the release line contains both the late fix and the public
+version snapshot without changing what tag `v1.0.1` names.
 
-### 2:20 — Preserve late work through a genuine conflict
+### 2:50 — Demonstrate lost-success convergence
 
-Open conflict recovery [PR #16](https://github.com/fablebookjs/lab-01/pull/16).
-The sequence is visible in three runs:
+[Run 29489970777](https://github.com/fablebookjs/lab-01/actions/runs/29489970777)
+spent its durable authorization, created and hydrated the one GitHub Release,
+then intentionally failed before success reporting. Recovery
+[run 29490136244](https://github.com/fablebookjs/lab-01/actions/runs/29490136244)
+found that exact Release, issued no duplicate POST, and advanced the structured
+`1.0.2` intent.
 
-- [29429579354](https://github.com/fablebookjs/lab-01/actions/runs/29429579354)
-  retains the complete late head before the guarded destructive line update;
-- [29429674616](https://github.com/fablebookjs/lab-01/actions/runs/29429674616)
-  resumes after the intentional interruption and creates the draft recovery PR;
-- [29429754785](https://github.com/fablebookjs/lab-01/actions/runs/29429754785)
-  reuses the exact retained graph and PR without duplicate writes.
+### 3:50 — Carry the late fix forward
 
-### 3:20 — Suppress the next proposal while recovery is open
+Open [draft PR #44](https://github.com/fablebookjs/lab-01/pull/44). It is a
+zero-file empty intent from `staged/v1.0` to `releases/v1.0`, based on exact
+`J`, and lists `X` as the work excluded from `1.0.1`. Proposal creation
+[run 29490413923](https://github.com/fablebookjs/lab-01/actions/runs/29490413923)
+spent one authorization and created one PR; duplicate
+[run 29490566032](https://github.com/fablebookjs/lab-01/actions/runs/29490566032)
+made zero mutations.
 
-Open dedicated recovery [PR #26](https://github.com/fablebookjs/lab-01/pull/26).
-While it was open and clean, sweeps
-[29454762852](https://github.com/fablebookjs/lab-01/actions/runs/29454762852)
-and [29454800587](https://github.com/fablebookjs/lab-01/actions/runs/29454800587)
-both returned `blocked-recovery-open`: no proposal ref and no proposal PR.
-PR #26 then merged normally with the exact two-parent recovery graph.
+### 4:35 — Connect to the broader release model
 
-### 4:10 — Create once, then reuse
+Open the public [release-state explorer](https://fablebookjs.github.io/release-state-explorer/)
+to name the states and show how conflict recovery differs from this clean live
+path. The retained conflict, required-check, and recovery-terminal calibrations
+remain linked from the repository README and were not replayed destructively on
+the real release line.
 
-Run [29454848877](https://github.com/fablebookjs/lab-01/actions/runs/29454848877)
-created the structured empty next proposal and draft
-[PR #27](https://github.com/fablebookjs/lab-01/pull/27). Run
-[29454904814](https://github.com/fablebookjs/lab-01/actions/runs/29454904814)
-reused the exact proposal SHA, ref, marker, and PR with no duplicate POST. The
-[completed recovery-terminal proof](recovery-terminal-calibration.md) carries
-the exact parents, trees, trailers, and retained SHAs.
+## Boundaries
 
-## What this does—and does not—prove
-
-Proven live in the synthetic lab: GitHub token authority, guarded fixed-ref
-writes, same-draft maintenance, current-head required checks, conflict backup
-and recovery, open-recovery suppression, and next-proposal creation/reuse.
-
-Not implemented or claimed here:
-
-- public package publication;
-- integrated `M`/`V` finalization, version tag, or GitHub Release creation;
-- Storybook repository or package migration;
-- a commitment to multi-major release-line support.
-
-Those boundaries are intentional. Public finalization and publication remain
-owned by `fablebookjs/infra#19`.
+This is a disposable two-package, one-release-line laboratory proof. It does
+not mutate Storybook, deploy documentation, implement multi-major branch cuts
+or forward ports, or establish production support policy. Those are separate
+program increments, not hidden claims of this demo.

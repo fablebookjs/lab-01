@@ -252,13 +252,19 @@ export function recoveryPullBody({ lateSha, snapshotSha }) {
 export function nextProposalBody(state) {
   const commits = state.line.remaining.map(({ sha, subject }) => `- \`${sha}\` — ${subject}`).join('\n');
   return `## Fablebook lab release proposal ${NEXT_VERSION}\n\n` +
+    `- Release line: \`${RELEASE_LINE}\`\n` +
+    `- Proposed version: \`${NEXT_VERSION}\`\n` +
+    `- Exact release source: \`${state.line.headSha}\`\n` +
+    `- Structured intent commit: \`${state.staged.sha}\`\n\n` +
+    `The structured empty commit is authoritative. This editable title and body are presentation only.\n\n` +
     `This draft contains the ordered work that remained after ${TAG_NAME}.\n\n${commits}\n\n` +
     `### Lifecycle\n\n` +
     `- Mark this draft ready to run exact-version release QA.\n` +
     `- Additional release-line fixes refresh and revalidate the proposal.\n` +
     `- Merge the current green proposal to authorize publication.\n` +
     `- Close an unmerged proposal to request one clean replacement draft.\n\n` +
-    `The ${TAG_NAME} tag remains bound to snapshot \`${state.graph.snapshot.sha}\`; the commits above were not part of ${RELEASE_VERSION}.`;
+    `The ${TAG_NAME} tag remains bound to snapshot \`${state.graph.snapshot.sha}\`; the commits above were not part of ${RELEASE_VERSION}.\n\n` +
+    `See [docs/release-process.md](https://github.com/${REPOSITORY}/blob/${RELEASE_LINE}/docs/release-process.md) for the current contract and safety boundary.`;
 }
 
 export function githubReleaseBody(state) {
