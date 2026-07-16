@@ -64,7 +64,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: ready-release-qa-${{ steps.qa.outputs.staged-sha || github.run_id }}
+          name: ready-release-qa-${{ steps.qa.outputs.staged_sha || github.run_id }}
           path: ${{ runner.temp }}/ready-release-qa.json
           if-no-files-found: warn
           retention-days: 30

@@ -379,7 +379,7 @@ test('Ready QA uses a read-only signal and exact default-main controller with in
   assert.match(controller, /--authority github-current/);
   assert.match(controller, /uses: actions\/setup-node@[0-9a-f]{40} # v6/);
   assert.match(controller, /uses: actions\/upload-artifact@[0-9a-f]{40} # v6/);
-  assert.match(controller, /ready-release-qa-\$\{\{ steps\.qa\.outputs\.staged-sha/);
+  assert.match(controller, /ready-release-qa-\$\{\{ steps\.qa\.outputs\.staged_sha/);
   assert.doesNotMatch(controller, /path: candidate|pull_request\.head\.sha|staged_sha:|source_sha:/);
 });
 

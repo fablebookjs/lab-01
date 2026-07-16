@@ -1355,7 +1355,7 @@ export async function main(argv = process.argv.slice(2)) {
     });
     await writeJson(output, evidence);
     if (process.env.GITHUB_OUTPUT) {
-      await appendFile(process.env.GITHUB_OUTPUT, `staged-sha=${resolved.stagedSha}\n`);
+      await appendFile(process.env.GITHUB_OUTPUT, `staged_sha=${resolved.stagedSha}\n`);
     }
     console.log(JSON.stringify(evidence, null, 2));
   } catch {
