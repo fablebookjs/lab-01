@@ -177,6 +177,8 @@ test('maintainer wake-ups are non-authoritative exact signal/manual shapes and e
   const malformedClose = structuredClone(unrelatedClose);
   malformedClose.workflow_run.head_branch = 'bad..branch';
   assert.throws(() => validateMaintainerWakeup({ eventName: 'workflow_run', event: malformedClose }));
+  malformedClose.workflow_run.head_branch = '/suspicious';
+  assert.throws(() => validateMaintainerWakeup({ eventName: 'workflow_run', event: malformedClose }));
   for (const mutate of [
     (value) => { value.workflow_run.name = 'Maintain release draft'; },
     (value) => { value.workflow_run.event = 'workflow_dispatch'; },

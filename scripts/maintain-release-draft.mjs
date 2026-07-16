@@ -52,6 +52,7 @@ function validHeadBranch(branch) {
   if (
     branch === '@' ||
     branch.startsWith('-') ||
+    branch.startsWith('/') ||
     branch.endsWith('/') ||
     branch.endsWith('.') ||
     branch.includes('//') ||
