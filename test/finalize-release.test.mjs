@@ -50,6 +50,7 @@ const ids = {
   nextIntent: sha('7'),
   otherLate: sha('8'),
   main: sha('9'),
+  oldIntent: sha('a'),
   recoveryReconciliation: sha('f'),
 };
 const trees = {
@@ -121,6 +122,23 @@ function recoveryPull(overrides = {}) {
   };
 }
 
+function historicalReleasePull(number = 1, overrides = {}) {
+  return {
+    number,
+    state: 'closed',
+    draft: true,
+    merged: false,
+    merged_at: null,
+    merge_commit_sha: null,
+    html_url: `https://github.com/fablebookjs/lab-01/pull/${number}`,
+    title: 'release: propose v1.0.1',
+    body: 'retained historical 1.0.1 lifecycle proposal',
+    head: { ref: 'staged/v1.0', sha: ids.oldIntent, repo: { full_name: REPOSITORY } },
+    base: { ref: 'releases/v1.0', sha: ids.source, repo: { full_name: REPOSITORY } },
+    ...overrides,
+  };
+}
+
 class MemoryGit {
   constructor() {
     this.refs = {
@@ -134,6 +152,7 @@ class MemoryGit {
     this.commits = new Map([
       [ids.source, { sha: ids.source, parents: [sha('0')], tree: trees.source, message: 'fix: sealed source\n' }],
       [ids.intent, { sha: ids.intent, parents: [ids.source], tree: trees.source, message: intentMessage() }],
+      [ids.oldIntent, { sha: ids.oldIntent, parents: [ids.source], tree: trees.source, message: intentMessage() }],
       [ids.merge, { sha: ids.merge, parents: [ids.source, ids.intent], tree: trees.source, message: 'Merge pull request #12\n' }],
       [ids.snapshot, {
         sha: ids.snapshot,
@@ -185,6 +204,7 @@ class MemoryGit {
     this.genericPushFailure = false;
     this.mainCheckHook = null;
     this.refReadHook = null;
+    this.stableRefReadHook = null;
   }
 
   async listRefs() {
@@ -194,10 +214,12 @@ class MemoryGit {
   }
   async readStableRef(ref) {
     this.operations.push({ transport: 'git', method: 'ls-remote', mutation: false, repository: REPOSITORY, ref });
+    if (this.stableRefReadHook) await this.stableRefReadHook(this, ref);
     return this.refs[ref]?.sha ?? null;
   }
-  async assertTrustedMain(context) {
-    if (this.mainCheckHook) await this.mainCheckHook(this);
+  async preflight() {}
+  async assertTrustedMain(context, knownRefs = null) {
+    if (this.mainCheckHook) await this.mainCheckHook(this, knownRefs);
     const remoteMainSha = this.refs['refs/heads/main']?.sha ?? null;
     if (
       remoteMainSha !== context.sourceSha ||
@@ -211,6 +233,7 @@ class MemoryGit {
     if (!commit) throw new Error(`missing commit ${value}`);
     return structuredClone(commit);
   }
+  async pullCommit(_number, value) { return this.commit(value); }
   async acceptedSnapshot(value) {
     assert.equal(value, ids.snapshot);
     return {
@@ -310,6 +333,8 @@ class MemoryGitHub {
     this.definiteReleaseRejection = false;
     this.definitePullRejection = false;
     this.pullReadHook = null;
+    this.beforeReleaseCreate = null;
+    this.beforePullCreate = null;
   }
   async repository() {
     this.operations.push({ transport: 'github', method: 'GET', mutation: false, repository: REPOSITORY, endpoint: '/' });
@@ -328,9 +353,13 @@ class MemoryGitHub {
     else if (this.pendingReleases.length) this.releases.push(...this.pendingReleases.splice(0));
     return structuredClone(this.releases);
   }
-  async createRelease({ tagName, targetSha, body }) {
+  async createRelease({ tagName, targetSha, body, expectedLineSha, expectedTagSha }) {
+    if (this.beforeReleaseCreate) await this.beforeReleaseCreate(this);
     this.durableWrites.push({ type: 'release', tagName, targetSha });
-    this.operations.push({ transport: 'github', method: 'POST', mutation: true, repository: REPOSITORY, endpoint: '/releases' });
+    this.operations.push({
+      transport: 'github', method: 'POST', mutation: true, repository: REPOSITORY, endpoint: '/releases',
+      expectations: { targetSha, expectedLineSha, expectedTagSha },
+    });
     if (this.definiteReleaseRejection) {
       this.definiteReleaseRejection = false;
       throw new DefiniteGitHubClientError(400, '/releases');
@@ -351,12 +380,15 @@ class MemoryGitHub {
       this.ambiguousRelease = false;
       throw new Error('lost release POST response');
     }
+    return structuredClone(release);
   }
   async createPullRequest({ title, body, head, base, draft, expectedHeadSha, expectedBaseSha }) {
+    if (this.beforePullCreate) await this.beforePullCreate(this);
     this.durableWrites.push({ type: 'pull', head, base });
-    this.operations.push({ transport: 'github', method: 'POST', mutation: true, repository: REPOSITORY, endpoint: '/pulls' });
-    assert.equal(expectedHeadSha, this.git.refs[STAGED_REF].sha);
-    assert.equal(expectedBaseSha, this.git.refs[RELEASE_REF].sha);
+    this.operations.push({
+      transport: 'github', method: 'POST', mutation: true, repository: REPOSITORY, endpoint: '/pulls',
+      expectations: { expectedHeadSha, expectedBaseSha },
+    });
     if (this.definitePullRejection) {
       this.definitePullRejection = false;
       throw new DefiniteGitHubClientError(400, '/pulls');
@@ -380,6 +412,7 @@ class MemoryGitHub {
       this.ambiguousPull = false;
       throw new Error('lost PR POST response');
     }
+    return structuredClone(pull);
   }
 }
 
@@ -445,6 +478,8 @@ test('workflow is exact trusted-main manual authority with no npm authentication
   assert.match(workflow, /permissions:\n      contents: write\n      pull-requests: write/);
   assert.doesNotMatch(workflow, /id-token:|packages:|actions: (?:read|write)|secrets\.|NPM_TOKEN|NODE_AUTH_TOKEN|npmrc|registry=/i);
   assert.doesNotMatch(workflow, /source_sha|merge_sha|snapshot_sha|head_sha|target_sha/i);
+  assert.ok(workflow.indexOf('node scripts/bootstrap-npm-cli.mjs') < workflow.indexOf('node scripts/finalize-release.mjs'));
+  assert.doesNotMatch(workflow, /npm\s+(?:publish|login|adduser|token)/i);
   for (const line of workflow.split('\n').filter((value) => value.trim().startsWith('uses:'))) {
     assert.match(line, /@[0-9a-f]{40}(?: # v6)?$/);
   }
@@ -587,6 +622,10 @@ test('lost GitHub Release success and the retained injected fault converge witho
   );
   assert.equal(value.githubAdapter.durableWrites.length, 1);
   assert.equal(value.githubAdapter.releases.length, 1);
+  assert.deepEqual(
+    value.githubAdapter.operations.find(({ method }) => method === 'POST').expectations,
+    { targetSha: ids.snapshot, expectedLineSha: ids.snapshot, expectedTagSha: ids.snapshot },
+  );
   const rerun = await runFinalizerInvocation({ adapters: value, context: value.context });
   assert.equal(rerun.action.type, 'complete');
   assert.equal(value.githubAdapter.durableWrites.length, 1);
@@ -644,6 +683,10 @@ test('normal J advances the old staged intent, then creates exactly one draft wi
   assert.equal(prRun.action.type, 'post-next-proposal');
   assert.equal(prRun.action.result, 'converged-after-ambiguous-response');
   assert.equal(value.githubAdapter.durableWrites.filter(({ type }) => type === 'pull').length, 1);
+  assert.deepEqual(
+    value.githubAdapter.operations.find(({ method, endpoint }) => method === 'POST' && endpoint === '/pulls').expectations,
+    { expectedHeadSha: ids.nextIntent, expectedBaseSha: ids.reconciliation },
+  );
   assert.match(value.githubAdapter.pulls.at(-1).body, new RegExp(ids.late));
   assert.match(value.githubAdapter.pulls.at(-1).body, /Mark this draft ready/);
   assert.match(value.githubAdapter.pulls.at(-1).body, /Close an unmerged proposal/);
@@ -690,6 +733,34 @@ test('closed next proposals regenerate once, while duplicates and merged/wrong i
     html_url: 'https://github.com/fablebookjs/lab-01/pull/102',
   });
   await assert.rejects(observe(value), /more than one open/);
+});
+
+test('retained live-shaped 1.0.1 lifecycle history is classified and preserved around 1.0.2 staging', async () => {
+  const before = fixture();
+  before.githubAdapter.pulls.push(historicalReleasePull(1), historicalReleasePull(11));
+  const beforeState = await observe(before);
+  assert.deepEqual(beforeState.historicalReleasePulls.map(({ number }) => number), [1, 11]);
+  assert.equal(classifyNextAction(beforeState).type, 'fast-forward-line');
+
+  const after = fixture();
+  after.gitAdapter.refs[RELEASE_REF].sha = ids.reconciliation;
+  after.gitAdapter.refs[TAG_REF] = { sha: ids.snapshot, type: 'commit' };
+  await installExactRelease(after);
+  after.gitAdapter.refs[STAGED_REF].sha = ids.nextIntent;
+  after.gitAdapter.commits.set(ids.nextIntent, {
+    sha: ids.nextIntent,
+    parents: [ids.reconciliation],
+    tree: trees.reconciliation,
+    message: nextIntentMessage(ids.reconciliation),
+  });
+  after.githubAdapter.pulls.splice(1, 0, historicalReleasePull(1));
+  after.githubAdapter.pulls.push(historicalReleasePull(11));
+  const afterState = await observe(after);
+  assert.deepEqual(afterState.historicalReleasePulls.map(({ number }) => number), [1, 11]);
+  assert.equal(classifyNextAction(afterState).type, 'authorize-next-proposal');
+
+  after.gitAdapter.commits.get(ids.oldIntent).message = intentMessage(RELEASE_VERSION, ids.otherLate);
+  await assert.rejects(observe(after), /invalid Release-Source/);
 });
 
 test('complete pagination is bounded, ordered, and rejects duplicate page identities', async () => {
@@ -841,12 +912,113 @@ test('trusted main is rebound at the push and GitHub POST boundaries', async () 
     postChecks += 1;
     if (postChecks === 4) git.refs['refs/heads/main'].sha = ids.otherLate;
   };
-  await assert.rejects(
-    runFinalizerInvocation({ adapters: postRace, context: postRace.context }),
-    /(?:trusted current-main binding drifted|finalizer source is not exact current default main)/,
-  );
+  let postError;
+  try { await runFinalizerInvocation({ adapters: postRace, context: postRace.context }); }
+  catch (error) { postError = error; }
+  assert.match(postError?.message ?? '', /(?:trusted current-main binding drifted|finalizer source is not exact current default main)/);
   assert.equal(postRace.githubAdapter.durableWrites.length, 0);
   assert.equal(postRace.gitAdapter.refs[RELEASE_ATTEMPT_REF].sha, ids.snapshot);
+  assert.ok(postError.evidence, 'spent marker failure retains durable evidence');
+  assert.equal(postError.evidence.durableTransitions.at(-1).observedSha, ids.snapshot);
+  assert.notEqual(postError.evidence.currentError, undefined);
+  assert.doesNotMatch(JSON.stringify(postError.evidence), /GITHUB_TOKEN|authorization|\/tmp\//i);
+});
+
+test('spent attempts stably bind every mutable ref and retain evidence across all post-marker races', async () => {
+  const releaseFixture = async () => {
+    const value = fixture();
+    value.gitAdapter.refs[RELEASE_REF].sha = ids.snapshot;
+    value.gitAdapter.refs[TAG_REF] = { sha: ids.snapshot, type: 'commit' };
+    assert.equal((await runFinalizerInvocation({ adapters: value, context: value.context })).action.type, 'authorize-github-release');
+    return value;
+  };
+  const caught = async (promise) => {
+    try { await promise; return null; } catch (error) { return error; }
+  };
+
+  const markerDrift = await releaseFixture();
+  let markerReads = 0;
+  markerDrift.gitAdapter.stableRefReadHook = async (git, ref) => {
+    if (ref === RELEASE_ATTEMPT_REF && git.refs[ref]?.sha === ids.snapshot && markerReads++ === 0) {
+      git.refs[ref].sha = ids.merge;
+    }
+  };
+  const markerError = await caught(runFinalizerInvocation({ adapters: markerDrift, context: markerDrift.context }));
+  assert.equal(markerDrift.githubAdapter.durableWrites.length, 0);
+  assert.ok(markerError.evidence);
+  assert.equal(markerError.evidence.durableTransitions[0].pushAccepted, true);
+
+  const tagDrift = await releaseFixture();
+  let refSweeps = 0;
+  tagDrift.gitAdapter.refReadHook = async (git) => {
+    refSweeps += 1;
+    if (refSweeps === 3) git.refs[TAG_REF].sha = ids.merge;
+  };
+  const tagError = await caught(runFinalizerInvocation({ adapters: tagDrift, context: tagDrift.context }));
+  assert.equal(tagDrift.githubAdapter.durableWrites.length, 0);
+  assert.ok(tagError.evidence);
+  assert.equal(tagError.evidence.postBinding.refs.find(({ ref }) => ref === TAG_REF).observed, ids.merge);
+
+  const mainDrift = await releaseFixture();
+  mainDrift.gitAdapter.mainCheckHook = async (git, knownRefs) => {
+    if (knownRefs && git.refs[RELEASE_ATTEMPT_REF]?.sha === ids.snapshot) git.refs['refs/heads/main'].sha = ids.otherLate;
+  };
+  const mainError = await caught(runFinalizerInvocation({ adapters: mainDrift, context: mainDrift.context }));
+  assert.equal(mainDrift.githubAdapter.durableWrites.length, 0);
+  assert.ok(mainError.evidence);
+
+  const transportFailure = await releaseFixture();
+  let transportSweeps = 0;
+  transportFailure.gitAdapter.refReadHook = async () => {
+    transportSweeps += 1;
+    if (transportSweeps === 3) throw new Error('sanitized stable-ref transport failure');
+  };
+  const transportError = await caught(runFinalizerInvocation({ adapters: transportFailure, context: transportFailure.context }));
+  assert.match(transportError.message, /stable-ref transport failure/);
+  assert.equal(transportFailure.githubAdapter.durableWrites.length, 0);
+  assert.ok(transportError.evidence);
+
+  const crossService = await releaseFixture();
+  crossService.githubAdapter.beforeReleaseCreate = async ({ git }) => {
+    git.refs[RELEASE_REF].sha = ids.late;
+  };
+  const crossServiceError = await caught(runFinalizerInvocation({ adapters: crossService, context: crossService.context }));
+  assert.equal(crossService.githubAdapter.durableWrites.length, 1);
+  assert.ok(crossServiceError.evidence);
+  assert.equal(crossServiceError.evidence.postBinding.refs.find(({ ref }) => ref === RELEASE_REF).observed, ids.snapshot);
+
+  const proposal = fixture();
+  proposal.gitAdapter.refs[RELEASE_REF].sha = ids.reconciliation;
+  proposal.gitAdapter.refs[TAG_REF] = { sha: ids.snapshot, type: 'commit' };
+  await installExactRelease(proposal);
+  proposal.gitAdapter.refs[STAGED_REF].sha = ids.nextIntent;
+  proposal.gitAdapter.commits.set(ids.nextIntent, {
+    sha: ids.nextIntent,
+    parents: [ids.reconciliation],
+    tree: trees.reconciliation,
+    message: nextIntentMessage(ids.reconciliation),
+  });
+  await runFinalizerInvocation({ adapters: proposal, context: proposal.context });
+  proposal.githubAdapter.beforePullCreate = async ({ git }) => { git.refs[STAGED_REF].sha = ids.oldIntent; };
+  const proposalError = await caught(runFinalizerInvocation({ adapters: proposal, context: proposal.context }));
+  assert.equal(proposal.githubAdapter.durableWrites.filter(({ type }) => type === 'pull').length, 1);
+  assert.ok(proposalError.evidence);
+  assert.deepEqual(
+    proposalError.evidence.postBinding.refs.filter(({ ref }) => [RELEASE_REF, STAGED_REF].includes(ref)).map(({ expected, observed }) => [expected, observed]),
+    [[ids.reconciliation, ids.reconciliation], [ids.nextIntent, ids.nextIntent]],
+  );
+
+  const postRead = fixture();
+  let pullReads = 0;
+  postRead.githubAdapter.pullReadHook = async (github) => {
+    pullReads += 1;
+    if (pullReads === 2) github.pulls[0].base.sha = ids.otherLate;
+  };
+  const postReadError = await caught(runFinalizerInvocation({ adapters: postRead, context: postRead.context }));
+  assert.equal(postRead.gitAdapter.refs[RELEASE_REF].sha, ids.snapshot);
+  assert.ok(postReadError.evidence);
+  assert.equal(postReadError.evidence.durableTransitions.at(-1).observedSha, ids.snapshot);
+  assert.match(postReadError.evidence.currentError.message, /accepted snapshot does not resolve/);
 });
 
 test('merged conflict recovery accepts exact J [V,H] with a conflict-resolution tree', async () => {
@@ -916,8 +1088,26 @@ test('Git, GitHub, and npm adapters reject hostile configuration and destination
     execFileSync('git', ['init', root], { stdio: 'ignore' });
     execFileSync('git', ['-C', root, 'remote', 'add', 'origin', 'https://github.com/fablebookjs/lab-01.git']);
     execFileSync('git', ['-C', root, 'config', 'push.followTags', 'true']);
-    assert.throws(() => new LiveGitAdapter({ cwd: root }).assertClosedTransport(), /forbidden local Git/);
+    assert.throws(() => new LiveGitAdapter({ cwd: root }).assertClosedTransport(), /non-allowlisted setting/);
     execFileSync('git', ['-C', root, 'config', '--unset', 'push.followTags']);
+    for (const [key, value] of [
+      ['http.proxy', 'http://127.0.0.1:1'],
+      ['http.sslVerify', 'false'],
+      ['http.sslCAInfo', '/tmp/hostile-ca.pem'],
+      ['http.sslCert', '/tmp/hostile-cert.pem'],
+      ['http.lowSpeedLimit', '1'],
+      ['http.lowSpeedTime', '1'],
+      ['credential.helper', '!hostile'],
+      ['remote.origin.proxy', 'socks5://127.0.0.1:1'],
+      ['remote.origin.uploadpack', '/tmp/hostile-upload-pack'],
+      ['include.path', '/tmp/hostile-gitconfig'],
+      ['includeIf.gitdir:/tmp/.path', '/tmp/hostile-gitconfig'],
+      ['url.https://attacker.invalid/.insteadOf', 'https://github.com/'],
+    ]) {
+      execFileSync('git', ['-C', root, 'config', key, value]);
+      assert.throws(() => new LiveGitAdapter({ cwd: root }).assertClosedTransport(), /non-allowlisted setting|rewriting is forbidden/);
+      execFileSync('git', ['-C', root, 'config', '--unset-all', key]);
+    }
     process.env.GIT_EXEC_PATH = '/tmp/hostile-git-exec';
     assert.throws(() => new LiveGitAdapter({ cwd: root }).assertClosedTransport(), /GIT_EXEC_PATH/);
     delete process.env.GIT_EXEC_PATH;
@@ -927,6 +1117,24 @@ test('Git, GitHub, and npm adapters reject hostile configuration and destination
     process.env.HTTPS_PROXY = 'http://127.0.0.1:1';
     assert.throws(() => github.assertRequest('GET', `/repos/${REPOSITORY}`), /hostile inherited HTTP environment/);
     await assert.rejects(new LiveNpmAdapter().observe(PACKAGE_SPECS[0]), /hostile inherited HTTP environment/);
+
+    delete process.env.HTTPS_PROXY;
+    execFileSync('git', ['-C', root, 'config', 'http.sslVerify', 'false']);
+    let apiReads = 0;
+    const neverGitHub = {
+      repository: async () => { apiReads += 1; return { full_name: REPOSITORY, default_branch: 'main' }; },
+      listPulls: async () => { apiReads += 1; return []; },
+      listReleases: async () => { apiReads += 1; return []; },
+      operations: [],
+    };
+    const neverNpm = { observe: async () => { apiReads += 1; return { status: 'absent' }; }, operations: [] };
+    await assert.rejects(observeDurableState({
+      gitAdapter: new LiveGitAdapter({ cwd: root }),
+      githubAdapter: neverGitHub,
+      npmAdapter: neverNpm,
+      context: { enforceTrustedMain: false },
+    }), /non-allowlisted setting/);
+    assert.equal(apiReads, 0);
   } finally {
     if (oldGitExecPath === undefined) delete process.env.GIT_EXEC_PATH;
     else process.env.GIT_EXEC_PATH = oldGitExecPath;
@@ -1030,6 +1238,50 @@ test('authoritative sweeps compare complete hydrated tuples and proposal base SH
   };
   await assert.rejects(releases.listReleases(), /changed across two authoritative sweeps/);
 
+  const swappedPull = new LiveGitHubAdapter();
+  swappedPull.paginate = async () => [{ id: 1200, number: 12 }];
+  swappedPull.request = async () => ({ ...releasePull(), id: 1300, number: 13, html_url: 'https://github.com/fablebookjs/lab-01/pull/13' });
+  await assert.rejects(swappedPull.pullSweep(), /does not match requested summary/);
+
+  const swappedRelease = new LiveGitHubAdapter();
+  swappedRelease.paginate = async () => [{ id: 500 }];
+  swappedRelease.request = async () => ({
+    id: 501,
+    tag_name: 'v1.0.1',
+    target_commitish: ids.snapshot,
+    name: 'v1.0.1',
+    body: 'body',
+    draft: false,
+    prerelease: false,
+    html_url: 'https://github.com/fablebookjs/lab-01/releases/tag/v1.0.1',
+  });
+  await assert.rejects(swappedRelease.releaseSweep(), /does not match requested summary/);
+
+  const createdPull = new LiveGitHubAdapter();
+  createdPull.request = async (method) => method === 'POST'
+    ? { id: 1001, number: 101 }
+    : { ...releasePull(), id: 1002, number: 102, html_url: 'https://github.com/fablebookjs/lab-01/pull/102' };
+  await assert.rejects(createdPull.createPullRequest({
+    title: 'release: propose v1.0.2', body: 'body', head: 'staged/v1.0', base: 'releases/v1.0', draft: true,
+    expectedHeadSha: ids.nextIntent, expectedBaseSha: ids.reconciliation,
+  }), /does not match its POST identity/);
+
+  const createdRelease = new LiveGitHubAdapter();
+  createdRelease.request = async (method) => method === 'POST'
+    ? { id: 500 }
+    : { id: 501 };
+  await assert.rejects(createdRelease.createRelease({
+    tagName: 'v1.0.1', targetSha: ids.snapshot, body: 'body', expectedLineSha: ids.snapshot, expectedTagSha: ids.snapshot,
+  }), /does not match its POST identity/);
+
+  const stringIdentity = new LiveGitHubAdapter();
+  stringIdentity.request = async () => [{ number: '12' }];
+  await assert.rejects(stringIdentity.paginate('/repos/fablebookjs/lab-01/pulls?state=all&sort=created&direction=asc'), /exact positive number/);
+
+  const aliasedIdentity = new LiveGitHubAdapter();
+  aliasedIdentity.request = async () => [{ number: 12, id: 1200 }, { number: 13, id: 1200 }];
+  await assert.rejects(aliasedIdentity.paginate('/repos/fablebookjs/lab-01/pulls?state=all&sort=created&direction=asc'), /aliased pull id/);
+
   const staleBase = fixture();
   staleBase.gitAdapter.refs[RELEASE_REF].sha = ids.reconciliation;
   staleBase.gitAdapter.refs[TAG_REF] = { sha: ids.snapshot, type: 'commit' };
@@ -1056,7 +1308,7 @@ test('authoritative sweeps compare complete hydrated tuples and proposal base SH
     head: { ref: 'staged/v1.0', sha: ids.nextIntent, repo: { full_name: REPOSITORY } },
     base: { ref: 'releases/v1.0', sha: ids.snapshot, repo: { full_name: REPOSITORY } },
   });
-  await assert.rejects(observe(staleBase), /incompatible head\/base/);
+  await assert.rejects(observe(staleBase), /(?:incompatible head\/base|lifecycle source\/title is incompatible)/);
 });
 
 test('preservation evidence records full observed tuple changes and instrumented scope boundaries', async () => {

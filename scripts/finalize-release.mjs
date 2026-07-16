@@ -12,15 +12,11 @@ import {
   REPOSITORY_URL,
   SNAPSHOT_REF,
   STAGED_LINE,
-  TRANSFORMED_FILES,
   assertSha,
+  deriveTrustedSnapshotAuthority,
   fail,
-  parseSnapshotMessage,
   parseTrailers,
-  validateIntentShape,
-  validateMergeShape,
   validatePackageEvidence,
-  validateSnapshotShape,
 } from './release-publication.mjs';
 
 export const DEFAULT_BRANCH = 'main';
@@ -117,6 +113,13 @@ export class DefiniteGitHubClientError extends Error {
   }
 }
 
+export class PrePostDriftError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'PrePostDriftError';
+  }
+}
+
 export function buildLeasedPushArguments(ref, expected, next) {
   if (!ALLOWED_GIT_WRITE_REFS.has(ref)) fail(`finalizer refuses write outside its exact ref allowlist: ${ref}`);
   if (expected !== null) assertSha(expected, 'expected old ref');
@@ -153,6 +156,7 @@ function pullState(pull) {
 
 function validateCanonicalPull(pull) {
   if (!Number.isInteger(pull?.number) || pull.number < 1) fail('pull request number is not positive');
+  if (pull.id !== undefined && (!Number.isInteger(pull.id) || pull.id < 1)) fail(`pull request #${pull.number} has an invalid id`);
   if (pull.html_url !== `https://github.com/${REPOSITORY}/pull/${pull.number}`) {
     fail(`pull request #${pull.number} has a non-canonical URL`);
   }
@@ -277,6 +281,35 @@ function validateNextIntent(commit, source) {
   }
 }
 
+async function structuredLifecycleIntent(pull, gitAdapter, readCommit) {
+  const commit = typeof gitAdapter.pullCommit === 'function'
+    ? await gitAdapter.pullCommit(pull.number, pull.head.sha)
+    : await readCommit(pull.head.sha);
+  if (commit.sha !== pull.head.sha || commit.parents.length !== 1) {
+    fail(`pull request #${pull.number} does not resolve to one exact lifecycle intent`);
+  }
+  const match = /^release: propose v(1\.0\.[12])$/.exec(commit.message.split('\n', 1)[0]);
+  if (!match) fail(`pull request #${pull.number} has an unstructured production lifecycle intent`);
+  const version = match[1];
+  const source = await readCommit(commit.parents[0]);
+  if (commit.tree !== source.tree) fail(`pull request #${pull.number} lifecycle intent is not empty`);
+  const trailers = parseTrailers(commit.message, `release: propose v${version}`);
+  const expected = new Map([
+    ['Release-Intent-Version', '1'],
+    ['Release-Line', RELEASE_LINE],
+    ['Release-Version', version],
+    ['Release-Source', source.sha],
+  ]);
+  if (trailers.size !== expected.size) fail(`pull request #${pull.number} lifecycle intent has unexpected trailers`);
+  for (const [key, value] of expected) {
+    if (trailers.get(key) !== value) fail(`pull request #${pull.number} lifecycle intent has an invalid ${key}`);
+  }
+  if (pull.base.sha !== source.sha || pull.title !== `release: propose v${version}`) {
+    fail(`pull request #${pull.number} lifecycle source/title is incompatible`);
+  }
+  return { version, sourceSha: source.sha, intentSha: commit.sha };
+}
+
 function validateNpmObservation(observation, expected, spec) {
   if (observation.status === 'absent') return;
   if (observation.status !== 'present' || observation.name !== spec.name || observation.version !== RELEASE_VERSION) {
@@ -372,6 +405,7 @@ function summarizeRefs(refs) {
 function canonicalPullTuple(pull) {
   validateCanonicalPull(pull);
   return {
+    id: pull.id ?? null,
     number: pull.number,
     url: pull.html_url,
     state: pull.state,
@@ -477,6 +511,7 @@ function validateAcceptedAuthority(authority, snapshotSha) {
 }
 
 export async function observeDurableState({ gitAdapter, githubAdapter, npmAdapter, context }) {
+  if (typeof gitAdapter.preflight === 'function') await gitAdapter.preflight();
   const [refs, repository, pulls, releases, npmObservations] = await Promise.all([
     gitAdapter.listRefs(),
     githubAdapter.repository(),
@@ -674,8 +709,24 @@ export async function observeDurableState({ gitAdapter, githubAdapter, npmAdapte
     staged = { kind: 'next-intent', sha: stagedSha, commit: stagedCommit };
   }
 
-  const currentProposalHistory = matchingPulls(pulls, STAGED_LINE, RELEASE_LINE)
+  const productionLifecycleHistory = matchingPulls(pulls, STAGED_LINE, RELEASE_LINE)
     .filter((pull) => pull.number !== releasePulls[0].number);
+  const historicalReleasePulls = [];
+  const currentProposalHistory = [];
+  for (const pull of productionLifecycleHistory) {
+    const lifecycle = await structuredLifecycleIntent(pull, gitAdapter, readCommit);
+    const state = pullState(pull);
+    if (lifecycle.version === RELEASE_VERSION) {
+      if (state !== 'closed-unmerged') {
+        fail(`historical ${RELEASE_VERSION} pull request #${pull.number} is not safely closed-unmerged`);
+      }
+      historicalReleasePulls.push({ number: pull.number, state, url: pull.html_url, ...lifecycle });
+    } else if (lifecycle.version === NEXT_VERSION) {
+      currentProposalHistory.push(pull);
+    } else {
+      fail(`pull request #${pull.number} identifies an unsupported lifecycle version`);
+    }
+  }
   let proposal = { kind: 'none', history: [] };
   let proposalAttempt = { phase: 'absent', ref: PROPOSAL_ATTEMPT_REF };
   if (staged.kind === 'next-intent') {
@@ -722,7 +773,15 @@ export async function observeDurableState({ gitAdapter, githubAdapter, npmAdapte
     fail('a 1.0.2 intent exists before the exact 1.0.1 GitHub Release');
   }
 
-  return stableReturn({ ...baseState, githubRelease, releaseAttempt, staged, proposal, proposalAttempt });
+  return stableReturn({
+    ...baseState,
+    githubRelease,
+    releaseAttempt,
+    staged,
+    proposal,
+    proposalAttempt,
+    historicalReleasePulls,
+  });
 }
 
 export function classifyNextAction(state) {
@@ -768,6 +827,15 @@ export function classifyNextAction(state) {
         tagName: TAG_NAME,
         targetSha: state.graph.snapshot.sha,
         body: githubReleaseBody(state),
+        expectedRefs: {
+          [RELEASE_REF]: state.line.headSha,
+          [STAGED_REF]: state.staged.sha,
+          [SNAPSHOT_REF]: state.graph.snapshot.sha,
+          [TAG_REF]: state.graph.snapshot.sha,
+          [RECOVERY_REF]: state.recovery.kind === 'recorded' ? state.recovery.sha : null,
+          [RELEASE_ATTEMPT_REF]: state.graph.snapshot.sha,
+          [PROPOSAL_ATTEMPT_REF]: null,
+        },
       };
     }
     return { type: 'await-github-release-visibility', durable: false, attemptRef: RELEASE_ATTEMPT_REF };
@@ -811,6 +879,17 @@ export function classifyNextAction(state) {
     rejectedAttempt: state.graph.snapshot.sha,
     title: nextProposalTitle(),
     body: nextProposalBody(state),
+    expectedHeadSha: state.staged.sha,
+    expectedBaseSha: state.line.headSha,
+    expectedRefs: {
+      [RELEASE_REF]: state.line.headSha,
+      [STAGED_REF]: state.staged.sha,
+      [SNAPSHOT_REF]: state.graph.snapshot.sha,
+      [TAG_REF]: state.graph.snapshot.sha,
+      [RECOVERY_REF]: state.recovery.kind === 'recorded' ? state.recovery.sha : null,
+      [RELEASE_ATTEMPT_REF]: state.graph.snapshot.sha,
+      [PROPOSAL_ATTEMPT_REF]: state.staged.sha,
+    },
   };
 }
 
@@ -967,7 +1046,12 @@ function summarizeState(state) {
     githubRelease: state.githubRelease,
     recovery: state.recovery,
     releaseAttempt: state.releaseAttempt,
-    next: { staged: state.staged, proposal: state.proposal, attempt: state.proposalAttempt },
+    next: {
+      staged: state.staged,
+      proposal: state.proposal,
+      attempt: state.proposalAttempt,
+      retainedReleaseHistory: state.historicalReleasePulls ?? [],
+    },
   };
 }
 
@@ -999,7 +1083,50 @@ export async function runFinalizerInvocation({ adapters, context, fault = 'none'
   let writeError = null;
   let postIssued = false;
   let definiteRejectionRecorded = false;
+  let prePostDrift = false;
+  let prePostFailure = false;
+  let ambiguousSpend = false;
+  let postBinding = null;
+  let createdObject = null;
   const mainBindings = [];
+  const durableTransitions = [];
+  let durableEvidence = null;
+
+  const partialEvidence = ({ current = null, currentError = null } = {}) => ({
+    schemaVersion: 2,
+    operation: 'finalize-release',
+    repository: REPOSITORY,
+    outcome: 'durable-write-observed-before-failure',
+    context: before.context,
+    before: summarizeState(before),
+    action: { ...action, createdSha, postIssued },
+    durableTransitions: structuredClone(durableTransitions),
+    mainBindings: structuredClone(mainBindings),
+    postBinding: postBinding === null ? null : structuredClone(postBinding),
+    current,
+    currentError,
+    operations: operationsSince(adapters, cursor),
+    epistemicBoundary: 'This evidence covers only exact transitions and reads observed by this finalizer process.',
+  });
+
+  const observeTransition = async ({ boundary, ref, expected, next, pushAccepted, response }) => {
+    const transition = { boundary, ref, expected, next, pushAccepted, response, observedSha: null, exact: false };
+    durableTransitions.push(transition);
+    durableEvidence = partialEvidence();
+    const observedSha = await adapters.gitAdapter.readStableRef(ref);
+    transition.observedSha = observedSha;
+    transition.exact = observedSha === next;
+    durableEvidence = partialEvidence();
+    if (!transition.exact) fail(`durable transition ${boundary} did not read back exact ${next}`);
+    return observedSha;
+  };
+
+  const captureLostTransition = async ({ boundary, ref, expected, next }) => {
+    const observedSha = await adapters.gitAdapter.readStableRef(ref);
+    if (observedSha !== next) return observedSha;
+    await observeTransition({ boundary, ref, expected, next, pushAccepted: false, response: 'lost-response-exact-readback' });
+    return observedSha;
+  };
 
   const bindTrustedMain = async (boundary) => {
     const binding = await adapters.gitAdapter.assertTrustedMain(context);
@@ -1008,7 +1135,37 @@ export async function runFinalizerInvocation({ adapters, context, fault = 'none'
   };
   const guardedPush = async (ref, expected, next, boundary) => {
     await bindTrustedMain(boundary);
-    return adapters.gitAdapter.pushRef(ref, expected, next, { context });
+    await adapters.gitAdapter.pushRef(ref, expected, next, { context });
+    await observeTransition({ boundary, ref, expected, next, pushAccepted: true, response: 'push-porcelain-success' });
+  };
+  const bindPlannedPostRefs = async () => {
+    const refs = await adapters.gitAdapter.listRefs();
+    const binding = await adapters.gitAdapter.assertTrustedMain(context, refs);
+    mainBindings.push({ boundary: `before-github-post:${action.type}`, ...binding });
+    const observed = Object.entries(action.expectedRefs).sort(([a], [b]) => a.localeCompare(b)).map(([ref, expected]) => ({
+      ref,
+      expected,
+      observed: refSha(refs, ref),
+    }));
+    postBinding = { refs: observed, main: binding };
+    const mismatch = observed.find(({ expected, observed: actual }) => expected !== actual);
+    if (mismatch) {
+      throw new PrePostDriftError(`pre-POST ref drift at ${mismatch.ref}`);
+    }
+    return postBinding;
+  };
+  const attachDurableEvidence = async (error) => {
+    if (error.evidence || durableEvidence === null) return error;
+    let current = null;
+    let currentError = null;
+    try {
+      const state = await observeDurableState({ ...adapters, context });
+      current = { summary: summarizeState(state), authoritativeObservation: state.authoritativeObservation };
+    } catch (observationError) {
+      currentError = { message: String(observationError.message).slice(0, 800) };
+    }
+    error.evidence = partialEvidence({ current, currentError });
+    return error;
   };
 
   const simpleRefActions = new Set([
@@ -1021,141 +1178,203 @@ export async function runFinalizerInvocation({ adapters, context, fault = 'none'
     'reauthorize-next-proposal-after-close',
   ]);
 
-  if (simpleRefActions.has(action.type)) {
-    try {
-      await guardedPush(action.ref, action.expected, action.next, `before-push:${action.type}`);
-    } catch (error) {
-      writeError = error;
-    }
-  } else if (action.type === 'create-reconciliation' || action.type === 'advance-staged-intent') {
-    createdSha = await adapters.gitAdapter.createCommit({ tree: action.tree, parents: action.parents, message: action.message, identity: FINALIZER_IDENTITY });
-    assertSha(createdSha, 'deterministic commit');
-    try {
-      await guardedPush(action.ref, action.expected, createdSha, `before-push:${action.type}`);
-    } catch (error) {
-      writeError = error;
-    }
-  } else if (action.type === 'post-github-release' || action.type === 'post-next-proposal') {
-    let transitionError = null;
-    try {
-      await guardedPush(
-        action.attemptRef,
-        action.expectedAttempt,
-        action.spentAttempt,
-        `before-attempt-consume:${action.type}`,
-      );
-    } catch (error) {
-      transitionError = error;
-    }
-    const markerAfterTransition = await adapters.gitAdapter.readStableRef(action.attemptRef);
-    if (markerAfterTransition !== action.spentAttempt) {
-      writeError = transitionError ?? new Error(`${action.type} attempt authorization did not become exact spent state`);
-    } else if (transitionError !== null) {
-      // Ambiguous marker success is query-only. Posting would risk consuming an older authorization twice.
-      writeError = transitionError;
-    } else {
-      await bindTrustedMain(`before-github-post:${action.type}`);
+  try {
+    if (simpleRefActions.has(action.type)) {
       try {
-        postIssued = true;
-        if (action.type === 'post-github-release') {
-          await adapters.githubAdapter.createRelease({ tagName: action.tagName, targetSha: action.targetSha, body: action.body });
-        } else {
-          await adapters.githubAdapter.createPullRequest({
-            title: action.title,
-            body: action.body,
-            head: STAGED_LINE,
-            base: RELEASE_LINE,
-            draft: true,
-            expectedHeadSha: before.staged.sha,
-            expectedBaseSha: before.line.headSha,
+        await guardedPush(action.ref, action.expected, action.next, `before-push:${action.type}`);
+      } catch (error) {
+        writeError = error;
+        if (durableEvidence === null) {
+          try { await captureLostTransition({ boundary: `after-push-error:${action.type}`, ref: action.ref, expected: action.expected, next: action.next }); } catch {}
+        }
+      }
+    } else if (action.type === 'create-reconciliation' || action.type === 'advance-staged-intent') {
+      createdSha = await adapters.gitAdapter.createCommit({ tree: action.tree, parents: action.parents, message: action.message, identity: FINALIZER_IDENTITY });
+      assertSha(createdSha, 'deterministic commit');
+      try {
+        await guardedPush(action.ref, action.expected, createdSha, `before-push:${action.type}`);
+      } catch (error) {
+        writeError = error;
+        if (durableEvidence === null) {
+          try { await captureLostTransition({ boundary: `after-push-error:${action.type}`, ref: action.ref, expected: action.expected, next: createdSha }); } catch {}
+        }
+      }
+    } else if (action.type === 'post-github-release' || action.type === 'post-next-proposal') {
+      let transitionError = null;
+      try {
+        await guardedPush(
+          action.attemptRef,
+          action.expectedAttempt,
+          action.spentAttempt,
+          `before-attempt-consume:${action.type}`,
+        );
+      } catch (error) {
+        transitionError = error;
+      }
+      const markerAfterTransition = await adapters.gitAdapter.readStableRef(action.attemptRef);
+      if (markerAfterTransition !== action.spentAttempt) {
+        writeError = transitionError ?? new Error(`${action.type} attempt authorization did not become exact spent state`);
+      } else if (transitionError !== null) {
+        if (durableEvidence === null) {
+          await observeTransition({
+            boundary: `after-attempt-consume-error:${action.type}`,
+            ref: action.attemptRef,
+            expected: action.expectedAttempt,
+            next: action.spentAttempt,
+            pushAccepted: false,
+            response: 'lost-response-exact-readback',
           });
         }
-      } catch (error) {
-        if (error instanceof DefiniteGitHubClientError) {
-          const rejectedObservation = await observeDurableState({ ...adapters, context });
-          const objectAbsent = action.type === 'post-github-release'
-            ? rejectedObservation.githubRelease.status === 'absent'
-            : rejectedObservation.proposal.kind === 'none';
-          if (!objectAbsent) {
-            writeError = null;
-          } else {
-            await guardedPush(
-              action.attemptRef,
-              action.spentAttempt,
-              action.rejectedAttempt,
-              `record-definite-rejection:${action.type}`,
-            );
-            definiteRejectionRecorded = true;
-          }
-        } else {
+        ambiguousSpend = true;
+        writeError = transitionError;
+      } else {
+        try {
+          await bindPlannedPostRefs();
+        } catch (error) {
+          prePostDrift = error instanceof PrePostDriftError;
+          prePostFailure = !prePostDrift;
           writeError = error;
+        }
+        if (!prePostDrift && !prePostFailure) {
+          try {
+            postIssued = true;
+            if (action.type === 'post-github-release') {
+              createdObject = await adapters.githubAdapter.createRelease({
+                tagName: action.tagName,
+                targetSha: action.targetSha,
+                body: action.body,
+                expectedLineSha: action.expectedRefs[RELEASE_REF],
+                expectedTagSha: action.expectedRefs[TAG_REF],
+              });
+              validateCanonicalRelease(createdObject);
+              if (
+                createdObject.tag_name !== action.tagName ||
+                createdObject.target_commitish !== action.targetSha ||
+                createdObject.name !== action.tagName ||
+                createdObject.body !== action.body ||
+                createdObject.draft !== false ||
+                createdObject.prerelease !== false
+              ) fail('created GitHub Release hydration does not bind exact V semantics');
+            } else {
+              createdObject = await adapters.githubAdapter.createPullRequest({
+                title: action.title,
+                body: action.body,
+                head: STAGED_LINE,
+                base: RELEASE_LINE,
+                draft: true,
+                expectedHeadSha: action.expectedHeadSha,
+                expectedBaseSha: action.expectedBaseSha,
+              });
+              validateCanonicalPull(createdObject);
+              if (
+                createdObject.head.sha !== action.expectedHeadSha ||
+                createdObject.base.sha !== action.expectedBaseSha ||
+                !sameRepositorySide(createdObject.head, STAGED_LINE) ||
+                !sameRepositorySide(createdObject.base, RELEASE_LINE) ||
+                createdObject.title !== action.title ||
+                createdObject.body !== action.body ||
+                createdObject.draft !== true ||
+                pullState(createdObject) !== 'open'
+              ) fail('created proposal hydration does not bind exact planned head/base SHAs');
+            }
+          } catch (error) {
+            if (error instanceof DefiniteGitHubClientError) {
+              const rejectedObservation = await observeDurableState({ ...adapters, context });
+              const objectAbsent = action.type === 'post-github-release'
+                ? rejectedObservation.githubRelease.status === 'absent'
+                : rejectedObservation.proposal.kind === 'none';
+              if (!objectAbsent) {
+                writeError = null;
+              } else {
+                await guardedPush(
+                  action.attemptRef,
+                  action.spentAttempt,
+                  action.rejectedAttempt,
+                  `record-definite-rejection:${action.type}`,
+                );
+                definiteRejectionRecorded = true;
+              }
+            } else {
+              writeError = error;
+            }
+          }
         }
       }
     }
-  }
 
-  if (action.durable) {
-    after = await observeDurableState({ ...adapters, context });
-    const satisfied = actionSatisfied(action, after, createdSha);
-    const exactObjectVisible = action.type === 'post-github-release'
-      ? after.githubRelease.status === 'present'
-      : action.type === 'post-next-proposal'
-        ? after.proposal.kind === 'open'
-        : false;
-    if (definiteRejectionRecorded) {
-      result = 'definite-client-rejection-recorded';
-    } else if (satisfied && exactObjectVisible) {
-      result = writeError ? 'converged-after-ambiguous-response' : 'performed-and-verified';
-    } else if (satisfied && postIssued) {
-      result = 'post-issued-awaiting-stable-visibility';
-    } else if (satisfied && writeError && !(writeError instanceof StaleLeaseError)) {
-      result = 'converged-after-ambiguous-response';
-    } else if (writeError instanceof StaleLeaseError) {
-      result = 'stale-ref-rejected-and-refetched';
-    } else if (writeError !== null) {
-      throw writeError;
-    } else if (satisfied) {
-      result = 'performed-and-verified';
-    } else {
-      throw new Error(`durable action ${action.type} did not pass exact post-read`);
+    if (action.durable) {
+      after = await observeDurableState({ ...adapters, context });
+      const satisfied = actionSatisfied(action, after, createdSha);
+      const exactObjectVisible = action.type === 'post-github-release'
+        ? after.githubRelease.status === 'present'
+        : action.type === 'post-next-proposal'
+          ? after.proposal.kind === 'open'
+          : false;
+      if (definiteRejectionRecorded) {
+        result = 'definite-client-rejection-recorded';
+      } else if (prePostFailure) {
+        throw writeError;
+      } else if (prePostDrift && satisfied) {
+        result = 'pre-post-ref-drift-query-only';
+      } else if (ambiguousSpend && satisfied) {
+        result = 'attempt-spend-ambiguous-query-only';
+      } else if (satisfied && exactObjectVisible) {
+        result = writeError ? 'converged-after-ambiguous-response' : 'performed-and-verified';
+      } else if (satisfied && postIssued) {
+        result = 'post-issued-awaiting-stable-visibility';
+      } else if (satisfied && writeError && !(writeError instanceof StaleLeaseError)) {
+        result = 'converged-after-ambiguous-response';
+      } else if (writeError instanceof StaleLeaseError) {
+        result = 'stale-ref-rejected-and-refetched';
+      } else if (writeError !== null) {
+        throw writeError;
+      } else if (satisfied) {
+        result = 'performed-and-verified';
+      } else {
+        throw new Error(`durable action ${action.type} did not pass exact post-read`);
+      }
     }
-  }
 
-  const operations = operationsSince(adapters, cursor);
-  const assessment = assessOperations(operations);
-  if (!assessment.allGitWritesAllowlisted || !assessment.allGitHubWritesAllowlisted || !assessment.npmTransportReadOnly) {
-    fail('instrumented finalizer operation escaped its exact write/read boundary');
-  }
+    const operations = operationsSince(adapters, cursor);
+    const assessment = assessOperations(operations);
+    if (!assessment.allGitWritesAllowlisted || !assessment.allGitHubWritesAllowlisted || !assessment.npmTransportReadOnly) {
+      fail('instrumented finalizer operation escaped its exact write/read boundary');
+    }
 
-  const evidence = {
-    schemaVersion: 2,
-    operation: 'finalize-release',
-    repository: REPOSITORY,
-    context: before.context,
-    before: summarizeState(before),
-    action: { ...action, result, createdSha, postIssued },
-    after: summarizeState(after),
-    preservation: {
-      beforeFingerprint: before.preservationFingerprint,
-      afterFingerprint: after.preservationFingerprint,
-      before: before.authoritativeObservation,
-      after: after.authoritativeObservation,
-      changedRefs: changedRefs(before, after),
-      changedPulls: tupleChanges(before.authoritativeObservation.pulls, after.authoritativeObservation.pulls, 'number'),
-      changedReleases: tupleChanges(before.authoritativeObservation.releases, after.authoritativeObservation.releases, 'id'),
-      changedPackages: tupleChanges(before.authoritativeObservation.packages, after.authoritativeObservation.packages, 'name'),
-      mainBindings,
-      operations,
-      assessment,
-    },
-  };
+    const evidence = {
+      schemaVersion: 2,
+      operation: 'finalize-release',
+      repository: REPOSITORY,
+      context: before.context,
+      before: summarizeState(before),
+      action: { ...action, result, createdSha, postIssued, createdObject },
+      after: summarizeState(after),
+      preservation: {
+        beforeFingerprint: before.preservationFingerprint,
+        afterFingerprint: after.preservationFingerprint,
+        before: before.authoritativeObservation,
+        after: after.authoritativeObservation,
+        changedRefs: changedRefs(before, after),
+        changedPulls: tupleChanges(before.authoritativeObservation.pulls, after.authoritativeObservation.pulls, 'number'),
+        changedReleases: tupleChanges(before.authoritativeObservation.releases, after.authoritativeObservation.releases, 'id'),
+        changedPackages: tupleChanges(before.authoritativeObservation.packages, after.authoritativeObservation.packages, 'name'),
+        mainBindings,
+        postBinding,
+        durableTransitions,
+        operations,
+        assessment,
+      },
+    };
 
-  if (action.type === 'post-github-release' && fault === 'after-github-release-post' && after.githubRelease.status === 'present') {
-    const error = new Error('INJECTED FAULT: GitHub Release is durable; stop before success report');
-    error.evidence = evidence;
-    throw error;
+    if (action.type === 'post-github-release' && fault === 'after-github-release-post' && after.githubRelease.status === 'present') {
+      const error = new Error('INJECTED FAULT: GitHub Release is durable; stop before success report');
+      error.evidence = evidence;
+      throw error;
+    }
+    return evidence;
+  } catch (error) {
+    throw await attachDurableEvidence(error);
   }
-  return evidence;
 }
 
 function closedGitEnvironment(overrides = {}) {
@@ -1193,6 +1412,30 @@ function runGit(args, { cwd = process.cwd(), input, env = {}, allowFailure = fal
   return result;
 }
 
+function parseLocalGitConfiguration(output) {
+  return output.split('\0').filter(Boolean).map((entry) => {
+    const separator = entry.indexOf('\n');
+    if (separator < 1) fail('local Git configuration has a malformed entry');
+    return { key: entry.slice(0, separator).toLowerCase(), value: entry.slice(separator + 1) };
+  });
+}
+
+function allowedLocalGitConfiguration({ key, value }) {
+  if (key === 'core.repositoryformatversion') return ['0', '1'].includes(value);
+  if (key === 'core.filemode' || key === 'core.ignorecase' || key === 'core.precomposeunicode') return ['true', 'false'].includes(value);
+  if (key === 'core.bare') return value === 'false';
+  if (key === 'core.logallrefupdates') return value === 'true';
+  if (key === 'gc.auto') return value === '0';
+  if (key === 'remote.origin.url') return LIVE_REMOTE_URLS.has(value);
+  if (key === 'remote.origin.fetch') return value === '+refs/heads/*:refs/remotes/origin/*';
+  if (key === 'remote.origin.promisor') return value === 'true';
+  if (key === 'remote.origin.partialclonefilter') return value === 'blob:none';
+  if (/^branch\..+\.remote$/.test(key)) return value === 'origin';
+  if (/^branch\..+\.merge$/.test(key)) return /^refs\/heads\/[A-Za-z0-9._/-]+$/.test(value);
+  if (key === 'http.https://github.com/.extraheader') return /^AUTHORIZATION: basic [A-Za-z0-9+/=]+$/.test(value);
+  return false;
+}
+
 export class LiveGitAdapter {
   constructor({ cwd = process.cwd() } = {}) {
     this.cwd = cwd;
@@ -1202,11 +1445,12 @@ export class LiveGitAdapter {
   assertClosedTransport() {
     const hostile = hostileEnvironmentKeys(HOSTILE_GIT_ENVIRONMENT);
     if (hostile.length > 0) fail(`hostile inherited Git environment: ${hostile.sort().join(', ')}`);
-    const forbidden = runGit([
-      'config', '--local', '--get-regexp',
-      '^(remote\\.origin\\.(pushurl|uploadpack|receivepack)|push\\.followtags|credential\\.|core\\.hookspath|http\\..*\\.(proxy|sslverify|sslcainfo|sslcert|sslkey|cookiefile)|url\\..*\\.(insteadof|pushinsteadof))$',
-    ], { cwd: this.cwd, allowFailure: true });
-    if (forbidden.status !== 1 || forbidden.stdout.trim()) fail('forbidden local Git transport/configuration is set');
+    const localResult = runGit(['config', '--local', '--null', '--list', '--includes'], { cwd: this.cwd, allowFailure: true });
+    if (localResult.status !== 0) fail('could not enumerate complete local Git configuration');
+    const local = parseLocalGitConfiguration(localResult.stdout);
+    if (local.some((entry) => !allowedLocalGitConfiguration(entry))) {
+      fail('local Git configuration contains a non-allowlisted setting');
+    }
 
     const rewrites = runGit(['config', '--show-origin', '--get-regexp', '^url\\..*\\.(insteadof|pushinsteadof)$'], {
       cwd: this.cwd,
@@ -1221,20 +1465,13 @@ export class LiveGitAdapter {
       !LIVE_REMOTE_URLS.has(fetchUrls[0]) || !LIVE_REMOTE_URLS.has(pushUrls[0])
     ) fail('origin fetch/push destination is not the exact HTTPS lab repository');
 
-    const headers = runGit(['config', '--local', '--get-regexp', '^http\\..*\\.extraheader$'], {
-      cwd: this.cwd,
-      allowFailure: true,
-    });
-    if (headers.status === 0) {
-      const rows = headers.stdout.trim().split('\n').filter(Boolean);
-      if (
-        rows.length !== 1 ||
-        !rows[0].startsWith('http.https://github.com/.extraheader AUTHORIZATION: basic ')
-      ) fail('checkout authentication is not one exact scoped GitHub extraheader');
-    } else if (headers.status !== 1 || headers.stdout.trim()) {
-      fail('could not validate scoped checkout authentication');
-    }
-    return { fetchUrl: fetchUrls[0], pushUrl: pushUrls[0], scopedCheckoutAuth: headers.status === 0 };
+    const headers = local.filter(({ key }) => key.endsWith('.extraheader'));
+    if (headers.length > 1) fail('checkout authentication is not one exact scoped GitHub extraheader');
+    return { fetchUrl: fetchUrls[0], pushUrl: pushUrls[0], scopedCheckoutAuth: headers.length === 1 };
+  }
+
+  async preflight() {
+    return this.assertClosedTransport();
   }
 
   parseAdvertisement(output) {
@@ -1320,46 +1557,35 @@ export class LiveGitAdapter {
     };
   }
 
+  async pullCommit(number, expectedSha) {
+    if (!Number.isInteger(number) || number < 1) fail('pull commit lookup requires a positive number');
+    assertSha(expectedSha, 'pull head');
+    this.assertClosedTransport();
+    const ref = `refs/pull/${number}/head`;
+    const read = () => {
+      this.operations.push({ transport: 'git', method: 'ls-remote', mutation: false, repository: REPOSITORY, ref });
+      const result = runGit(['ls-remote', '--refs', 'origin', ref], { cwd: this.cwd, allowFailure: true });
+      const rows = result.stdout.trim().split('\n').filter(Boolean);
+      if (result.status !== 0 || rows.length !== 1) fail(`pull request #${number} head ref is not exactly advertised`);
+      const match = /^([0-9a-f]{40})\t(refs\/pull\/[1-9]\d*\/head)$/.exec(rows[0]);
+      if (!match || match[2] !== ref) fail(`pull request #${number} head advertisement is malformed`);
+      return match[1];
+    };
+    const first = read();
+    const second = read();
+    if (first !== second || second !== expectedSha) fail(`pull request #${number} head changed or mismatched its hydrated SHA`);
+    this.operations.push({ transport: 'git', method: 'fetch', mutation: false, repository: REPOSITORY, ref });
+    const fetched = runGit(['fetch', '--force', '--no-tags', '--no-write-fetch-head', 'origin', ref], {
+      cwd: this.cwd,
+      allowFailure: true,
+    });
+    if (fetched.status !== 0) fail(`pull request #${number} head object fetch failed`);
+    return this.commit(expectedSha);
+  }
+
   async acceptedSnapshot(snapshotSha) {
-    const snapshot = this.commit(snapshotSha);
-    const metadata = parseSnapshotMessage(snapshot.message);
-    for (const [value, label] of [[metadata.mergeSha, 'M'], [metadata.stagedSha, 'I'], [metadata.sourceSha, 'S']]) {
-      assertSha(value, label);
-    }
-    const merge = this.commit(metadata.mergeSha);
-    const intent = this.commit(metadata.stagedSha);
-    const source = this.commit(metadata.sourceSha);
-    intent.sourceTree = source.tree;
-    validateIntentShape(intent, source.sha);
-    validateMergeShape(merge, source, intent);
-    validateSnapshotShape(snapshot, metadata, merge);
-    const changedPaths = await this.diffPaths(merge.sha, snapshot.sha);
-    if (JSON.stringify([...changedPaths].sort()) !== JSON.stringify([...TRANSFORMED_FILES].sort())) {
-      fail('V does not contain the exact accepted four-file version transform');
-    }
-    const [coreManifest, addonManifest] = await Promise.all([
-      this.jsonAt(snapshot.sha, PACKAGE_SPECS[0].directory + '/package.json'),
-      this.jsonAt(snapshot.sha, PACKAGE_SPECS[1].directory + '/package.json'),
-    ]);
-    for (const [manifest, spec] of [[coreManifest, PACKAGE_SPECS[0]], [addonManifest, PACKAGE_SPECS[1]]]) {
-      if (manifest.name !== spec.name || manifest.version !== RELEASE_VERSION || !exactRepository(manifest.repository, spec.directory)) {
-        fail(`V contains an incompatible ${spec.name} manifest identity`);
-      }
-    }
-    if (addonManifest.dependencies?.[PACKAGE_SPECS[0].name] !== RELEASE_VERSION || Object.keys(addonManifest.dependencies ?? {}).length !== 1) {
-      fail(`V add-on manifest does not depend exactly on core ${RELEASE_VERSION}`);
-    }
-    const content = createHash('sha256');
-    for (const path of TRANSFORMED_FILES) {
-      content.update(path);
-      content.update('\0');
-      content.update(runGit(['show', `${snapshot.sha}:${path}`], { cwd: this.cwd }).stdout);
-      content.update('\0');
-    }
-    const contentSha256 = content.digest('hex');
-    if (metadata.tree !== snapshot.tree || metadata.contentSha256 !== contentSha256) {
-      fail('V tree/content authority does not match its exact committed bytes');
-    }
+    const { source, intent, merge, snapshot, tree, contentSha256, packages } =
+      await deriveTrustedSnapshotAuthority(this.cwd, snapshotSha);
     return {
       schemaVersion: 2,
       locator: SNAPSHOT_REF,
@@ -1370,24 +1596,16 @@ export class LiveGitAdapter {
       intent,
       merge,
       snapshot,
-      treeSha: metadata.tree,
+      treeSha: tree,
       contentSha256,
-      packages: metadata.packages,
+      packages,
       qa: {
         kind: 'accepted-snapshot-content',
-        treeSha: metadata.tree,
+        treeSha: tree,
         contentSha256,
-        label: `accepted-snapshot-content:${metadata.tree}:${contentSha256}`,
+        label: `accepted-snapshot-content:${tree}:${contentSha256}`,
       },
     };
-  }
-
-  diffPaths(from, to) {
-    return runGit(['diff-tree', '--no-commit-id', '--name-only', '-r', from, to], { cwd: this.cwd }).stdout.trim().split('\n').filter(Boolean);
-  }
-
-  jsonAt(sha, path) {
-    return JSON.parse(runGit(['show', `${sha}:${path}`], { cwd: this.cwd }).stdout);
   }
 
   isAncestor(ancestor, descendant) {
@@ -1469,7 +1687,7 @@ export class LiveGitHubAdapter {
     fail(`GitHub adapter rejects ${method} ${path}`);
   }
 
-  async request(method, path, body) {
+  async request(method, path, body, expectations = null) {
     this.assertRequest(method, path);
     this.operations.push({
       transport: 'github',
@@ -1477,6 +1695,7 @@ export class LiveGitHubAdapter {
       mutation: method !== 'GET',
       repository: REPOSITORY,
       endpoint: path.replace(`/repos/${REPOSITORY}`, '').split('?')[0] || '/',
+      expectations,
     });
     const response = await fetch(`https://api.github.com${path}`, {
       method,
@@ -1498,15 +1717,24 @@ export class LiveGitHubAdapter {
   async paginate(path) {
     const items = [];
     const seen = new Set();
+    const seenPullIds = new Set();
+    const identityField = path.includes('/pulls?') ? 'number' : path.includes('/releases?') ? 'id' : null;
+    if (identityField === null) fail(`GitHub pagination rejects unknown collection ${path}`);
     for (let page = 1; page <= MAX_PAGES; page += 1) {
       const separator = path.includes('?') ? '&' : '?';
       const value = await this.request('GET', `${path}${separator}per_page=${PAGE_SIZE}&page=${page}`);
       if (!Array.isArray(value)) fail(`GitHub pagination for ${path} did not return an array`);
-      const keys = value.map((item) => item.number ?? item.id);
-      if (keys.some((key) => !Number.isInteger(key))) fail(`GitHub pagination for ${path} returned an item without a stable identity`);
+      const keys = value.map((item) => item[identityField]);
+      if (keys.some((key) => !Number.isInteger(key) || key < 1)) fail(`GitHub pagination for ${path} returned an item without its exact positive ${identityField}`);
       for (let index = 0; index < value.length; index += 1) {
         if (seen.has(keys[index])) fail(`GitHub pagination for ${path} returned a duplicate identity`);
         seen.add(keys[index]);
+        if (identityField === 'number' && value[index].id !== undefined) {
+          if (!Number.isInteger(value[index].id) || value[index].id < 1 || seenPullIds.has(value[index].id)) {
+            fail(`GitHub pagination for ${path} returned an invalid or aliased pull id`);
+          }
+          seenPullIds.add(value[index].id);
+        }
         items.push(value[index]);
       }
       if (value.length < PAGE_SIZE) return items;
@@ -1527,7 +1755,11 @@ export class LiveGitHubAdapter {
     const hydrated = [];
     for (const summary of summaries) {
       if (!Number.isInteger(summary.number) || summary.number < 1) fail('pull summary lacks a positive number');
+      if (summary.id !== undefined && (!Number.isInteger(summary.id) || summary.id < 1)) fail('pull summary has an invalid id');
       const detail = await this.request('GET', `/repos/${REPOSITORY}/pulls/${summary.number}`);
+      if (detail?.number !== summary.number || (summary.id !== undefined && detail?.id !== summary.id)) {
+        fail(`hydrated pull detail does not match requested summary #${summary.number}`);
+      }
       hydrated.push(validateCanonicalPull(detail));
     }
     return hydrated.sort((a, b) => a.number - b.number);
@@ -1548,6 +1780,7 @@ export class LiveGitHubAdapter {
     for (const summary of summaries) {
       if (!Number.isInteger(summary.id) || summary.id < 1) fail('Release summary lacks a positive id');
       const detail = await this.request('GET', `/repos/${REPOSITORY}/releases/${summary.id}`);
+      if (detail?.id !== summary.id) fail(`hydrated Release detail does not match requested summary ${summary.id}`);
       hydrated.push(validateCanonicalRelease(detail));
     }
     return hydrated.sort((a, b) => a.id - b.id);
@@ -1562,8 +1795,12 @@ export class LiveGitHubAdapter {
     return second;
   }
 
-  async createRelease({ tagName, targetSha, body }) {
-    return this.request('POST', `/repos/${REPOSITORY}/releases`, {
+  async createRelease({ tagName, targetSha, body, expectedLineSha, expectedTagSha }) {
+    for (const [value, label] of [[targetSha, 'Release target'], [expectedLineSha, 'Release line'], [expectedTagSha, 'Release tag']]) {
+      assertSha(value, label);
+    }
+    if (targetSha !== expectedTagSha) fail('Release POST target/tag expectation is incompatible');
+    const created = await this.request('POST', `/repos/${REPOSITORY}/releases`, {
       tag_name: tagName,
       target_commitish: targetSha,
       name: tagName,
@@ -1571,12 +1808,27 @@ export class LiveGitHubAdapter {
       draft: false,
       prerelease: false,
       generate_release_notes: false,
-    });
+    }, { targetSha, expectedLineSha, expectedTagSha });
+    if (!Number.isInteger(created?.id) || created.id < 1) fail('Release POST response lacks a positive id');
+    const hydrated = await this.request('GET', `/repos/${REPOSITORY}/releases/${created.id}`);
+    if (hydrated?.id !== created.id) fail('created Release hydration does not match its POST identity');
+    return validateCanonicalRelease(hydrated);
   }
 
   async createPullRequest({ title, body, head, base, draft, expectedHeadSha, expectedBaseSha }) {
     if (!SHA.test(expectedHeadSha ?? '') || !SHA.test(expectedBaseSha ?? '')) fail('PR POST lacks exact expected head/base SHAs');
-    return this.request('POST', `/repos/${REPOSITORY}/pulls`, { title, body, head, base, draft });
+    const created = await this.request(
+      'POST',
+      `/repos/${REPOSITORY}/pulls`,
+      { title, body, head, base, draft },
+      { expectedHeadSha, expectedBaseSha },
+    );
+    if (!Number.isInteger(created?.number) || created.number < 1) fail('PR POST response lacks a positive number');
+    const hydrated = await this.request('GET', `/repos/${REPOSITORY}/pulls/${created.number}`);
+    if (hydrated?.number !== created.number || (created.id !== undefined && hydrated?.id !== created.id)) {
+      fail('created pull hydration does not match its POST identity');
+    }
+    return validateCanonicalPull(hydrated);
   }
 }
 

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -32,8 +33,10 @@ import {
   buildSnapshotMessage,
   command,
   createClosedNpmEnvironment,
+  deriveTrustedSnapshotAuthority,
   materializeInertPackages,
   parseSnapshotMessage,
+  readBlob,
   reconstructExpectedSnapshot,
   validateExactSnapshotTree,
   validateManifest,
@@ -98,7 +101,15 @@ async function repositoryFixture() {
   git(directory, 'remote', 'add', 'origin', 'https://github.com/fablebookjs/lab-01.git');
   git(directory, 'add', '.');
   git(directory, 'commit', '-qm', 'baseline');
-  return { directory, merge: git(directory, 'rev-parse', 'HEAD') };
+  const source = git(directory, 'rev-parse', 'HEAD');
+  const tree = git(directory, 'rev-parse', 'HEAD^{tree}');
+  const staged = git(
+    directory,
+    'commit-tree', tree, '-p', source, '-m',
+    `release: propose v${RELEASE_VERSION}\n\nRelease-Intent-Version: 1\nRelease-Line: ${RELEASE_LINE}\nRelease-Version: ${RELEASE_VERSION}\nRelease-Source: ${source}\n`,
+  );
+  const merge = git(directory, 'commit-tree', tree, '-p', source, '-p', staged, '-m', 'Merge pull request #12');
+  return { directory, source, staged, merge };
 }
 
 function snapshotMessage(overrides = {}) {
@@ -238,6 +249,74 @@ test('trusted reconstruction rejects a forged V with extra core source', async (
       materializeInertPackages(fixture.directory, forgedTree, join(fixture.directory, 'inert')),
       /PACKAGE_TREE_INVALID_CORE/,
     );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('shared schema-2 authority rejects executable, extra-field, extra-file, and invalid-byte V forgeries', async () => {
+  const fixture = await repositoryFixture();
+  const rawIdentity = (tree) => {
+    const hash = createHash('sha256');
+    for (const path of TRANSFORMED_FILES) {
+      hash.update(path);
+      hash.update('\0');
+      hash.update(readBlob(fixture.directory, tree, path));
+      hash.update('\0');
+    }
+    return hash.digest('hex');
+  };
+  const forgedTree = (name, mutate) => {
+    const index = join(fixture.directory, `${name}-index`);
+    git(fixture.directory, 'read-tree', `--index-output=${index}`, expected.tree);
+    const writeBlob = (path, bytes, mode = '100644') => {
+      const object = execFileSync('git', ['hash-object', '-w', '--stdin'], {
+        cwd: fixture.directory,
+        input: bytes,
+      }).toString().trim();
+      execFileSync('git', ['update-index', '--add', '--cacheinfo', `${mode},${object},${path}`], {
+        cwd: fixture.directory,
+        env: { ...process.env, GIT_INDEX_FILE: index },
+      });
+    };
+    mutate({ writeBlob });
+    return execFileSync('git', ['write-tree'], {
+      cwd: fixture.directory,
+      env: { ...process.env, GIT_INDEX_FILE: index },
+      encoding: 'utf8',
+    }).trim();
+  };
+  const commitForged = (tree, name) => {
+    const message = buildSnapshotMessage({
+      mergeSha: fixture.merge,
+      stagedSha: fixture.staged,
+      sourceSha: fixture.source,
+      tree,
+      contentSha256: rawIdentity(tree),
+      packages,
+    });
+    return git(fixture.directory, 'commit-tree', tree, '-p', fixture.merge, '-m', message, '-m', name);
+  };
+  let expected;
+  try {
+    expected = reconstructExpectedSnapshot(fixture.directory, fixture.merge, join(fixture.directory, 'expected-index'));
+    const coreManifest = readBlob(fixture.directory, expected.tree, 'packages/core/package.json');
+    const extraManifest = JSON.parse(coreManifest);
+    extraManifest.scripts = { prepare: 'forged' };
+    const cases = [
+      ['executable', forgedTree('executable', ({ writeBlob }) => writeBlob('packages/core/package.json', coreManifest, '100755'))],
+      ['extra-field', forgedTree('extra-field', ({ writeBlob }) => writeBlob('packages/core/package.json', Buffer.from(`${JSON.stringify(extraManifest, null, 2)}\n`)))],
+      ['extra-file', forgedTree('extra-file', ({ writeBlob }) => writeBlob('packages/core/src/extra.js', Buffer.from('export const forged = true;\n')))],
+      ['invalid-byte', forgedTree('invalid-byte', ({ writeBlob }) => writeBlob('package-lock.json', Buffer.from([0xff, 0xfe, 0x00, 0x0a])))],
+    ];
+    for (const [name, tree] of cases) {
+      const snapshot = commitForged(tree, name);
+      await assert.rejects(
+        deriveTrustedSnapshotAuthority(fixture.directory, snapshot, { temporaryBase: fixture.directory }),
+        /SNAPSHOT_(?:GRAPH_OR_TREE|DIFF_ALLOWLIST|MODE)_INVALID/,
+        name,
+      );
+    }
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
   }

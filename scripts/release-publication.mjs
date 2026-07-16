@@ -1,8 +1,9 @@
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 
 export const REPOSITORY = 'fablebookjs/lab-01';
@@ -267,6 +268,32 @@ function validateRootManifest(root, version) {
   ) fail('ROOT_MANIFEST_INVALID');
 }
 
+function validateLockManifest(lock, root, version) {
+  if (JSON.stringify(Object.keys(lock).sort()) !== JSON.stringify(['lockfileVersion', 'name', 'packages', 'requires', 'version'])) {
+    fail('LOCK_KEYS_INVALID');
+  }
+  const expectedRoot = {
+    name: root.name,
+    version,
+    workspaces: root.workspaces,
+    devDependencies: root.devDependencies,
+  };
+  const expectedAddon = {
+    name: PACKAGE_SPECS[1].name,
+    version,
+    dependencies: { [PACKAGE_SPECS[0].name]: version },
+  };
+  const expectedCore = { name: PACKAGE_SPECS[0].name, version };
+  if (
+    lock.name !== root.name || lock.version !== version || lock.lockfileVersion !== 3 || lock.requires !== true ||
+    JSON.stringify(lock.packages?.['']) !== JSON.stringify(expectedRoot) ||
+    JSON.stringify(lock.packages?.['packages/addon']) !== JSON.stringify(expectedAddon) ||
+    JSON.stringify(lock.packages?.['packages/core']) !== JSON.stringify(expectedCore) ||
+    JSON.stringify(lock.packages?.[`node_modules/${PACKAGE_SPECS[0].name}`]) !== JSON.stringify({ resolved: 'packages/core', link: true }) ||
+    JSON.stringify(lock.packages?.[`node_modules/${PACKAGE_SPECS[1].name}`]) !== JSON.stringify({ resolved: 'packages/addon', link: true })
+  ) fail('LOCK_WORKSPACE_SHAPE_INVALID');
+}
+
 function gitIndex(repoRoot, indexFile, args, input) {
   try {
     return execFileSync('git', ['--no-replace-objects', ...args], {
@@ -303,6 +330,7 @@ export function reconstructExpectedSnapshot(repoRoot, mergeSha, indexFile) {
   validateRootManifest(baseline.root, BASE_VERSION);
   validateManifest(baseline.core, PACKAGE_SPECS[0], BASE_VERSION);
   validateManifest(baseline.addon, PACKAGE_SPECS[1], BASE_VERSION);
+  validateLockManifest(baseline.lock, baseline.root, BASE_VERSION);
   if (baseline.addon.dependencies?.[PACKAGE_SPECS[0].name] !== BASE_VERSION) fail('BASE_ADDON_EDGE_INVALID');
   if (
     baseline.lock.name !== baseline.root.name || baseline.lock.version !== BASE_VERSION || baseline.lock.lockfileVersion !== 3 ||
@@ -324,6 +352,7 @@ export function reconstructExpectedSnapshot(repoRoot, mergeSha, indexFile) {
   validateRootManifest(transformed.root, RELEASE_VERSION);
   validateManifest(transformed.core, PACKAGE_SPECS[0], RELEASE_VERSION);
   validateManifest(transformed.addon, PACKAGE_SPECS[1], RELEASE_VERSION);
+  validateLockManifest(transformed.lock, transformed.root, RELEASE_VERSION);
   const files = new Map(Object.entries(paths).map(([key, path]) => [path, Buffer.from(`${JSON.stringify(transformed[key], null, 2)}\n`)]));
   gitIndex(repoRoot, indexFile, ['read-tree', mergeSha]);
   for (const path of TRANSFORMED_FILES) {
@@ -593,6 +622,52 @@ export function parseSnapshotMessage(message) {
     contentSha256: trailers.get('Release-Content-SHA256'),
     packages,
   };
+}
+
+export async function deriveTrustedSnapshotAuthority(repoRoot, snapshotSha, { temporaryBase = tmpdir() } = {}) {
+  assertSha(snapshotSha, 'snapshot V');
+  const snapshot = commitShape(repoRoot, snapshotSha);
+  if (snapshot.parents.length !== 1) fail('SNAPSHOT_PARENT_INVALID');
+  const merge = commitShape(repoRoot, snapshot.parents[0]);
+  if (merge.parents.length !== 2) fail('MERGE_PARENT_INVALID');
+  const source = commitShape(repoRoot, merge.parents[0]);
+  const intent = commitShape(repoRoot, merge.parents[1]);
+  intent.sourceTree = source.tree;
+  validateIntentShape(intent, source.sha);
+  validateMergeShape(merge, source, intent);
+  assertNoTrackedNpmConfiguration(repoRoot, merge.sha);
+
+  const temporary = await mkdtemp(join(temporaryBase, 'lab-01-snapshot-authority-'));
+  try {
+    const expected = reconstructExpectedSnapshot(repoRoot, merge.sha, join(temporary, 'index'));
+    validateExactSnapshotTree(repoRoot, merge.sha, snapshot.sha, expected.tree);
+    const inert = join(temporary, 'inert');
+    await materializeInertPackages(repoRoot, snapshot.sha, inert);
+    const npmEnvironment = await assertPinnedNpmVersion(join(temporary, 'npm'));
+    const packed = packageEvidence(await packPackages(inert, join(temporary, 'packs'), npmEnvironment));
+    const packages = packed.map(({ name, integrity, shasum }) => ({ name, integrity, shasum }));
+
+    // V metadata is consulted only after S/I/M, the exact transformed whole tree,
+    // raw blob materialization, and deterministic tarballs have been derived.
+    const metadata = parseSnapshotMessage(snapshot.message);
+    validateSnapshotShape(snapshot, metadata, merge);
+    if (
+      metadata.tree !== expected.tree ||
+      metadata.contentSha256 !== expected.contentSha256 ||
+      JSON.stringify(metadata.packages) !== JSON.stringify(packages)
+    ) fail('SNAPSHOT_METADATA_CROSSCHECK_FAILED');
+    return {
+      source,
+      intent,
+      merge,
+      snapshot,
+      tree: expected.tree,
+      contentSha256: expected.contentSha256,
+      packages,
+    };
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
 }
 
 export function sanitizedEvidence(value) {

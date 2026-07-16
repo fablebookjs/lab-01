@@ -60,18 +60,31 @@ Immediately before every Git push and GitHub POST, the controller rebinds
 remote `main`, local `HEAD`, `GITHUB_SHA`, and `GITHUB_WORKFLOW_SHA`. Workflow
 identity must be exactly
 `fablebookjs/lab-01/.github/workflows/finalize-release.yml@refs/heads/main`.
-These checks minimize but cannot make the cross-service race atomic: remote
-main can move after the final advertisement and before GitHub accepts a
-request. Drift observed before an adapter mutation aborts. A consumed POST
-authorization remains query-only if drift occurs before its POST.
+After a POST marker is spent, one final stable read also binds the release
+line/base, staged/head, V locator, lightweight tag, recovery ref, and both
+attempt refs to the classified plan. The POST adapter carries exact head/base
+or line/tag/V expectations in evidence, immediately hydrates the created
+object, and requires GitHub to have stored those exact identities. Pre-POST
+drift is query-only.
+
+These checks minimize but cannot make Git and GitHub one atomic CAS: a ref can
+move after the final Git advertisement and before GitHub accepts the request.
+Immediate object hydration detects that irreducible cross-service race but
+cannot undo an object GitHub already created. The run fails with the spent
+authorization and exact before/after evidence; reruns remain query-only.
 
 The snapshot parser is isolated inside `LiveGitAdapter.acceptedSnapshot(sha)`.
 It consumes schema-2 snapshot authority: Release-Snapshot-Version,
 Release-Line/Version/Merge, Release-QA-Staged/QA-Source, Release-Tree,
-Release-Content-SHA256, and both packages'
-integrity/shasum. There is no Release-QA-Run identity. The adapter binds the
-tree to V and independently hashes V's four committed transformed files before
-returning normalized tree/content authority. No classifier or action parses
+Release-Content-SHA256, and both packages' integrity/shasum. There is no
+Release-QA-Run identity. It delegates to the shared trusted-main validator in
+`release-publication.mjs`, which derives S/I/M from the concrete graph,
+reconstructs the only permitted four-file transform, requires exact whole-tree
+equality, four `M` name-status changes and `100644` blobs, validates complete
+root/package/workspace-lock shapes and exact inert package contents, reads Git
+blobs as raw buffers, and deterministically repacks both packages with the
+closed fixed npm CLI. Only after those independent facts exist does it parse
+and cross-check V's tree/content/package trailers. No classifier parses
 snapshot trailers directly.
 
 Repeated dispatches converge in this order:
@@ -86,6 +99,12 @@ Repeated dispatches converge in this order:
    leased to one structured empty `1.0.2` intent over current J/V.
 6. A later dispatch creates or reuses one draft `staged/v1.0` to
    `releases/v1.0` proposal over the current line SHA.
+
+Hydrated production-branch PR history is partitioned by each head commit's
+exact structured intent version and source. Valid closed-unmerged `1.0.1`
+lifecycle attempts, including retained PR #1-shaped history, remain preserved
+and do not enter `1.0.2` cardinality. Exact next-version rules apply only to
+the current `1.0.2` lineage; malformed or wrong same-version identities stop.
 
 Blocked or out-of-order state is a successful no-op. Contradictory package,
 graph, ref, tag, Release, recovery, or PR identity fails closed.
@@ -123,10 +142,13 @@ source it. Exact calibration identities remain unrelated.
 
 Every ref update uses `--no-follow-tags`. Only the release line, staged line,
 lightweight tag, and two fixed attempt refs are writable. The Git adapter builds
-a closed environment and rejects URL rewrites, push URLs, tag following,
-credential helpers, askpass, alternates/replacements, and proxy/TLS/certificate
-overrides. It preserves at most checkout's single scoped GitHub authorization
-header. Exact `LC_ALL=C --porcelain` stale status is separate from auth,
+a closed environment and allowlists every effective local setting. Generic or
+URL-scoped proxy/TLS/CA/certificate/low-speed settings, credentials, includes,
+remote service/proxy commands, URL rewrites, push URLs, tag following, askpass,
+and alternates/replacements are rejected before any advertisement, write, or
+GitHub API call. Only exact origin/fetch mechanics, inert repository mechanics,
+branch tracking, and at most checkout's single scoped GitHub authorization
+header survive. Exact `LC_ALL=C --porcelain` stale status is separate from auth,
 transport, policy, and malformed-output errors; only an exact post-read proves
 lost success.
 
@@ -151,7 +173,10 @@ refs/heads/finalizer-attempts/v1.0.2/next-proposal
 
 Every transition has an exact lease. One classified POST action is a bounded
 protocol: consume the authorization, stably reread the marker, then issue at
-most one POST. Once spent, reruns are query-only until two complete stable
+most one POST. The post-marker read binds every mutable planned ref and trusted
+main, and the POST response is immediately hydrated by exact returned
+number/id, canonical URL/repository, state, and stored SHA tuple. Once spent,
+reruns are query-only until two complete stable
 history sweeps reveal the object. Ambiguous failures never reauthorize. Only a
 definite pre-creation client rejection plus exact all-state absence records the
 explicit rejected state. A POST action therefore may contain its marker write
@@ -168,7 +193,11 @@ each pre-mutation main binding, release PR, S/I/M/V, QA authority, npm
 identities, H/J, action old/new refs, tag, Release ID/URL, recovery, next
 intent/PR, and full before/after canonical tuples for relevant refs, PRs,
 Releases, and packages. Instrumentation records exact methods, destinations,
-and writes.
+and writes. Immediately after every accepted ref/marker write, exact stable
+readback is captured as partial durable evidence. Any later main/ref drift,
+transport, hydration, post-read, or injected-fault failure retains those
+transitions plus the latest full re-observation when one is available; a known
+durable write is never represented as `durableEvidence: null`.
 
 The preservation claim is deliberately scoped: it proves what this finalizer
 process asked its exact `fablebookjs/lab-01` Git/GitHub and two read-only npm

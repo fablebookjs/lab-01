@@ -39,6 +39,12 @@ jobs:
           node-version: 24.18.0
           package-manager-cache: false
 
+      - name: Bootstrap the closed fixed npm packer
+        run: >-
+          node scripts/bootstrap-npm-cli.mjs
+          --repository-root "$GITHUB_WORKSPACE"
+          --path-file "$GITHUB_PATH"
+
       - name: Observe and perform at most one durable finalizer action
         env:
           GITHUB_TOKEN: ${{ github.token }}
