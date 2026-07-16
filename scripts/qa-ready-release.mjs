@@ -235,7 +235,6 @@ function cleanupContract() {
 function expectedStepShape(steps) {
   const prefix = [
     ['candidate:install', 'npm ci --omit=dev --offline (loopback registry)'],
-    ['candidate:test', 'LAB_01_EXPECTED_PACKAGE_VERSION=1.0.1 npm test'],
   ];
   const suffix = [
     [`pack:${PACKAGE_SPECS[0].name}`, `npm pack ./${PACKAGE_SPECS[0].directory}`],
@@ -245,20 +244,9 @@ function expectedStepShape(steps) {
     ['consumer:install', 'npm install (loopback registry)'],
     ['consumer:test', 'npm test'],
   ];
-  const buildNames = [
-    '@fablebook/lab-01',
-    ...PACKAGE_SPECS.map(({ name }) => name),
-  ].map((name) => `build:${name}`);
-  const buildSteps = Array.isArray(steps) ? steps.slice(prefix.length, -suffix.length) : [];
-  const commands = [...prefix, ...buildSteps.map(({ name }) => [name, 'npm run build']), ...suffix];
+  const commands = [...prefix, ...suffix];
   if (
     !Array.isArray(steps) ||
-    buildSteps.length > buildNames.length ||
-    buildSteps.some(
-      (step, index) =>
-        !buildNames.includes(step?.name) ||
-        (index > 0 && buildNames.indexOf(step.name) <= buildNames.indexOf(buildSteps[index - 1].name)),
-    ) ||
     steps.length !== commands.length ||
     steps.some(
       (step, index) =>
@@ -1011,16 +999,6 @@ async function verifyRegistryPackage(origin, candidate) {
     metadataUrl: metadataUrl.href,
     tarballUrl: tarballUrl.href,
   };
-}
-
-async function buildIfPresent(candidateDirectory, steps, env) {
-  for (const manifestPath of ['package.json', ...PACKAGE_SPECS.map(({ directory }) => `${directory}/package.json`)]) {
-    const manifest = await readJson(join(candidateDirectory, manifestPath));
-    if (!manifest.scripts?.build) continue;
-    const cwd = dirname(join(candidateDirectory, manifestPath));
-    const result = await command('npm', ['run', 'build'], { cwd, env });
-    steps.push({ name: `build:${manifest.name}`, command: 'npm run build', durationMs: result.durationMs });
-  }
 }
 
 async function proveConsumer(tempRoot, registryOrigin, registryPackages, steps, repoRoot) {

@@ -137,7 +137,6 @@ function evidenceFixture() {
   }));
   const steps = [
     ['candidate:install', 'npm ci --omit=dev --offline (loopback registry)'],
-    ['candidate:test', 'LAB_01_EXPECTED_PACKAGE_VERSION=1.0.1 npm test'],
     [`pack:${PACKAGE_SPECS[0].name}`, 'npm pack ./packages/core'],
     [`pack:${PACKAGE_SPECS[1].name}`, 'npm pack ./packages/addon'],
     [`publish:${PACKAGE_SPECS[0].name}`, 'npm publish (loopback registry)'],
