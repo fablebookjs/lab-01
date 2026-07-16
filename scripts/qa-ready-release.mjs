@@ -45,6 +45,7 @@ const SHASUM_PATTERN = /^[0-9a-f]{40}$/;
 const INTEGRITY_PATTERN = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
 const execFileAsync = promisify(execFile);
 const READY_QA_SIGNAL = 'Ready release QA signal';
+const GITHUB_ACTIONS_BOT = Object.freeze({ id: 41898282, login: 'github-actions[bot]' });
 const HISTORY_PAGE_SIZE = 100;
 const HISTORY_MAX_PAGES = 20;
 
@@ -630,11 +631,20 @@ function validActor(actor) {
   return Number.isInteger(actor?.id) && actor.id > 0 && /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(actor.login ?? '');
 }
 
+function isGitHubActionsBot(actor) {
+  return actor?.id === GITHUB_ACTIONS_BOT.id && actor.login === GITHUB_ACTIONS_BOT.login;
+}
+
 export function validateReadyQaWakeup({ eventName, event }) {
   if (event?.repository?.full_name !== REPOSITORY || !Number.isInteger(event.repository.id) || event.repository.id < 1) {
     fail('Ready QA wake-up repository identity is invalid');
   }
-  if (!validActor(event.sender)) fail('Ready QA wake-up sender identity is invalid');
+  if (
+    !validActor(event.sender) &&
+    !(eventName === 'workflow_dispatch' && isGitHubActionsBot(event.sender))
+  ) {
+    fail('Ready QA wake-up sender identity is invalid');
+  }
   if (eventName === 'workflow_dispatch') {
     if (event.inputs && Object.keys(event.inputs).length !== 0) fail('manual Ready QA wake-up cannot supply state');
     return { event: eventName, actor: event.sender.login };
