@@ -5,6 +5,7 @@ import {
   assertStableOwnershipSnapshots,
   classifyMaintainerOwnership,
   classifyMaintainerOwnershipWithDurableObserver,
+  durablePullCommitShas,
   readCompletePullHistory,
   settleMaintainerOwnership,
 } from '../scripts/maintain-release-draft.mjs';
@@ -329,6 +330,20 @@ test('accepts concrete no-open M, snapshot V, and exact next 1.0.2 ownership', (
     intentSha: NEXT_INTENT,
     version: '1.0.2',
   });
+});
+
+test('hydrates only durable PR commit identities and ignores synthetic unmerged merge SHAs', () => {
+  const synthetic = '0'.repeat(40);
+  const open = openPull();
+  open.merged = false;
+  open.merge_commit_sha = synthetic;
+  assert.deepEqual(durablePullCommitShas(open), [open.base.sha, open.head.sha]);
+
+  const closedUnmerged = { ...open, state: 'closed', draft: false };
+  assert.deepEqual(durablePullCommitShas(closedUnmerged), [open.base.sha, open.head.sha]);
+
+  const merged = mergedPull();
+  assert.deepEqual(durablePullCommitShas(merged), [merged.base.sha, merged.head.sha, MERGE]);
 });
 
 test('accepted handoff states never access a maintenance write or dispatch adapter', async () => {
