@@ -1,6 +1,5 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -19,7 +18,6 @@ import {
   assertSafeGitConfiguration,
   assertSha,
   closedGitEnvironment,
-  command,
   commitShape,
   fail,
   git,
@@ -71,10 +69,10 @@ function repositoryMatches(repository, directory) {
   return repository?.type === 'git' && repository.url === REPOSITORY_URL && repository.directory === directory;
 }
 
-async function fetchRegistryPackage(spec) {
+async function fetchRegistryPackage(spec, { signal } = {}) {
   let response;
   try {
-    response = await fetch(new URL(`/${encodeURIComponent(spec.name)}/${RELEASE_VERSION}`, REGISTRY), { headers: { Accept: 'application/json' } });
+    response = await fetch(new URL(`/${encodeURIComponent(spec.name)}/${RELEASE_VERSION}`, REGISTRY), { headers: { Accept: 'application/json' }, signal });
   } catch { fail(`NPM_QUERY_FAILED_${spec.choice.toUpperCase()}`); }
   if (response.status === 404) return { status: 'absent', name: spec.name };
   if (!response.ok) fail(`NPM_QUERY_FAILED_${spec.choice.toUpperCase()}`);
@@ -89,7 +87,7 @@ async function fetchRegistryPackage(spec) {
   const expectedTarball = new URL(`/${spec.name}/-/${archiveName}`, REGISTRY);
   if (metadata.dist.tarball !== expectedTarball.href) fail(`NPM_TARBALL_URL_INCOMPATIBLE_${spec.choice.toUpperCase()}`);
   let tarballResponse;
-  try { tarballResponse = await fetch(expectedTarball); } catch { fail(`NPM_TARBALL_READ_FAILED_${spec.choice.toUpperCase()}`); }
+  try { tarballResponse = await fetch(expectedTarball, { signal }); } catch { fail(`NPM_TARBALL_READ_FAILED_${spec.choice.toUpperCase()}`); }
   if (!tarballResponse.ok) fail(`NPM_TARBALL_READ_FAILED_${spec.choice.toUpperCase()}`);
   const bytes = Buffer.from(await tarballResponse.arrayBuffer());
   const integrity = `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
@@ -100,12 +98,112 @@ async function fetchRegistryPackage(spec) {
 
 export const liveNpmAdapter = {
   query: fetchRegistryPackage,
-  async publish(artifact, env, neutralDirectory) {
-    await command('npm', [
+  async publish(artifact, env, neutralDirectory, interruption) {
+    await interruption.run('npm', [
       'publish', artifact.tarball, '--access', 'public', '--ignore-scripts', '--provenance', '--registry', REGISTRY,
     ], { cwd: neutralDirectory, env, errorCode: `NPM_PUBLISH_FAILED_${artifact.choice.toUpperCase()}` });
   },
 };
+
+function interruptionError(signal) {
+  const error = new Error('PUBLISH_INTERRUPTED');
+  error.code = 'PUBLISH_INTERRUPTED';
+  Object.defineProperty(error, 'signal', { value: signal, enumerable: false });
+  return error;
+}
+
+function wait(milliseconds) {
+  return new Promise((resolvePromise) => {
+    const timer = setTimeout(resolvePromise, milliseconds);
+    timer.unref?.();
+  });
+}
+
+export function createInterruptionLifecycle({ graceMs = 2_000 } = {}) {
+  let signal = null;
+  let active = null;
+  let termination = Promise.resolve();
+  const child = { started: false, forwarded: false, escalated: false, settled: true };
+
+  function send(target, requested) {
+    try {
+      if (process.platform !== 'win32' && target.pid) process.kill(-target.pid, requested);
+      else target.process.kill(requested);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function terminateActive() {
+    const target = active;
+    if (!target || target.process.exitCode !== null || target.process.signalCode !== null) return;
+    child.forwarded = send(target, signal);
+    await Promise.race([target.closed, wait(graceMs)]);
+    if (active === target && target.process.exitCode === null && target.process.signalCode === null) {
+      child.escalated = send(target, 'SIGKILL');
+      await target.closed;
+    }
+  }
+
+  return {
+    get signal() { return signal; },
+    get child() { return { ...child }; },
+    interrupt(requested) {
+      if (!['SIGINT', 'SIGTERM'].includes(requested) || signal) return termination;
+      signal = requested;
+      termination = terminateActive();
+      return termination;
+    },
+    checkpoint() {
+      if (signal) throw interruptionError(signal);
+    },
+    async settle() {
+      await termination;
+      if (active) await active.closed;
+    },
+    async run(file, args, options = {}) {
+      this.checkpoint();
+      let subprocess;
+      try {
+        subprocess = spawn(file, args, {
+          cwd: options.cwd,
+          env: options.env,
+          detached: process.platform !== 'win32',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch {
+        fail(options.errorCode ?? 'SUBPROCESS_FAILED');
+      }
+      child.started = true;
+      child.settled = false;
+      subprocess.stdout?.resume();
+      subprocess.stderr?.resume();
+      let resolveClosed;
+      const closed = new Promise((resolvePromise) => { resolveClosed = resolvePromise; });
+      const target = { process: subprocess, pid: subprocess.pid, closed };
+      active = target;
+      const completed = new Promise((resolvePromise, rejectPromise) => {
+        subprocess.once('error', () => rejectPromise(new Error(options.errorCode ?? 'SUBPROCESS_FAILED')));
+        subprocess.once('close', (code, childSignal) => {
+          child.settled = true;
+          if (active === target) active = null;
+          resolveClosed({ code, signal: childSignal });
+          if (signal) rejectPromise(interruptionError(signal));
+          else if (code === 0) resolvePromise();
+          else rejectPromise(new Error(options.errorCode ?? 'SUBPROCESS_FAILED'));
+        });
+      });
+      if (signal) termination = terminateActive();
+      try {
+        await completed;
+      } catch (error) {
+        if (error.code === 'PUBLISH_INTERRUPTED') throw error;
+        fail(options.errorCode ?? 'SUBPROCESS_FAILED');
+      }
+    },
+  };
+}
 
 function assertMatching(observation, artifact) {
   if (observation.status !== 'present') fail(`NPM_EXPECTED_PRESENT_${artifact.choice.toUpperCase()}`);
@@ -113,7 +211,8 @@ function assertMatching(observation, artifact) {
   if (!repositoryMatches(observation.repository, artifact.directory)) fail(`NPM_REPOSITORY_INCOMPATIBLE_${artifact.choice.toUpperCase()}`);
 }
 
-export async function applyPublicationState({ choice, artifacts, adapter, npmEnvironment, neutralDirectory = tmpdir() }) {
+export async function applyPublicationState({ choice, artifacts, adapter, npmEnvironment, neutralDirectory = tmpdir(), interruption = createInterruptionLifecycle() }) {
+  interruption.checkpoint();
   const selectedIndex = PACKAGE_SPECS.findIndex((spec) => spec.choice === choice);
   if (selectedIndex < 0) fail('PACKAGE_CHOICE_INVALID');
   const observations = [];
@@ -127,7 +226,7 @@ export async function applyPublicationState({ choice, artifacts, adapter, npmEnv
   const before = observations[selectedIndex];
   if (before.status === 'present') return { result: 'reused', before, after: before, observations };
   try {
-    await adapter.publish(artifacts[selectedIndex], npmEnvironment, neutralDirectory);
+    await adapter.publish(artifacts[selectedIndex], npmEnvironment, neutralDirectory, interruption);
   } catch (error) {
     const raced = await adapter.query(PACKAGE_SPECS[selectedIndex]);
     if (raced.status === 'present') {
@@ -157,16 +256,43 @@ export function lineRelation(repoRoot, mergeSha, snapshotSha, lineHead) {
   return lineHead === mergeSha ? 'at-merge' : 'late-descendant';
 }
 
-async function durableNpmState(adapter) {
+function matchesExpected(observation, artifact) {
+  return observation.status === 'present' && observation.integrity === artifact.integrity &&
+    observation.shasum === artifact.shasum && repositoryMatches(observation.repository, artifact.directory);
+}
+
+async function boundedQuery(adapter, spec, milliseconds) {
+  const controller = new AbortController();
+  let timer;
+  const timeout = new Promise((_, rejectPromise) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      const error = new Error('NPM_DURABLE_READ_TIMEOUT');
+      error.code = 'NPM_DURABLE_READ_TIMEOUT';
+      rejectPromise(error);
+    }, milliseconds);
+  });
+  try {
+    return await Promise.race([adapter.query(spec, { signal: controller.signal }), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function durableNpmState(adapter, artifacts = [], milliseconds = 5_000) {
   const state = [];
-  for (const spec of PACKAGE_SPECS) {
+  for (let index = 0; index < PACKAGE_SPECS.length; index += 1) {
+    const spec = PACKAGE_SPECS[index];
     try {
-      const item = await adapter.query(spec);
-      state.push(item.status === 'present'
-        ? { name: spec.name, status: 'present', integrity: item.integrity, shasum: item.shasum, repository: item.repository }
-        : { name: spec.name, status: 'absent' });
+      const item = await boundedQuery(adapter, spec, milliseconds);
+      if (item.status === 'absent') state.push({ name: spec.name, status: 'absent' });
+      else if (!artifacts[index]) state.push({ name: spec.name, status: 'unknown', code: `NPM_EXPECTED_IDENTITY_UNAVAILABLE_${spec.choice.toUpperCase()}` });
+      else if (matchesExpected(item, artifacts[index])) {
+        state.push({ name: spec.name, status: 'matching', integrity: item.integrity, shasum: item.shasum, repository: item.repository });
+      } else state.push({ name: spec.name, status: 'mismatching', code: `NPM_DURABLE_MISMATCH_${spec.choice.toUpperCase()}` });
     } catch (error) {
-      state.push({ name: spec.name, status: 'unknown', code: error.code ?? 'NPM_STATE_READ_FAILED' });
+      const suffix = spec.choice.toUpperCase();
+      state.push({ name: spec.name, status: 'unknown', code: error.code === 'NPM_DURABLE_READ_TIMEOUT' ? `NPM_DURABLE_READ_TIMEOUT_${suffix}` : `NPM_DURABLE_READ_FAILED_${suffix}` });
     }
   }
   return state;
@@ -192,6 +318,8 @@ export async function publishFromSnapshot({
   fetchAdapter = fetchObjects,
   temporaryBase = tmpdir(),
   oidc = true,
+  interruption = createInterruptionLifecycle(),
+  durableReadTimeoutMs = 5_000,
 }) {
   const evidence = {
     schemaVersion: 2,
@@ -201,16 +329,22 @@ export async function publishFromSnapshot({
     status: 'started',
     npm: { durable: [] },
     error: null,
+    interruption: null,
+    restart: { required: false, reason: null },
+    cleanup: { temporary: 'not-created', code: null },
     safety: { trustedMain: null, candidateExecuted: false, traditionalToken: false, reconciliationMutation: false, tagMutation: false, githubReleaseMutation: false },
   };
   let temporary;
+  let packed = [];
   let thrown;
   try {
+    interruption.checkpoint();
     assertSafeGitConfiguration(repoRoot);
     if (git(repoRoot, 'status', '--porcelain') !== '') fail('PUBLISHER_WORKTREE_DIRTY');
     if (process.env.NPM_TOKEN || process.env.NODE_AUTH_TOKEN) fail('TRADITIONAL_NPM_TOKEN_PROHIBITED');
     evidence.safety.trustedMain = assertTrustedMain(repoRoot, refAdapter);
     temporary = await mkdtemp(join(temporaryBase, 'lab-01-publish-'));
+    evidence.cleanup.temporary = 'pending';
     const npmEnvironment = await assertPinnedNpmVersion(join(temporary, 'npm'), { oidc });
     const snapshotSha = refAdapter(repoRoot, SNAPSHOT_REF);
     const lineBefore = refAdapter(repoRoot, `refs/heads/${RELEASE_LINE}`);
@@ -236,12 +370,13 @@ export async function publishFromSnapshot({
     evidence.line = { before: lineBefore, beforeRelation: lineRelation(repoRoot, merge.sha, snapshot.sha, lineBefore), after: null, afterRelation: null };
     const inert = join(temporary, 'inert');
     await materializeInertPackages(repoRoot, expected.tree, inert);
-    const packed = await packPackages(inert, join(temporary, 'packs'), npmEnvironment);
+    packed = await packPackages(inert, join(temporary, 'packs'), npmEnvironment);
     const identities = packageEvidence(packed);
     const reduced = identities.map(({ name, integrity, shasum }) => ({ name, integrity, shasum }));
     if (JSON.stringify(reduced) !== JSON.stringify(metadata.packages)) fail('SNAPSHOT_MESSAGE_HASH_CROSSCHECK_FAILED');
     evidence.snapshot.packages = identities;
-    evidence.npm.publication = await applyPublicationState({ choice, artifacts: packed, adapter: npmAdapter, npmEnvironment, neutralDirectory: temporary });
+    evidence.npm.publication = await applyPublicationState({ choice, artifacts: packed, adapter: npmAdapter, npmEnvironment, neutralDirectory: temporary, interruption });
+    interruption.checkpoint();
     const lineAfter = refAdapter(repoRoot, `refs/heads/${RELEASE_LINE}`);
     fetchAdapter(repoRoot, [lineAfter]);
     evidence.line.after = lineAfter;
@@ -249,23 +384,74 @@ export async function publishFromSnapshot({
     evidence.status = 'succeeded';
   } catch (error) {
     thrown = error;
-    evidence.status = 'failed';
-    evidence.error = { code: error.code ?? 'PUBLISHER_FAILED' };
+    if (interruption.signal || error.code === 'PUBLISH_INTERRUPTED') {
+      evidence.status = 'interrupted';
+      evidence.error = { code: 'PUBLISH_INTERRUPTED', signal: interruption.signal ?? error.signal };
+      evidence.interruption = { signal: interruption.signal ?? error.signal, child: interruption.child };
+      evidence.restart = { required: true, reason: 'REOBSERVE_DURABLE_NPM_STATE' };
+    } else {
+      evidence.status = 'failed';
+      evidence.error = { code: error.code ?? 'PUBLISHER_FAILED' };
+    }
   } finally {
-    evidence.npm.durable = await durableNpmState(npmAdapter);
+    await interruption.settle();
+    if (interruption.signal && evidence.status !== 'interrupted') {
+      thrown = interruptionError(interruption.signal);
+      evidence.status = 'interrupted';
+      evidence.error = { code: 'PUBLISH_INTERRUPTED', signal: interruption.signal };
+      evidence.interruption = { signal: interruption.signal, child: interruption.child };
+      evidence.restart = { required: true, reason: 'REOBSERVE_DURABLE_NPM_STATE' };
+    }
+    evidence.npm.durable = await durableNpmState(npmAdapter, packed, durableReadTimeoutMs);
+    if (evidence.snapshot?.sha) {
+      try {
+        evidence.snapshot.refHeadAfter = refAdapter(repoRoot, SNAPSHOT_REF);
+        if (evidence.snapshot.refHeadAfter !== evidence.snapshot.sha) {
+          evidence.restart = { required: true, reason: 'REOBSERVE_RELEASE_STATE' };
+        }
+        const lineAfter = refAdapter(repoRoot, `refs/heads/${RELEASE_LINE}`);
+        evidence.line.after = lineAfter;
+        evidence.line.afterRelation = lineRelation(repoRoot, evidence.release.mergeSha, evidence.snapshot.sha, lineAfter);
+      } catch {
+        evidence.restart = { required: true, reason: 'REOBSERVE_RELEASE_STATE' };
+        evidence.line.after = null;
+        evidence.line.afterRelation = 'unknown';
+      }
+    }
+    if (temporary) {
+      try {
+        await rm(temporary, { recursive: true, force: true });
+        evidence.cleanup.temporary = 'removed';
+      } catch {
+        evidence.cleanup.temporary = 'failed';
+        evidence.cleanup.code = 'TEMPORARY_CLEANUP_FAILED';
+        try { fail('TEMPORARY_CLEANUP_FAILED'); } catch (error) { thrown ??= error; }
+      }
+    }
+    if (evidence.interruption) evidence.interruption.child = interruption.child;
     try {
       if (evidencePath) await writeFile(evidencePath, `${JSON.stringify(sanitizedEvidence(evidence), null, 2)}\n`);
     } catch {
       try { fail('EVIDENCE_WRITE_FAILED'); } catch (error) { thrown ??= error; }
-    } finally {
-      if (temporary) await rm(temporary, { recursive: true, force: true });
+    }
+    if (interruption.signal && evidence.status !== 'interrupted') {
+      thrown = interruptionError(interruption.signal);
+      evidence.status = 'interrupted';
+      evidence.error = { code: 'PUBLISH_INTERRUPTED', signal: interruption.signal };
+      evidence.interruption = { signal: interruption.signal, child: interruption.child };
+      evidence.restart = { required: true, reason: 'REOBSERVE_DURABLE_NPM_STATE' };
+      try {
+        if (evidencePath) await writeFile(evidencePath, `${JSON.stringify(sanitizedEvidence(evidence), null, 2)}\n`);
+      } catch {
+        try { fail('EVIDENCE_WRITE_FAILED'); } catch (error) { thrown ??= error; }
+      }
     }
   }
   if (thrown) throw thrown;
   return evidence;
 }
 
-function parseArguments(args) {
+export function parseArguments(args) {
   const values = {};
   for (let index = 0; index < args.length; index += 2) {
     if (!args[index]?.startsWith('--') || args[index + 1] === undefined) fail('PUBLISHER_ARGUMENTS_INVALID');
@@ -276,16 +462,59 @@ function parseArguments(args) {
   return values;
 }
 
+export async function runPublisherCli({
+  argv = process.argv.slice(2),
+  repoRoot,
+  npmAdapter = liveNpmAdapter,
+  refAdapter = remoteRef,
+  fetchAdapter = fetchObjects,
+  temporaryBase = tmpdir(),
+  oidc = true,
+  graceMs = 2_000,
+  durableReadTimeoutMs = 5_000,
+} = {}) {
+  const args = parseArguments(argv);
+  const interruption = createInterruptionLifecycle({ graceMs });
+  const handlers = Object.fromEntries(['SIGINT', 'SIGTERM'].map((signal) => [signal, () => { interruption.interrupt(signal); }]));
+  for (const [signal, handler] of Object.entries(handlers)) process.on(signal, handler);
+  try {
+    const evidence = await publishFromSnapshot({
+      repoRoot: repoRoot ?? git(process.cwd(), 'rev-parse', '--show-toplevel'),
+      choice: args.package,
+      evidencePath: args.evidence,
+      npmAdapter,
+      refAdapter,
+      fetchAdapter,
+      temporaryBase,
+      oidc,
+      interruption,
+      durableReadTimeoutMs,
+    });
+    if (interruption.signal) {
+      evidence.status = 'interrupted';
+      evidence.error = { code: 'PUBLISH_INTERRUPTED', signal: interruption.signal };
+      evidence.interruption = { signal: interruption.signal, child: interruption.child };
+      evidence.restart = { required: true, reason: 'REOBSERVE_DURABLE_NPM_STATE' };
+      await writeFile(args.evidence, `${JSON.stringify(sanitizedEvidence(evidence), null, 2)}\n`);
+      throw interruptionError(interruption.signal);
+    }
+    console.log(JSON.stringify({ status: evidence.status, choice: evidence.choice }));
+    return evidence;
+  } catch (error) {
+    if (!interruption.signal) {
+      console.error(error.code ?? 'PUBLISHER_FAILED');
+      process.exitCode = 1;
+      return null;
+    }
+    await interruption.settle();
+    for (const [signal, handler] of Object.entries(handlers)) process.off(signal, handler);
+    process.kill(process.pid, interruption.signal);
+    return null;
+  } finally {
+    for (const [signal, handler] of Object.entries(handlers)) process.off(signal, handler);
+  }
+}
+
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  const args = parseArguments(process.argv.slice(2));
-  const interrupted = (signal) => {
-    try {
-      writeFileSync(args.evidence, `${JSON.stringify({ schemaVersion: 2, operation: 'publish-npm', repository: REPOSITORY, choice: args.package, status: 'interrupted', error: { code: signal }, npm: { durable: [{ status: 'unknown' }] } }, null, 2)}\n`);
-    } finally { process.exit(1); }
-  };
-  process.once('SIGINT', () => interrupted('SIGINT'));
-  process.once('SIGTERM', () => interrupted('SIGTERM'));
-  publishFromSnapshot({ repoRoot: git(process.cwd(), 'rev-parse', '--show-toplevel'), choice: args.package, evidencePath: args.evidence })
-    .then((evidence) => console.log(JSON.stringify({ status: evidence.status, choice: evidence.choice })))
-    .catch((error) => { console.error(error.code ?? 'PUBLISHER_FAILED'); process.exitCode = 1; });
+  await runPublisherCli();
 }

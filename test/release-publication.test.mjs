@@ -15,6 +15,7 @@ import {
 import {
   applyPublicationState,
   assertTrustedMain,
+  durableNpmState,
   lineRelation,
   publishFromSnapshot,
 } from '../scripts/publish-npm.mjs';
@@ -311,6 +312,36 @@ test('publisher rejects inverse partial, wrong order, and mismatching durable st
     applyPublicationState({ choice: 'core', artifacts, adapter: publicationHarness([mismatch, absent[1]]).adapter, npmEnvironment: {} }),
     /NPM_INTEGRITY_INCOMPATIBLE_CORE/,
   );
+});
+
+test('bounded durable registry readback names exact matching, absent, mismatching, and unknown package states', async () => {
+  const artifacts = packages.map((item, index) => ({ ...PACKAGE_SPECS[index], ...item }));
+  const exact = await durableNpmState({
+    query: async (spec) => spec.choice === 'core' ? present(artifacts[0]) : { status: 'absent', name: spec.name },
+  }, artifacts, 50);
+  assert.deepEqual(exact.map(({ name, status }) => ({ name, status })), [
+    { name: PACKAGE_SPECS[0].name, status: 'matching' },
+    { name: PACKAGE_SPECS[1].name, status: 'absent' },
+  ]);
+
+  const mismatching = await durableNpmState({ query: async (spec) => ({ ...present(artifacts.find(({ name }) => name === spec.name)), integrity: 'sha512-wrong' }) }, artifacts, 50);
+  assert.deepEqual(mismatching.map(({ name, status, code }) => ({ name, status, code })), [
+    { name: PACKAGE_SPECS[0].name, status: 'mismatching', code: 'NPM_DURABLE_MISMATCH_CORE' },
+    { name: PACKAGE_SPECS[1].name, status: 'mismatching', code: 'NPM_DURABLE_MISMATCH_ADDON' },
+  ]);
+
+  const unavailable = await durableNpmState({ query: async () => { throw new Error('raw registry diagnostics'); } }, artifacts, 50);
+  assert.deepEqual(unavailable.map(({ name, status, code }) => ({ name, status, code })), [
+    { name: PACKAGE_SPECS[0].name, status: 'unknown', code: 'NPM_DURABLE_READ_FAILED_CORE' },
+    { name: PACKAGE_SPECS[1].name, status: 'unknown', code: 'NPM_DURABLE_READ_FAILED_ADDON' },
+  ]);
+  assert.doesNotMatch(JSON.stringify(unavailable), /raw registry diagnostics/);
+
+  const timedOut = await durableNpmState({ query: async () => new Promise(() => {}) }, artifacts, 5);
+  assert.deepEqual(timedOut.map(({ name, status, code }) => ({ name, status, code })), [
+    { name: PACKAGE_SPECS[0].name, status: 'unknown', code: 'NPM_DURABLE_READ_TIMEOUT_CORE' },
+    { name: PACKAGE_SPECS[1].name, status: 'unknown', code: 'NPM_DURABLE_READ_TIMEOUT_ADDON' },
+  ]);
 });
 
 test('late release-line descendants do not block package publication but reconciled V does', async () => {

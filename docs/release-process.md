@@ -235,6 +235,19 @@ output, temporary paths, credentials, or configuration. It records that no
 candidate code, traditional token, reconciliation, tag, or GitHub Release
 mutation occurred.
 
+`SIGINT` and `SIGTERM` are managed stops, not synchronous exits. Handlers are
+installed before publisher child or temporary state exists. During the
+irreversible npm window the original signal is forwarded to the npm process
+group; a bounded grace period is followed by group `SIGKILL` only when the
+child ignores the stop. The publisher awaits child settlement, performs a
+bounded read-only public-registry read-back for both named packages, records
+each as exact `matching`, `absent`, `mismatching`, or `unknown`, re-observes the
+line and durable `V` locator, removes all temporary pack/config/home/cache
+state, and writes normal schema-2 evidence. Interruption evidence always marks
+restart as required so a later dispatch re-observes npm and converges through
+registry read-back. Only after evidence and cleanup does the CLI restore the
+original signal exit semantics.
+
 The accepted issue #14 state contract requires publication to complete before
 normal reconciliation or conflict recovery begins. Consequently this slice
 never reconciles the release line while either package is absent and never
