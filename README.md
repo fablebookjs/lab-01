@@ -102,9 +102,10 @@ block incomplete package publication. The separate finalizer controller
 completed reconciliation, tag, GitHub Release, and next-proposal actions only
 after both public packages matched `V`.
 
-The issue #19 controllers are installed on default `main`, and this branch was
-their accepted `1.0.1` release source. The manual operator-only exact
-`1.0.0` bootstrap completed on 2026-07-16; both public package tarballs match
+The issue #19 controllers are installed on default `main`. Their accepted
+`1.0.1` source was exact `releases/v1.0` at `S`, and `staged/v1.0` carried the
+empty intent `I` before the ordered merge `M=[S,I]`. The manual operator-only
+exact `1.0.0` bootstrap completed on 2026-07-16; both public package tarballs match
 the immutable tagged baseline, and an external consumer installed them
 together successfully. The `npm-publish` environment exists with no secrets or
 reviewers and permits only `main`. Exact `1.0.1` staged QA succeeded before M;

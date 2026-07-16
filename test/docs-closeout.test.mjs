@@ -109,9 +109,10 @@ test('README surfaces the demo and changed Markdown is structurally clean', () =
   assert.match(opening, /https:\/\/fablebookjs\.github\.io\/release-state-explorer\//);
   assert.match(finalizer, /ordinary merge `H=\[M,P\]`/);
   assert.doesNotMatch(finalizer, /Installation prerequisite|release-line candidate/);
-  assert.doesNotMatch(readme, /Current staged QA is successful|release-line source candidate/);
+  assert.doesNotMatch(readme, /Current staged QA is successful|release-line source candidate|this branch was/);
   assert.match(readme, /Exact `1\.0\.1` staged QA succeeded before M/);
   assert.match(readme, /current staged ref is the draft `1\.0\.2` intent/);
+  assert.match(readme, /accepted\s+`1\.0\.1` source was exact `releases\/v1\.0` at `S`/);
   for (const [name, markdown] of [
     ['README', readme],
     ['calibration', calibration],
