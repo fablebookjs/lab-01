@@ -632,6 +632,7 @@ async function publish(context, artifact) {
     {
       cwd: context.commandDirectory,
       env: context.npmEnvironment,
+      interactive: true,
       phase: `npm-publish:${artifact.name}`,
     },
   );
