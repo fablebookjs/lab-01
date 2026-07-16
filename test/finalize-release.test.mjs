@@ -91,6 +91,7 @@ function npmPresent(index, overrides = {}) {
 
 function releasePull() {
   return {
+    id: 1200,
     number: 12,
     state: 'closed',
     draft: false,
@@ -107,6 +108,7 @@ function releasePull() {
 
 function recoveryPull(overrides = {}) {
   return {
+    id: 10000,
     number: 100,
     state: 'open',
     draft: true,
@@ -124,6 +126,7 @@ function recoveryPull(overrides = {}) {
 
 function historicalReleasePull(number = 1, overrides = {}) {
   return {
+    id: 10000 + number,
     number,
     state: 'closed',
     draft: true,
@@ -131,8 +134,8 @@ function historicalReleasePull(number = 1, overrides = {}) {
     merged_at: null,
     merge_commit_sha: null,
     html_url: `https://github.com/fablebookjs/lab-01/pull/${number}`,
-    title: 'release: propose v1.0.1',
-    body: 'retained historical 1.0.1 lifecycle proposal',
+    title: 'Release 1.0.1',
+    body: 'Arbitrarily edited presentation; the structured empty commit remains authoritative.',
     head: { ref: 'staged/v1.0', sha: ids.oldIntent, repo: { full_name: REPOSITORY } },
     base: { ref: 'releases/v1.0', sha: ids.source, repo: { full_name: REPOSITORY } },
     ...overrides,
@@ -309,6 +312,7 @@ class MemoryGitHub {
   constructor(gitAdapter) {
     this.git = gitAdapter;
     this.pulls = [releasePull(), {
+      id: 9900,
       number: 99,
       state: 'open',
       draft: true,
@@ -345,7 +349,7 @@ class MemoryGitHub {
     if (this.pullVisibilityDelay > 0) this.pullVisibilityDelay -= 1;
     else if (this.pendingPulls.length) this.pulls.push(...this.pendingPulls.splice(0));
     if (this.pullReadHook) await this.pullReadHook(this);
-    return structuredClone(this.pulls);
+    return structuredClone(this.pulls.map((pull) => ({ ...pull, id: pull.id ?? 10000 + pull.number })));
   }
   async listReleases() {
     this.operations.push({ transport: 'github', method: 'GET', mutation: false, repository: REPOSITORY, endpoint: '/releases' });
@@ -394,6 +398,7 @@ class MemoryGitHub {
       throw new DefiniteGitHubClientError(400, '/pulls');
     }
     const pull = {
+      id: 10100,
       number: 101,
       state: 'open',
       draft,
@@ -765,19 +770,78 @@ test('retained live-shaped 1.0.1 lifecycle history is classified and preserved a
 
 test('complete pagination is bounded, ordered, and rejects duplicate page identities', async () => {
   const adapter = new LiveGitHubAdapter();
-  const values = Array.from({ length: 205 }, (_, index) => ({ number: index + 1 }));
+  const values = Array.from({ length: 205 }, (_, index) => ({ id: 1000 + index, number: index + 1 }));
   adapter.request = async (_method, path) => {
     const page = Number(new URL(`https://example.invalid${path}`).searchParams.get('page'));
     return values.slice((page - 1) * 100, page * 100);
   };
-  assert.equal((await adapter.paginate('/pulls?state=all')).length, 205);
+  assert.equal((await adapter.paginate(`/repos/${REPOSITORY}/pulls?state=all`)).length, 205);
 
   const endless = new LiveGitHubAdapter();
   endless.request = async (_method, path) => {
     const page = Number(new URL(`https://example.invalid${path}`).searchParams.get('page'));
-    return Array.from({ length: 100 }, (_, index) => ({ number: (page - 1) * 100 + index + 1 }));
+    return Array.from({ length: 100 }, (_, index) => ({
+      id: (page - 1) * 100 + index + 1000,
+      number: (page - 1) * 100 + index + 1,
+    }));
   };
-  await assert.rejects(endless.paginate('/pulls?state=all'), /exceeded/);
+  await assert.rejects(endless.paginate(`/repos/${REPOSITORY}/pulls?state=all`), /exceeded/);
+});
+
+test('Release pagination structurally routes zero, one, multi-page, query, and ceiling sweeps', async () => {
+  const release = (id) => ({
+    id,
+    tag_name: `v1.0.${id}`,
+    target_commitish: ids.snapshot,
+    name: `v1.0.${id}`,
+    body: `release ${id}`,
+    draft: false,
+    prerelease: false,
+    html_url: `https://github.com/fablebookjs/lab-01/releases/tag/v1.0.${id}`,
+  });
+
+  const zero = new LiveGitHubAdapter();
+  const zeroRequests = [];
+  zero.request = async (_method, path) => { zeroRequests.push(path); return []; };
+  assert.deepEqual(await zero.releaseSweep(), []);
+  assert.deepEqual(zeroRequests, [`/repos/${REPOSITORY}/releases?per_page=100&page=1`]);
+
+  const one = new LiveGitHubAdapter();
+  const oneRequests = [];
+  one.request = async (_method, path) => {
+    oneRequests.push(path);
+    return path.includes('/releases?') ? [{ id: 501 }] : release(501);
+  };
+  assert.deepEqual((await one.releaseSweep()).map(({ id }) => id), [501]);
+  assert.equal(oneRequests.length, 2);
+
+  const multi = new LiveGitHubAdapter();
+  const multiRequests = [];
+  multi.request = async (_method, path) => {
+    multiRequests.push(path);
+    if (!path.includes('/releases?')) return release(Number(path.split('/').at(-1)));
+    const page = Number(new URL(`https://api.github.invalid${path}`).searchParams.get('page'));
+    if (page === 1) return Array.from({ length: 100 }, (_, index) => ({ id: index + 1 }));
+    return [{ id: 101 }];
+  };
+  assert.equal((await multi.releaseSweep()).length, 101);
+  assert.equal(multiRequests.filter((path) => path.includes('/releases?')).length, 2);
+  assert.equal(multiRequests.length, 103);
+
+  const withQuery = new LiveGitHubAdapter();
+  const queryRequests = [];
+  withQuery.request = async (_method, path) => { queryRequests.push(path); return []; };
+  await withQuery.paginate(`/repos/${REPOSITORY}/releases?per_page=1`);
+  assert.deepEqual(queryRequests, [`/repos/${REPOSITORY}/releases?per_page=100&page=1`]);
+
+  const ceiling = new LiveGitHubAdapter();
+  let ceilingRequests = 0;
+  ceiling.request = async () => {
+    ceilingRequests += 1;
+    return Array.from({ length: 100 }, (_, index) => ({ id: (ceilingRequests - 1) * 100 + index + 1 }));
+  };
+  await assert.rejects(ceiling.paginate(`/repos/${REPOSITORY}/releases`), /exceeded/);
+  assert.equal(ceilingRequests, 100);
 });
 
 test('wake-up ordering converges with one classified action and at most one GitHub POST', async () => {
@@ -1278,9 +1342,25 @@ test('authoritative sweeps compare complete hydrated tuples and proposal base SH
   stringIdentity.request = async () => [{ number: '12' }];
   await assert.rejects(stringIdentity.paginate('/repos/fablebookjs/lab-01/pulls?state=all&sort=created&direction=asc'), /exact positive number/);
 
+  for (const id of [undefined, null, '1200']) {
+    const invalidId = new LiveGitHubAdapter();
+    invalidId.request = async () => [{ number: 12, ...(id === undefined ? {} : { id }) }];
+    await assert.rejects(
+      invalidId.paginate(`/repos/${REPOSITORY}/pulls?state=all&sort=created&direction=asc`),
+      /missing, invalid, or aliased pull id/,
+    );
+  }
+
   const aliasedIdentity = new LiveGitHubAdapter();
   aliasedIdentity.request = async () => [{ number: 12, id: 1200 }, { number: 13, id: 1200 }];
   await assert.rejects(aliasedIdentity.paginate('/repos/fablebookjs/lab-01/pulls?state=all&sort=created&direction=asc'), /aliased pull id/);
+
+  const missingPostId = new LiveGitHubAdapter();
+  missingPostId.request = async () => ({ number: 101 });
+  await assert.rejects(missingPostId.createPullRequest({
+    title: 'release: propose v1.0.2', body: 'body', head: 'staged/v1.0', base: 'releases/v1.0', draft: true,
+    expectedHeadSha: ids.nextIntent, expectedBaseSha: ids.reconciliation,
+  }), /exact positive number\/id/);
 
   const staleBase = fixture();
   staleBase.gitAdapter.refs[RELEASE_REF].sha = ids.reconciliation;
@@ -1308,7 +1388,7 @@ test('authoritative sweeps compare complete hydrated tuples and proposal base SH
     head: { ref: 'staged/v1.0', sha: ids.nextIntent, repo: { full_name: REPOSITORY } },
     base: { ref: 'releases/v1.0', sha: ids.snapshot, repo: { full_name: REPOSITORY } },
   });
-  await assert.rejects(observe(staleBase), /(?:incompatible head\/base|lifecycle source\/title is incompatible)/);
+  await assert.rejects(observe(staleBase), /(?:incompatible head\/base|lifecycle source is incompatible)/);
 });
 
 test('preservation evidence records full observed tuple changes and instrumented scope boundaries', async () => {

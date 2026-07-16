@@ -156,7 +156,7 @@ function pullState(pull) {
 
 function validateCanonicalPull(pull) {
   if (!Number.isInteger(pull?.number) || pull.number < 1) fail('pull request number is not positive');
-  if (pull.id !== undefined && (!Number.isInteger(pull.id) || pull.id < 1)) fail(`pull request #${pull.number} has an invalid id`);
+  if (!Number.isInteger(pull.id) || pull.id < 1) fail(`pull request #${pull.number} lacks an exact positive id`);
   if (pull.html_url !== `https://github.com/${REPOSITORY}/pull/${pull.number}`) {
     fail(`pull request #${pull.number} has a non-canonical URL`);
   }
@@ -210,6 +210,16 @@ function assertUniqueNumbers(items, label) {
       fail(`${label} contains an invalid or duplicate pull request number`);
     }
     seen.add(item.number);
+  }
+}
+
+function assertUniquePullIds(items, label) {
+  const seen = new Set();
+  for (const item of items) {
+    if (!Number.isInteger(item.id) || item.id < 1 || seen.has(item.id)) {
+      fail(`${label} contains a missing, invalid, or duplicate pull request id`);
+    }
+    seen.add(item.id);
   }
 }
 
@@ -304,8 +314,8 @@ async function structuredLifecycleIntent(pull, gitAdapter, readCommit) {
   for (const [key, value] of expected) {
     if (trailers.get(key) !== value) fail(`pull request #${pull.number} lifecycle intent has an invalid ${key}`);
   }
-  if (pull.base.sha !== source.sha || pull.title !== `release: propose v${version}`) {
-    fail(`pull request #${pull.number} lifecycle source/title is incompatible`);
+  if (pull.base.sha !== source.sha) {
+    fail(`pull request #${pull.number} lifecycle source is incompatible`);
   }
   return { version, sourceSha: source.sha, intentSha: commit.sha };
 }
@@ -405,7 +415,7 @@ function summarizeRefs(refs) {
 function canonicalPullTuple(pull) {
   validateCanonicalPull(pull);
   return {
-    id: pull.id ?? null,
+    id: pull.id,
     number: pull.number,
     url: pull.html_url,
     state: pull.state,
@@ -525,6 +535,7 @@ export async function observeDurableState({ gitAdapter, githubAdapter, npmAdapte
   pulls.forEach(validateCanonicalPull);
   releases.forEach(validateCanonicalRelease);
   assertUniqueNumbers(pulls, 'complete pull-request history');
+  assertUniquePullIds(pulls, 'complete pull-request history');
   const mainSha = refSha(refs, `refs/heads/${DEFAULT_BRANCH}`);
   assertSha(mainSha, 'remote default main');
   if (context.enforceTrustedMain && (context.sourceSha !== mainSha || context.localSha !== mainSha)) {
@@ -1718,20 +1729,30 @@ export class LiveGitHubAdapter {
     const items = [];
     const seen = new Set();
     const seenPullIds = new Set();
-    const identityField = path.includes('/pulls?') ? 'number' : path.includes('/releases?') ? 'id' : null;
+    let collection;
+    try { collection = new URL(path, 'https://api.github.invalid'); }
+    catch { fail(`GitHub pagination rejects malformed collection ${path}`); }
+    if (collection.origin !== 'https://api.github.invalid') fail(`GitHub pagination rejects external collection ${path}`);
+    const identityField = collection.pathname === `/repos/${REPOSITORY}/pulls`
+      ? 'number'
+      : collection.pathname === `/repos/${REPOSITORY}/releases`
+        ? 'id'
+        : null;
     if (identityField === null) fail(`GitHub pagination rejects unknown collection ${path}`);
     for (let page = 1; page <= MAX_PAGES; page += 1) {
-      const separator = path.includes('?') ? '&' : '?';
-      const value = await this.request('GET', `${path}${separator}per_page=${PAGE_SIZE}&page=${page}`);
+      const request = new URL(collection);
+      request.searchParams.set('per_page', String(PAGE_SIZE));
+      request.searchParams.set('page', String(page));
+      const value = await this.request('GET', `${request.pathname}${request.search}`);
       if (!Array.isArray(value)) fail(`GitHub pagination for ${path} did not return an array`);
       const keys = value.map((item) => item[identityField]);
       if (keys.some((key) => !Number.isInteger(key) || key < 1)) fail(`GitHub pagination for ${path} returned an item without its exact positive ${identityField}`);
       for (let index = 0; index < value.length; index += 1) {
         if (seen.has(keys[index])) fail(`GitHub pagination for ${path} returned a duplicate identity`);
         seen.add(keys[index]);
-        if (identityField === 'number' && value[index].id !== undefined) {
+        if (identityField === 'number') {
           if (!Number.isInteger(value[index].id) || value[index].id < 1 || seenPullIds.has(value[index].id)) {
-            fail(`GitHub pagination for ${path} returned an invalid or aliased pull id`);
+            fail(`GitHub pagination for ${path} returned a missing, invalid, or aliased pull id`);
           }
           seenPullIds.add(value[index].id);
         }
@@ -1755,9 +1776,9 @@ export class LiveGitHubAdapter {
     const hydrated = [];
     for (const summary of summaries) {
       if (!Number.isInteger(summary.number) || summary.number < 1) fail('pull summary lacks a positive number');
-      if (summary.id !== undefined && (!Number.isInteger(summary.id) || summary.id < 1)) fail('pull summary has an invalid id');
+      if (!Number.isInteger(summary.id) || summary.id < 1) fail('pull summary lacks an exact positive id');
       const detail = await this.request('GET', `/repos/${REPOSITORY}/pulls/${summary.number}`);
-      if (detail?.number !== summary.number || (summary.id !== undefined && detail?.id !== summary.id)) {
+      if (detail?.number !== summary.number || detail?.id !== summary.id) {
         fail(`hydrated pull detail does not match requested summary #${summary.number}`);
       }
       hydrated.push(validateCanonicalPull(detail));
@@ -1823,9 +1844,12 @@ export class LiveGitHubAdapter {
       { title, body, head, base, draft },
       { expectedHeadSha, expectedBaseSha },
     );
-    if (!Number.isInteger(created?.number) || created.number < 1) fail('PR POST response lacks a positive number');
+    if (
+      !Number.isInteger(created?.number) || created.number < 1 ||
+      !Number.isInteger(created?.id) || created.id < 1
+    ) fail('PR POST response lacks an exact positive number/id');
     const hydrated = await this.request('GET', `/repos/${REPOSITORY}/pulls/${created.number}`);
-    if (hydrated?.number !== created.number || (created.id !== undefined && hydrated?.id !== created.id)) {
+    if (hydrated?.number !== created.number || hydrated?.id !== created.id) {
       fail('created pull hydration does not match its POST identity');
     }
     return validateCanonicalPull(hydrated);

@@ -103,8 +103,10 @@ Repeated dispatches converge in this order:
 Hydrated production-branch PR history is partitioned by each head commit's
 exact structured intent version and source. Valid closed-unmerged `1.0.1`
 lifecycle attempts, including retained PR #1-shaped history, remain preserved
-and do not enter `1.0.2` cardinality. Exact next-version rules apply only to
-the current `1.0.2` lineage; malformed or wrong same-version identities stop.
+and do not enter `1.0.2` cardinality. Their editable title/body are presentation,
+not authority. Exact next-version rules apply only to the current `1.0.2`
+lineage, where the current proposal's settled title/body are checked separately;
+malformed or wrong structured same-version identities stop.
 
 Blocked or out-of-order state is a successful no-op. Contradictory package,
 graph, ref, tag, Release, recovery, or PR identity fails closed.
@@ -157,6 +159,11 @@ only exact public-registry metadata and tarball GETs for the fixed packages.
 Both HTTP adapters reject inherited proxy/TLS/CA overrides. Tokens, raw command
 output, temporary paths, authentication, and configuration never enter evidence
 or sanitized errors.
+
+PR and Release collections are routed by their parsed exact endpoint path.
+Every PR list item must carry positive integer `number` and `id`; hydration and
+POST readback bind both identities to the requested endpoint and reject missing,
+string, swapped, or aliased IDs across complete sweeps.
 
 ## Durable POST attempts
 
