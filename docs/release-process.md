@@ -64,10 +64,11 @@ expected-old guarded empty intent, and created [draft PR #12](https://github.com
 Attempt 2 of the same run returned `replacement-exists`; exactly one matching
 open release PR remained.
 
-Merging the current validated release PR is explicit authorization to publish
-its exact source. **Do not merge today's draft PR:** the public `1.0.0`
-baseline, npm trusted-publisher settings, GitHub environment, and fresh QA for
-the manifest-hardened head are still external gates.
+The new issue #19 surfaces described below are present only in this offline
+integration. The manual operator-only exact `1.0.0` bootstrap exists but has
+not published. The trusted-main `V` preparation and direct-OIDC publisher also
+exist locally but are not installed or live. No public package, finalization,
+or new live-workflow state is claimed by this changeset.
 
 ## One-time public baseline bootstrap
 
@@ -132,14 +133,14 @@ rerun `--preflight` before deciding whether to resume. This bootstrap does not
 publish `1.0.1`, merge the release PR, or alter any Git ref, tag, Release,
 workflow, Pages setting, or Storybook resource.
 
-This operator-only `1.0.0` bootstrap is the only current public npm write in
-the repository. No workflow invokes it, no workflow publishes a package, and
-no `1.0.1` publication automation exists yet.
+This operator-only `1.0.0` bootstrap is the sole prepared manual public-npm
+write path, and it has not been run to publish either baseline package. No
+workflow invokes it.
 
-Merging the current validated release PR is explicit authorization for a
-separately reviewed issue #19 finalizer to publish its exact source. This
-maintainer does not publish or reconcile. Until that finalizer and its operator
-gate are installed, the release PR must remain unmerged.
+A validated release-PR merge is the intended authorization input for a
+separately reviewed issue #19 finalizer. This maintainer does not publish or
+reconcile, no finalizer is installed here, and the operator gate remains closed
+while the required external state is absent.
 
 ## Maintainer-to-finalizer ownership handoff
 
@@ -255,6 +256,11 @@ execute pull-request-head code, and no workflow may mutate a Storybook
 resource.
 
 ## Offline trusted-publishing preparation
+
+The workflow and controller files in this section are locally verified
+preparation only. They are not installed on default `main`, their trusted
+publisher/environment configuration is absent, and they have performed no
+public npm or GitHub write.
 
 Both publishable package manifests carry the same exact Git repository URL,
 their monorepo directory, and the minimal `src` files allowlist. They contain no
@@ -378,8 +384,9 @@ normal reconciliation or conflict recovery begins. Consequently this slice
 never reconciles the release line while either package is absent and never
 creates `v1.0.1`, a GitHub Release, or a `1.0.2` proposal.
 
-The issue #19 public-package finalizer is intentionally **NOT INSTALLED BY THIS
-PREREQUISITE**. The maintainer only validates and yields at its ownership
-boundaries; it does not publish to public npm, reconcile, tag, create a GitHub
-Release, or mutate Storybook. The draft maintainer does not execute
-pull-request-head code.
+The issue #19 public-package finalizer is intentionally not installed by this
+offline integration. The maintainer validates the open `1.0.1` proposal, exact
+`M`, exact deterministic `V`, and the exact draft `1.0.2` proposal, then yields
+without publication, reconciliation, tag, Release, or Storybook writes. H/J
+remain fail-closed pending a concrete committed finalizer observer/schema. The
+draft maintainer does not execute pull-request-head code.

@@ -2,6 +2,8 @@ import { execFileSync } from 'node:child_process';
 import { appendFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
+import { parseSnapshotMessage } from './release-publication.mjs';
+
 const REPOSITORY = 'fablebookjs/lab-01';
 const RELEASE_LINE = 'releases/v1.0';
 const STAGED_LINE = 'staged/v1.0';
@@ -13,7 +15,6 @@ const READY_QA_WORKFLOW = 'ready-release-qa.yml';
 const SNAPSHOT_REF = 'release-snapshots/v1.0.1';
 const HISTORY_PAGE_SIZE = 100;
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
-const INTEGRITY_PATTERN = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
 
 const git = (...args) =>
   execFileSync('git', args, {
@@ -94,10 +95,9 @@ ${commits}
 
 Automatic release-PR maintenance is live. A push to \`${RELEASE_LINE}\` refreshes this same PR from the exact new release-line head while preserving its number, base, head, and draft-or-ready review state.
 
-Ready-state exact-version QA is live. Marking the current proposal ready runs QA for that exact head. When a ready proposal refreshes, release-PR maintenance explicitly dispatches QA for the new staged head because GitHub leaves token-authored synchronize runs approval-required. The first ready proof is [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684), and the first automatically refreshed-head proof is [run 29414043206](https://github.com/fablebookjs/lab-01/actions/runs/29414043206). Close-and-regenerate is live: [run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336) closed historical PR #1, created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12), and converged on that same replacement when rerun. Offline snapshot and direct-OIDC publisher preparation exists, but public baseline packages, npm trusted-publisher settings, the GitHub environment, and current-head QA remain external gates. Do not merge this release PR until all gates are satisfied.
-Ready-state exact-version QA is live. Marking the current proposal ready runs QA for that exact head. When a ready proposal refreshes, release-PR maintenance explicitly dispatches QA for the new staged head because GitHub leaves token-authored synchronize runs approval-required. The first ready proof is [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684), and the first automatically refreshed-head proof is [run 29414043206](https://github.com/fablebookjs/lab-01/actions/runs/29414043206). Close-and-regenerate is live: [run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336) closed historical PR #1, created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12), and converged on that same replacement when rerun. Offline snapshot and direct-OIDC publisher preparation exists, but public baseline packages, npm trusted-publisher settings, the GitHub environment, and current-head QA remain external gates.
+Ready-state exact-version QA is live. Marking the current proposal ready runs QA for that exact head. When a ready proposal refreshes, release-PR maintenance explicitly dispatches QA for the new staged head because GitHub leaves token-authored synchronize runs approval-required. The first ready proof is [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684), and the first automatically refreshed-head proof is [run 29414043206](https://github.com/fablebookjs/lab-01/actions/runs/29414043206). Close-and-regenerate is live: [run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336) closed historical PR #1, created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12), and converged on that same replacement when rerun. The manual operator-only exact \`1.0.0\` bootstrap and trusted-main \`V\`/direct-OIDC publisher exist only in this offline changeset: the bootstrap has not published, and the trusted publisher is not installed or live. Public baseline packages, npm trusted-publisher settings, the GitHub environment, and current-head QA remain external gates.
 
-This maintainer never publishes, reconciles the release line, tags, or creates a GitHub Release. After an exact merge, it validates sealed merge M and the concrete deterministic V snapshot without writing. H/J ownership intentionally fails closed until the finalizer provides a committed durable observer/schema. The maintainer likewise recognizes the finalizer's exact draft \`1.0.2\` proposal without refreshing it as \`1.0.1\` or dispatching \`1.0.1\` QA. That finalizer is not installed by this change; merge only when the issue #19 operator gate says it is ready.
+This maintainer never publishes, reconciles the release line, tags, or creates a GitHub Release. It validates the open \`1.0.1\` proposal, sealed merge \`M\`, the exact deterministic \`V\` snapshot, and an exact draft \`1.0.2\` proposal without crossing ownership boundaries. H/J ownership intentionally fails closed until the finalizer provides a committed durable observer/schema. No finalizer is installed by this changeset, so the issue #19 operator gate remains closed while the external gates are unmet.
 
 See [docs/release-process.md](https://github.com/${REPOSITORY}/blob/${RELEASE_LINE}/docs/release-process.md) for the current contract and safety boundary.`;
 }
@@ -291,35 +291,12 @@ function validateSnapshot(snapshot, { source, intent, merge }) {
   ) {
     fail('V is not the exact one-parent transformed snapshot over M');
   }
-  const { subject, trailers } = parseIntentMessage(commit.message);
-  const required = [
-    'Release-Snapshot-Version',
-    'Release-Line',
-    'Release-Version',
-    'Release-Merge',
-    'Release-QA-Run',
-    'Release-QA-Staged',
-    'Release-QA-Source',
-    'Core-Integrity',
-    'Core-Shasum',
-    'Addon-Integrity',
-    'Addon-Shasum',
-  ];
+  const metadata = parseSnapshotMessage(commit.message);
   if (
-    subject !== `release: snapshot v${RELEASE_VERSION}` ||
-    trailers.size !== required.length ||
-    required.some((key) => !trailers.has(key)) ||
-    trailers.get('Release-Snapshot-Version') !== '1' ||
-    trailers.get('Release-Line') !== RELEASE_LINE ||
-    trailers.get('Release-Version') !== RELEASE_VERSION ||
-    trailers.get('Release-Merge') !== merge.sha ||
-    trailers.get('Release-QA-Staged') !== intent.sha ||
-    trailers.get('Release-QA-Source') !== source.sha ||
-    !/^[1-9]\d*$/.test(trailers.get('Release-QA-Run') ?? '') ||
-    !INTEGRITY_PATTERN.test(trailers.get('Core-Integrity') ?? '') ||
-    !INTEGRITY_PATTERN.test(trailers.get('Addon-Integrity') ?? '') ||
-    !SHA_PATTERN.test(trailers.get('Core-Shasum') ?? '') ||
-    !SHA_PATTERN.test(trailers.get('Addon-Shasum') ?? '')
+    metadata.mergeSha !== merge.sha ||
+    metadata.stagedSha !== intent.sha ||
+    metadata.sourceSha !== source.sha ||
+    metadata.tree !== commit.commitTree
   ) {
     fail('release snapshot metadata is incomplete or incompatible');
   }

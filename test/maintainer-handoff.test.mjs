@@ -7,6 +7,7 @@ import {
   readCompletePullHistory,
   settleMaintainerOwnership,
 } from '../scripts/maintain-release-draft.mjs';
+import { buildSnapshotMessage } from '../scripts/release-publication.mjs';
 
 const SOURCE = '1'.repeat(40);
 const INTENT = '2'.repeat(40);
@@ -17,6 +18,8 @@ const RECONCILIATION = '6'.repeat(40);
 const NEXT_INTENT = '7'.repeat(40);
 const CORE_SHASUM = '8'.repeat(40);
 const ADDON_SHASUM = '9'.repeat(40);
+const SNAPSHOT_TREE = 'a'.repeat(40);
+const CONTENT_SHA256 = 'b'.repeat(64);
 const REPOSITORY = 'fablebookjs/lab-01';
 const RELEASE_LINE = 'releases/v1.0';
 const STAGED_LINE = 'staged/v1.0';
@@ -28,19 +31,17 @@ Release-Line: ${RELEASE_LINE}
 Release-Version: ${version}
 Release-Source: ${source}`;
 
-const snapshotMessage = `release: snapshot v1.0.1
-
-Release-Snapshot-Version: 1
-Release-Line: ${RELEASE_LINE}
-Release-Version: 1.0.1
-Release-Merge: ${MERGE}
-Release-QA-Run: 123
-Release-QA-Staged: ${INTENT}
-Release-QA-Source: ${SOURCE}
-Core-Integrity: sha512-AAAA
-Core-Shasum: ${CORE_SHASUM}
-Addon-Integrity: sha512-BBBB
-Addon-Shasum: ${ADDON_SHASUM}`;
+const snapshotMessage = buildSnapshotMessage({
+  mergeSha: MERGE,
+  stagedSha: INTENT,
+  sourceSha: SOURCE,
+  tree: SNAPSHOT_TREE,
+  contentSha256: CONTENT_SHA256,
+  packages: [
+    { name: '@fablebook/lab-01-core', integrity: 'sha512-AAAA', shasum: CORE_SHASUM },
+    { name: '@fablebook/lab-01-addon', integrity: 'sha512-BBBB', shasum: ADDON_SHASUM },
+  ],
+});
 
 const commit = ({ sha, parents = [], tree = `tree-${sha[0]}`, message = 'fixture' }) => ({
   sha,
@@ -94,7 +95,7 @@ const snapshot = () => ({
   commit: commit({
     sha: SNAPSHOT,
     parents: [MERGE],
-    tree: 'tree-version-101',
+    tree: SNAPSHOT_TREE,
     message: snapshotMessage,
   }),
 });

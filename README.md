@@ -81,8 +81,10 @@ allowed tree from `M`, and can publish or reuse only `core` first and then
 GitHub Release, or create the next proposal. Late descendants of `M` do not
 block incomplete package publication.
 
-This preparation is not permission to merge the current draft PR or publish.
-The exact `1.0.0` packages must first be published interactively, the two npm
-trusted publishers and `npm-publish` GitHub environment must be configured by a
-human, and PR #12 must be refreshed and receive current-head QA after these
-manifest changes.
+The issue #19 additions in this branch are offline-only. The manual
+operator-only exact `1.0.0` bootstrap exists but has not published. The
+trusted-main `V` preparation and direct-OIDC publisher exist locally but are
+not installed or live. No public package, finalization, or new live-workflow
+state is claimed. The external operator gate therefore remains closed until
+the baseline packages, both npm trusted publishers, the `npm-publish`
+environment, and refreshed current-head QA are all present.
