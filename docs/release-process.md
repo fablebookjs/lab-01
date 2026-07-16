@@ -67,8 +67,10 @@ Attempt 2 of the same run returned `replacement-exists`; exactly one matching
 open release PR remained.
 
 The trusted-main signal/controller replacement was installed on default `main`
-by PR #29. It has not yet produced a successful current staged lifecycle run;
-the historical run is not evidence for the new architecture.
+by PR #29. After the release-line installation and authority correction, exact
+current staged intent `06c824c25ae9aca248f70bcdb54216d8d14b562d` received
+successful trusted-main Ready QA in
+[run 29483729087](https://github.com/fablebookjs/lab-01/actions/runs/29483729087).
 
 ## Preserved post-installation no-op failure
 
@@ -94,9 +96,10 @@ and skipped controller [run 29482694854](https://github.com/fablebookjs/lab-01/a
 with release/staged/tag/PR #12/npm state unchanged.
 
 The issue #19 trusted-main surfaces described below are installed on default
-`main`; this branch carries their accepted release-line source. The manual
-operator-only exact `1.0.0` bootstrap exists but has not published. No current
-staged QA success, public package, snapshot, or finalization is claimed.
+`main`; this branch carries their accepted release-line source. Both exact
+public `1.0.0` baseline packages and current staged QA now exist. No `1.0.1`
+snapshot, publication, reconciliation, tag, GitHub Release, or next proposal
+is claimed.
 
 ## One-time public baseline bootstrap
 
@@ -163,9 +166,21 @@ rerun `--preflight` before deciding whether to resume. This bootstrap does not
 publish `1.0.1`, merge the release PR, or alter any Git ref, tag, Release,
 workflow, Pages setting, or Storybook resource.
 
-This operator-only `1.0.0` bootstrap is the sole prepared manual public-npm
-write path, and it has not been run to publish either baseline package. No
-workflow invokes it.
+The operator-only bootstrap completed on 2026-07-16. Registry metadata and
+freshly downloaded tarballs independently matched the reviewed bytes:
+
+- `@fablebook/lab-01-core@1.0.0`: SHA-512
+  `sha512-D2/F0PkQoENQagqntg1tUB0zn8lOen0jnqvyw0sbRLN3fkMJ4OR60geERuANxq0Ihx0RlCoYoP1lQhzb2KQZ+g==`
+  and SHA-1 `8ff5241867ebd1c2747c23ea016342c7cd101f6d`;
+- `@fablebook/lab-01-addon@1.0.0`: SHA-512
+  `sha512-DssrVgnRMbPG5qVqt0yr43ImplnR2YJZyCZkr0Yvp5h+wJHo5x9qL2Svpo3GyruuMZm1zdIhKJPAYYmZe7m78g==`
+  and SHA-1 `5ccab401d844a0254bd1914b5b96d798462a5017`.
+
+Both accepted writes initially stopped as unverified while the new package
+documents propagated, then converged through read-only registry observation
+and the resumable preflight. A clean external consumer resolved the add-on's
+exact core dependency and imported both packages. No workflow invokes the
+bootstrap, and it remains incapable of publishing `1.0.1`.
 
 A validated release-PR merge is the intended authorization input for a
 separately reviewed issue #19 finalizer. This maintainer does not publish or
@@ -294,8 +309,8 @@ pull-request-head code, and no workflow may mutate a Storybook resource.
 The workflow and controller files in this section are installed on default
 `main`. The `npm-publish` environment exists with no secrets or reviewers and
 an exact `main` deployment branch policy. The package-specific npm trusted
-publishers remain absent until the baseline package pages exist, and no public
-npm write has occurred.
+publishers are the remaining external npm configuration gate. The public
+`1.0.0` baselines exist; no public `1.0.1` write has occurred.
 
 Both publishable package manifests carry the same exact Git repository URL,
 their monorepo directory, and the minimal `src` files allowlist. They contain no

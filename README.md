@@ -108,9 +108,10 @@ next-proposal actions.
 
 The issue #19 controllers are installed on default `main`, and this branch is
 their accepted release-line source candidate. The manual operator-only exact
-`1.0.0` bootstrap exists but has not published. The `npm-publish` environment
-exists with no secrets or reviewers and permits only `main`; both npm trusted
-publishers remain impossible to configure until the package pages exist. No
-public package, finalization, or current-head QA success is claimed. The
-external operator gate remains closed until the baseline packages, both npm
-trusted publishers, and refreshed current-head QA are all present.
+`1.0.0` bootstrap completed on 2026-07-16; both public package tarballs match
+the immutable tagged baseline, and an external consumer installed them
+together successfully. The `npm-publish` environment exists with no secrets or
+reviewers and permits only `main`. Current staged QA is successful; configuring
+the exact trusted publisher on both npm package pages is the remaining external
+npm gate. No `1.0.1` snapshot, publication, reconciliation, tag, GitHub
+Release, or next proposal is claimed.
