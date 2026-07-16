@@ -1,0 +1,67 @@
+name: Publish npm package
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Fixed package to publish or verify from V
+        required: true
+        type: choice
+        options:
+          - core
+          - addon
+
+permissions: {}
+
+concurrency:
+  group: publish-npm-v1.0.1
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'fablebookjs/lab-01' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out exact trusted default-main publisher
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: false
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Install pinned Node without package-manager cache
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Bootstrap closed npm outside the project
+        run: >-
+          node scripts/bootstrap-npm-cli.mjs
+          --repository-root "$GITHUB_WORKSPACE"
+          --path-file "$GITHUB_PATH"
+
+      - name: Validate inert V data and publish or reuse only the selected package
+        env:
+          EXPECTED_DISPATCH_SHA: ${{ github.sha }}
+          EXPECTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          PACKAGE_CHOICE: ${{ inputs.package }}
+        run: >-
+          node scripts/publish-npm.mjs
+          --repository fablebookjs/lab-01
+          --package "$PACKAGE_CHOICE"
+          --evidence "$RUNNER_TEMP/publish-npm.json"
+
+      - name: Retain sanitized publication evidence on every outcome
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: publish-npm-${{ inputs.package }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/publish-npm.json
+          if-no-files-found: warn
+          retention-days: 30

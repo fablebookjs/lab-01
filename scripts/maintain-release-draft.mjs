@@ -1,25 +1,140 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
+import { observeMaintainerPostMerge, reconciliationMessage } from './finalize-release.mjs';
+import {
+  closedGitEnvironment,
+  assertSafeGitConfiguration,
+  deriveTrustedSnapshotAuthority,
+  git as closedGit,
+  parseSnapshotMessage,
+} from './release-publication.mjs';
+
 const REPOSITORY = 'fablebookjs/lab-01';
+const REPOSITORY_ID = 1301358254;
 const RELEASE_LINE = 'releases/v1.0';
 const STAGED_LINE = 'staged/v1.0';
 const BASELINE_TAG = 'v1.0.0';
 const RELEASE_VERSION = '1.0.1';
+const NEXT_RELEASE_VERSION = '1.0.2';
 const INTENT_VERSION = '1';
-const READY_QA_WORKFLOW = 'ready-release-qa.yml';
+const DEFAULT_BRANCH = 'main';
+const READY_QA_WORKFLOW = 'ready-release-qa-controller.yml';
+const MAINTENANCE_SIGNAL = 'Release maintenance signal';
+const REGENERATION_SIGNAL = 'Release regeneration signal';
+const SNAPSHOT_REF = 'release-snapshots/v1.0.1';
+const HISTORY_PAGE_SIZE = 100;
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
 
 const git = (...args) =>
-  execFileSync('git', args, {
+  execFileSync('git', args[0] === '--no-replace-objects' ? args : ['--no-replace-objects', ...args], {
     encoding: 'utf8',
+    env: closedGitEnvironment(),
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 
 const fail = (message) => {
   throw new Error(message);
 };
+
+function validActor(actor) {
+  return Number.isInteger(actor?.id) && actor.id > 0 && /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(actor.login ?? '');
+}
+
+function validRepository(repository) {
+  return repository?.full_name === REPOSITORY && repository.id === REPOSITORY_ID;
+}
+
+function validHeadBranch(branch) {
+  if (typeof branch !== 'string' || branch.length === 0 || branch.length > 1024) return false;
+  if (
+    branch === '@' ||
+    branch.startsWith('-') ||
+    branch.startsWith('/') ||
+    branch.endsWith('/') ||
+    branch.endsWith('.') ||
+    branch.includes('//') ||
+    branch.includes('..') ||
+    branch.includes('@{') ||
+    [...branch].some((character) => {
+      const code = character.codePointAt(0);
+      return code <= 32 || code === 127 || '~^:?*[\\'.includes(character);
+    })
+  ) {
+    return false;
+  }
+  return branch
+    .split('/')
+    .every((component) => !component.startsWith('.') && !component.endsWith('.lock'));
+}
+
+export function validateMaintainerWakeup({ eventName, event }) {
+  if (!validRepository(event?.repository)) {
+    fail('maintainer wake-up repository identity is invalid');
+  }
+  if (!validActor(event.sender)) fail('maintainer wake-up sender identity is invalid');
+  if (eventName === 'workflow_dispatch') {
+    if (event.inputs && Object.keys(event.inputs).length !== 0) fail('manual maintainer wake-up cannot supply state');
+    return { event: eventName, actor: event.sender.login };
+  }
+  if (eventName !== 'workflow_run' || event.action !== 'completed') {
+    fail('maintainer event is not an allowed wake-up');
+  }
+  const run = event.workflow_run;
+  if (
+    !Number.isInteger(run?.id) || run.id < 1 ||
+    run.status !== 'completed' ||
+    run.conclusion !== 'success' ||
+    !validRepository(run.repository) ||
+    !validRepository(run.head_repository) ||
+    !validActor(run.actor) ||
+    !validActor(run.triggering_actor)
+  ) {
+    fail('release maintenance signal wake-up identity is invalid');
+  }
+
+  if (run.name === MAINTENANCE_SIGNAL) {
+    if (run.event !== 'push' || run.head_branch !== RELEASE_LINE) {
+      fail('release maintenance signal wake-up identity is invalid');
+    }
+  } else if (run.name === REGENERATION_SIGNAL) {
+    if (run.event !== 'pull_request_target' || !validHeadBranch(run.head_branch)) {
+      fail('release maintenance signal wake-up identity is invalid');
+    }
+    if (run.head_branch !== STAGED_LINE) {
+      return {
+        event: eventName,
+        actor: run.triggering_actor.login,
+        runId: run.id,
+        action: 'ignored-unrelated-signal',
+      };
+    }
+  } else {
+    fail('release maintenance signal wake-up identity is invalid');
+  }
+
+  return { event: eventName, actor: run.triggering_actor.login, runId: run.id };
+}
+
+export function assertTrustedMaintainerMain({
+  environment = process.env,
+  localSha = git('rev-parse', 'HEAD'),
+  remoteMainSha = refSha(DEFAULT_BRANCH),
+} = {}) {
+  if (
+    environment.GITHUB_REPOSITORY !== REPOSITORY ||
+    environment.GITHUB_REF !== `refs/heads/${DEFAULT_BRANCH}` ||
+    !SHA_PATTERN.test(localSha) ||
+    localSha !== remoteMainSha ||
+    environment.EXPECTED_DISPATCH_SHA !== remoteMainSha ||
+    environment.EXPECTED_WORKFLOW_SHA !== remoteMainSha
+  ) {
+    fail('trusted maintainer main identity drifted');
+  }
+  return remoteMainSha;
+}
 
 export function parseIntentMessage(message) {
   const lines = message.trimEnd().split('\n');
@@ -88,9 +203,11 @@ ${commits}
 
 ## Current lifecycle state
 
-Automatic release-PR maintenance is live. A push to \`${RELEASE_LINE}\` refreshes this same PR from the exact new release-line head while preserving its number, base, head, and draft-or-ready review state.
+Historical automation demonstrated release-proposal refresh, Ready QA, and close-and-regenerate. Default-main trusted controllers are now installed; release and PR workflows remain fixed read-only/no-checkout signals, and controllers re-observe every durable ref and PR fact before acting. The trusted-main maintainer dispatches \`ready-release-qa-controller.yml\` only at \`main\`, while npm trusted publishing uses the exact stable workflow filename \`publish-npm.yml\`.
 
-Ready-state exact-version QA is live. Marking the current proposal ready runs QA for that exact head. When a ready proposal refreshes, release-PR maintenance explicitly dispatches QA for the new staged head because GitHub leaves token-authored synchronize runs approval-required. The first ready proof is [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684), and the first automatically refreshed-head proof is [run 29414043206](https://github.com/fablebookjs/lab-01/actions/runs/29414043206). Close-and-regenerate is live: [run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336) closed historical PR #1, created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12), and converged on that same replacement when rerun. Publication, branch reconciliation, a \`v1.0.1\` tag, and a GitHub Release are not implemented. Do not merge this release PR.
+The manual operator-only exact \`1.0.0\` bootstrap exists but has not published. The trusted-main maintainer, Ready-QA controller, \`V\` preparation, direct-OIDC publisher, finalizer, and H/J handoff are installed but have not completed a real release. The \`npm-publish\` environment exists with no secrets or reviewers and permits only \`main\`. No current-head QA success, public package, snapshot, or finalization is claimed; baseline packages, both npm trusted-publisher settings, and a real post-installation QA run remain external gates.
+
+This maintainer never publishes, reconciles the release line, tags, or creates a GitHub Release. It validates the open \`1.0.1\` proposal, sealed merge \`M\`, exact deterministic \`V\`, concrete \`H\`, deterministic \`J\`, and an exact draft \`1.0.2\` proposal from trusted-main code. Caller-supplied H/J facts are rejected; two complete ownership snapshots rederive and reclassify the durable graph. The issue #19 operator gate remains closed.
 
 See [docs/release-process.md](https://github.com/${REPOSITORY}/blob/${RELEASE_LINE}/docs/release-process.md) for the current contract and safety boundary.`;
 }
@@ -104,9 +221,19 @@ function refSha(ref) {
   return sha;
 }
 
+function optionalRefSha(ref) {
+  try {
+    return refSha(ref);
+  } catch (error) {
+    if (error.status === 2 || /exit code 2|status 2|exit status 2/.test(error.message)) return null;
+    throw error;
+  }
+}
+
 function commitShape(sha) {
   const row = git('rev-list', '--parents', '-n', '1', sha).split(' ');
   return {
+    sha,
     message: git('show', '-s', '--format=%B', sha),
     parents: row.slice(1),
     commitTree: git('rev-parse', `${sha}^{tree}`),
@@ -156,13 +283,30 @@ function createIntent(source) {
   return execFileSync('git', ['commit-tree', `${source}^{tree}`, '-p', source], {
     encoding: 'utf8',
     input: message,
-    env: {
-      ...process.env,
+    env: closedGitEnvironment({
       GIT_AUTHOR_NAME: 'github-actions[bot]',
       GIT_AUTHOR_EMAIL: '41898282+github-actions[bot]@users.noreply.github.com',
       GIT_COMMITTER_NAME: 'github-actions[bot]',
       GIT_COMMITTER_EMAIL: '41898282+github-actions[bot]@users.noreply.github.com',
-    },
+    }),
+  }).trim();
+}
+
+function pushStagedIntent({ previousIntent, intent }) {
+  const authorization = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${process.env.GITHUB_TOKEN}`).toString('base64')}`;
+  return execFileSync('git', [
+    '--no-replace-objects', 'push', '--no-follow-tags',
+    `--force-with-lease=refs/heads/${STAGED_LINE}:${previousIntent}`,
+    'origin', `${intent}:refs/heads/${STAGED_LINE}`,
+  ], {
+    encoding: 'utf8',
+    env: closedGitEnvironment({
+      GIT_CONFIG_COUNT: '3',
+      GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '',
+      GIT_CONFIG_KEY_1: 'push.followTags', GIT_CONFIG_VALUE_1: 'false',
+      GIT_CONFIG_KEY_2: 'http.https://github.com/.extraheader', GIT_CONFIG_VALUE_2: authorization,
+    }),
+    stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 }
 
@@ -194,7 +338,323 @@ export function assertMatchingReleasePull(pull) {
   }
 }
 
-export async function dispatchReadyQaIfNeeded({ pull, intent, request }) {
+function isMergedPull(pull) {
+  return pull.merged === true || (pull.state === 'closed' && typeof pull.merged_at === 'string');
+}
+
+function isLifecycleCandidate(pull) {
+  return pull?.head?.ref === STAGED_LINE;
+}
+
+function assertLifecycleIdentity(pull) {
+  if (
+    !Number.isInteger(pull?.number) ||
+    pull.number < 1 ||
+    pull.base?.ref !== RELEASE_LINE ||
+    pull.base?.repo?.full_name !== REPOSITORY ||
+    pull.head?.ref !== STAGED_LINE ||
+    pull.head?.repo?.full_name !== REPOSITORY
+  ) {
+    fail('release lifecycle PR has an unexpected repository or branch identity');
+  }
+}
+
+function intentVersion(shape) {
+  const { trailers } = parseIntentMessage(shape.message);
+  return trailers.get('Release-Version');
+}
+
+function requireCommit(observation, sha, label) {
+  const shape = observation.commits?.[sha];
+  if (!shape || shape.sha !== sha) fail(`${label} commit evidence is missing or stale`);
+  return shape;
+}
+
+function validateMergedLifecycle(observation, pull) {
+  if (pull.state !== 'closed' || !isMergedPull(pull)) {
+    fail('latest release lifecycle PR is closed without a merge commit');
+  }
+  for (const [value, label] of [
+    [pull.base?.sha, 'merged release source'],
+    [pull.head?.sha, 'merged staged intent'],
+    [pull.merge_commit_sha, 'merged release commit'],
+  ]) {
+    if (!SHA_PATTERN.test(value ?? '')) fail(`${label} is not a full SHA`);
+  }
+  if (observation.stagedSha !== pull.head.sha) {
+    fail('staged ref no longer identifies the merged lifecycle intent');
+  }
+
+  const source = requireCommit(observation, pull.base.sha, 'release source');
+  const intent = requireCommit(observation, pull.head.sha, 'release intent');
+  validateIntent(intent, { source: source.sha, version: RELEASE_VERSION });
+  const merge = requireCommit(observation, pull.merge_commit_sha, 'sealed merge');
+  if (
+    merge.parents.length !== 2 ||
+    merge.parents[0] !== source.sha ||
+    merge.parents[1] !== intent.sha ||
+    merge.commitTree !== source.commitTree ||
+    intent.commitTree !== source.commitTree
+  ) {
+    fail('sealed merge is not the ordered [source, intent] merge with the sealed source tree');
+  }
+  return { source, intent, merge };
+}
+
+function validateSnapshot(snapshot, { source, intent, merge }) {
+  if (snapshot === null) return null;
+  if (
+    snapshot.ref !== `refs/heads/${SNAPSHOT_REF}` ||
+    !SHA_PATTERN.test(snapshot.sha ?? '') ||
+    snapshot.sha !== snapshot.commit?.sha
+  ) {
+    fail('release snapshot ref does not identify exact V');
+  }
+  const commit = snapshot.commit;
+  if (
+    commit.parents.length !== 1 ||
+    commit.parents[0] !== merge.sha ||
+    commit.commitTree === merge.commitTree
+  ) {
+    fail('V is not the exact one-parent transformed snapshot over M');
+  }
+  const metadata = parseSnapshotMessage(commit.message);
+  if (
+    metadata.mergeSha !== merge.sha ||
+    metadata.stagedSha !== intent.sha ||
+    metadata.sourceSha !== source.sha ||
+    metadata.tree !== commit.commitTree
+  ) {
+    fail('release snapshot metadata is incomplete or incompatible');
+  }
+  return commit;
+}
+
+// Only the imported finalizer observer may supply this private H/J marker.
+// The public classifier never accepts caller-authored observer facts.
+function assertExactKeys(value, expected, label) {
+  const actual = Object.keys(value ?? {}).sort();
+  const wanted = [...expected].sort();
+  if (JSON.stringify(actual) !== JSON.stringify(wanted)) fail(`${label} has unexpected fields`);
+}
+
+function classifyPostMergeOwnershipFromDurableGit(marker, { releaseHeadSha, merge, snapshot }, observation) {
+  if (marker === null) fail('post-M H/J ownership requires the concrete durable finalizer observer');
+  if (snapshot === null) fail('post-M H/J ownership requires exact deterministic V');
+  const common = {
+    observer: 'issue-19-finalizer',
+    schemaVersion: 1,
+    line: RELEASE_LINE,
+    version: RELEASE_VERSION,
+    mergeSha: merge.sha,
+    headSha: releaseHeadSha,
+    snapshotSha: snapshot.sha,
+  };
+  for (const [key, value] of Object.entries(common)) {
+    if (marker?.[key] !== value) fail(`post-M finalizer observation has an invalid ${key}`);
+  }
+
+  const head = requireCommit(observation, releaseHeadSha, 'post-M release head');
+  if (marker.kind === 'late-head') {
+    assertExactKeys(marker, [...Object.keys(common), 'kind', 'verifiedMergeSha'], 'post-M H observation');
+    if (
+      marker.verifiedMergeSha !== merge.sha ||
+      head.parents.length !== 1 ||
+      head.parents[0] !== merge.sha ||
+      head.sha === snapshot.sha
+    ) {
+      fail('post-M H observation is not one exact late head over M');
+    }
+    return { owner: 'finalizer-owns-release', state: 'late-head', mergeSha: merge.sha, headSha: head.sha };
+  }
+
+  if (marker.kind === 'normal-reconciliation') {
+    assertExactKeys(
+      marker,
+      [...Object.keys(common), 'kind', 'lateHeadSha', 'expectedTreeSha', 'metadata'],
+      'post-M J observation',
+    );
+    const late = requireCommit(observation, marker.lateHeadSha, 'post-M late head');
+    assertExactKeys(
+      marker.metadata,
+      ['schemaVersion', 'line', 'version', 'mergeSha', 'snapshotSha', 'lateHeadSha'],
+      'post-M J metadata',
+    );
+    if (
+      late.parents.length !== 1 ||
+      late.parents[0] !== merge.sha ||
+      head.parents.length !== 2 ||
+      head.parents[0] !== late.sha ||
+      head.parents[1] !== snapshot.sha ||
+      marker.expectedTreeSha !== head.commitTree ||
+      marker.metadata.schemaVersion !== 1 ||
+      marker.metadata.line !== RELEASE_LINE ||
+      marker.metadata.version !== RELEASE_VERSION ||
+      marker.metadata.mergeSha !== merge.sha ||
+      marker.metadata.snapshotSha !== snapshot.sha ||
+      marker.metadata.lateHeadSha !== late.sha ||
+      head.message.trimEnd() !== reconciliationMessage({
+        mergeSha: merge.sha,
+        lateSha: late.sha,
+        snapshotSha: snapshot.sha,
+      }).trimEnd()
+    ) {
+      fail('post-M J observation is not the exact deterministic normal reconciliation');
+    }
+    return {
+      owner: 'finalizer-owns-release',
+      state: 'normal-reconciliation',
+      mergeSha: merge.sha,
+      headSha: head.sha,
+      lateHeadSha: late.sha,
+    };
+  }
+
+  fail('post-M finalizer observation accepts only exact H or normal J');
+}
+
+function classifyMaintainerOwnershipInternal(
+  observation,
+  { trustedPostMerge = null, allowPostMergePending = false } = {},
+) {
+  if (!SHA_PATTERN.test(observation?.releaseHeadSha ?? '') || !SHA_PATTERN.test(observation?.stagedSha ?? '')) {
+    fail('maintainer observation has an invalid current ref SHA');
+  }
+  if (!Array.isArray(observation.pulls)) fail('maintainer observation has no PR history');
+
+  const candidates = observation.pulls.filter(isLifecycleCandidate);
+  candidates.forEach(assertLifecycleIdentity);
+  const seen = new Set();
+  for (const pull of candidates) {
+    if (seen.has(pull.number)) fail(`release lifecycle PR #${pull.number} is duplicated in history`);
+    seen.add(pull.number);
+  }
+
+  const open = candidates.filter((pull) => pull.state === 'open');
+  if (open.length > 1) fail(`expected at most one open release lifecycle PR, found ${open.length}`);
+  if (open.length === 1) {
+    const pull = open[0];
+    if (typeof pull.draft !== 'boolean') fail('open release lifecycle PR has no draft/ready state');
+    if (pull.head.sha !== observation.stagedSha) fail('open release PR head does not equal staged ref');
+    const intent = requireCommit(observation, observation.stagedSha, 'open release intent');
+    const version = intentVersion(intent);
+    if (version === RELEASE_VERSION) {
+      return { owner: 'maintainer', state: pull.draft ? 'draft' : 'ready', pullNumber: pull.number };
+    }
+    if (version !== NEXT_RELEASE_VERSION) fail(`open release proposal has unexpected version ${version ?? '<missing>'}`);
+    if (observation.historyComplete !== true) fail('next-proposal ownership requires complete all-state PR history');
+    if (pull.number !== Math.max(...candidates.map((candidate) => candidate.number))) {
+      fail('open next proposal is not the unique latest lifecycle PR');
+    }
+    if (pull.draft !== true) fail('the next 1.0.2 proposal must be draft');
+    if (pull.base?.sha !== observation.releaseHeadSha) {
+      fail('next 1.0.2 proposal base SHA does not equal the current release line');
+    }
+    validateIntent(intent, { source: observation.releaseHeadSha, version: NEXT_RELEASE_VERSION });
+    return {
+      owner: 'next-proposal-owned',
+      state: 'draft',
+      pullNumber: pull.number,
+      sourceSha: observation.releaseHeadSha,
+      intentSha: observation.stagedSha,
+      version: NEXT_RELEASE_VERSION,
+    };
+  }
+
+  if (observation.historyComplete !== true) fail('all-state release PR history is incomplete or ambiguous');
+  if (candidates.length === 0) fail('release lifecycle PR history is missing');
+  const latestNumber = Math.max(...candidates.map((pull) => pull.number));
+  const latest = candidates.find((pull) => pull.number === latestNumber);
+  const context = validateMergedLifecycle(observation, latest);
+  context.snapshot = validateSnapshot(observation.snapshot ?? null, context);
+
+  if (observation.releaseHeadSha === context.merge.sha) {
+    return { owner: 'finalizer-owns-release', state: 'sealed-merge', mergeSha: context.merge.sha };
+  }
+  if (context.snapshot !== null && observation.releaseHeadSha === context.snapshot.sha) {
+    return { owner: 'finalizer-owns-release', state: 'version-snapshot', mergeSha: context.merge.sha };
+  }
+  if (allowPostMergePending && trustedPostMerge === null) {
+    return { owner: 'post-merge-observer-required', state: 'pending', context };
+  }
+  return classifyPostMergeOwnershipFromDurableGit(trustedPostMerge, {
+    releaseHeadSha: observation.releaseHeadSha,
+    merge: context.merge,
+    snapshot: context.snapshot,
+  }, observation);
+}
+
+export function classifyMaintainerOwnership(observation) {
+  return classifyMaintainerOwnershipInternal(observation);
+}
+
+export async function settleMaintainerOwnership({ observation, effects }) {
+  const decision = classifyMaintainerOwnership(observation);
+  if (decision.owner !== 'maintainer') return decision;
+  if (typeof effects?.maintain !== 'function') fail('normal maintenance requires an explicit effect adapter');
+  return effects.maintain(decision);
+}
+
+function canonicalPullAuthority(pull) {
+  return {
+    number: pull?.number ?? null,
+    state: pull?.state ?? null,
+    draft: pull?.draft ?? null,
+    merged: pull?.merged ?? null,
+    mergedAt: pull?.merged_at ?? null,
+    mergeCommitSha: pull?.merge_commit_sha ?? null,
+    base: {
+      ref: pull?.base?.ref ?? null,
+      sha: pull?.base?.sha ?? null,
+      repository: pull?.base?.repo?.full_name ?? null,
+    },
+    head: {
+      ref: pull?.head?.ref ?? null,
+      sha: pull?.head?.sha ?? null,
+      repository: pull?.head?.repo?.full_name ?? null,
+    },
+  };
+}
+
+function canonicalLifecycleHistory(pulls) {
+  return pulls.filter(isLifecycleCandidate).map(canonicalPullAuthority);
+}
+
+async function readPullHistorySweep({ request, maxPages, state }) {
+  const pulls = [];
+  const seen = new Set();
+  for (let page = 1; page <= maxPages; page += 1) {
+    const path = `/repos/${REPOSITORY}/pulls?state=${state}&per_page=${HISTORY_PAGE_SIZE}&page=${page}`;
+    const batch = await request(path);
+    if (!Array.isArray(batch) || batch.length > HISTORY_PAGE_SIZE) fail('GitHub returned an invalid PR history page');
+    for (const pull of batch) {
+      if (!Number.isInteger(pull?.number) || seen.has(pull.number)) {
+        fail('GitHub returned duplicate or malformed paginated PR history');
+      }
+      seen.add(pull.number);
+      pulls.push(pull);
+    }
+    if (batch.length < HISTORY_PAGE_SIZE) return pulls;
+  }
+  fail('all-state PR history exceeded the explicit pagination bound');
+}
+
+export async function readCompletePullHistory({ request, maxPages = 20, state = 'all' } = {}) {
+  if (typeof request !== 'function') fail('PR history requires a request function');
+  if (!Number.isInteger(maxPages) || maxPages < 1) fail('PR history maxPages must be positive');
+  if (!['all', 'open'].includes(state)) fail('PR history state filter is invalid');
+  const first = await readPullHistorySweep({ request, maxPages, state });
+  const second = await readPullHistorySweep({ request, maxPages, state });
+  if (
+    JSON.stringify(canonicalLifecycleHistory(first)) !==
+    JSON.stringify(canonicalLifecycleHistory(second))
+  ) {
+    fail('PR history changed across complete bounded snapshots');
+  }
+  return second;
+}
+
+export async function dispatchReadyQaIfNeeded({ pull, intent, request, rebind = async () => {} }) {
   assertMatchingReleasePull(pull);
   if (!SHA_PATTERN.test(intent ?? '')) fail('ready QA dispatch has an invalid intent SHA');
   if (pull.draft) return { action: 'not-dispatched-draft' };
@@ -203,22 +663,23 @@ export async function dispatchReadyQaIfNeeded({ pull, intent, request }) {
   }
   if (typeof request !== 'function') fail('ready QA dispatch requires a request function');
 
+  await rebind();
   await request(`/repos/${REPOSITORY}/actions/workflows/${READY_QA_WORKFLOW}/dispatches`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ref: STAGED_LINE }),
+    body: JSON.stringify({ ref: DEFAULT_BRANCH }),
   });
   return { action: 'dispatched-ready-qa', intent };
 }
 
 async function findReleasePull() {
-  const pulls = await github(
-    `/repos/${REPOSITORY}/pulls?state=open&base=${encodeURIComponent(RELEASE_LINE)}&per_page=100`,
-  );
+  const pulls = await readCompletePullHistory({ request: github, state: 'open' });
+  pulls.filter(isLifecycleCandidate).forEach(assertLifecycleIdentity);
   const matching = pulls.filter(
     (pull) => pull.head?.ref === STAGED_LINE && pull.head?.repo?.full_name === REPOSITORY,
   );
-  if (matching.length !== 1) fail(`expected one matching open release PR, found ${matching.length}`);
+  if (matching.length > 1) fail(`expected at most one matching open release PR, found ${matching.length}`);
+  if (matching.length === 0) return null;
   assertMatchingReleasePull(matching[0]);
   return matching[0];
 }
@@ -242,12 +703,45 @@ function includedCommits(baseline, source) {
   });
 }
 
-export async function main({ dryRun = process.argv.includes('--dry-run') } = {}) {
-  if (process.env.GITHUB_REPOSITORY !== REPOSITORY) {
-    fail(`refusing to write outside ${REPOSITORY}`);
-  }
-  if (!process.env.GITHUB_TOKEN) fail('GITHUB_TOKEN is required');
+function replacePull(pulls, detail) {
+  return pulls.map((pull) => (pull.number === detail.number ? detail : pull));
+}
 
+function assertHydratedPullMatches(listed, detail) {
+  const listedAuthority = canonicalPullAuthority(listed);
+  const detailAuthority = canonicalPullAuthority(detail);
+  delete listedAuthority.merged;
+  delete detailAuthority.merged;
+  if (JSON.stringify(listedAuthority) !== JSON.stringify(detailAuthority)) {
+    fail(`release lifecycle PR #${listed.number} changed while hydrating authority`);
+  }
+}
+
+function commitEvidence(shas) {
+  const commits = {};
+  for (const sha of shas) {
+    if (SHA_PATTERN.test(sha ?? '') && !(sha in commits)) commits[sha] = commitShape(sha);
+  }
+  return commits;
+}
+
+function readSnapshotObservation() {
+  const sha = optionalRefSha(SNAPSHOT_REF);
+  if (sha === null) return null;
+  git(
+    'fetch',
+    '--force',
+    '--no-tags',
+    'origin',
+    `+refs/heads/${SNAPSHOT_REF}:refs/remotes/origin/${SNAPSHOT_REF}`,
+  );
+  if (git('rev-parse', `refs/remotes/origin/${SNAPSHOT_REF}`) !== sha) {
+    fail('release snapshot ref changed while reading finalizer state');
+  }
+  return { ref: `refs/heads/${SNAPSHOT_REF}`, sha, commit: commitShape(sha) };
+}
+
+function refreshObservedRefs() {
   git(
     'fetch',
     '--force',
@@ -257,15 +751,294 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
     `+refs/heads/${STAGED_LINE}:refs/remotes/origin/${STAGED_LINE}`,
     `refs/tags/${BASELINE_TAG}:refs/tags/${BASELINE_TAG}`,
   );
-
-  const releaseSource = git('rev-parse', `refs/remotes/origin/${RELEASE_LINE}`);
-  const previousIntent = git('rev-parse', `refs/remotes/origin/${STAGED_LINE}`);
-  if (refSha(RELEASE_LINE) !== releaseSource || refSha(STAGED_LINE) !== previousIntent) {
+  const releaseHeadSha = git('rev-parse', `refs/remotes/origin/${RELEASE_LINE}`);
+  const stagedSha = git('rev-parse', `refs/remotes/origin/${STAGED_LINE}`);
+  if (refSha(RELEASE_LINE) !== releaseHeadSha || refSha(STAGED_LINE) !== stagedSha) {
     fail('remote refs changed while reading state; a later wake-up must reconcile them');
   }
+  return { releaseHeadSha, stagedSha };
+}
+
+function finalizerCommitShape(sha) {
+  if (!SHA_PATTERN.test(sha ?? '')) fail('finalizer Git adapter requires a full commit SHA');
+  const row = closedGit(process.cwd(), 'rev-list', '--parents', '-n', '1', sha).split(' ');
+  return {
+    sha,
+    parents: row.slice(1),
+    tree: closedGit(process.cwd(), 'rev-parse', `${sha}^{tree}`),
+    message: `${closedGit(process.cwd(), 'show', '-s', '--format=%B', sha).trimEnd()}\n`,
+  };
+}
+
+function maintainerCommitShape(commit) {
+  return {
+    sha: commit.sha,
+    parents: [...commit.parents],
+    commitTree: commit.tree,
+    parentTree: '',
+    message: commit.message.trimEnd(),
+  };
+}
+
+function runClosedGitStatus(args) {
+  return spawnSync('git', ['--no-replace-objects', ...args], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    env: closedGitEnvironment(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+export function createMaintainerFinalizerGitAdapter() {
+  return {
+    async listRefs() {
+      const { releaseHeadSha, stagedSha } = refreshObservedRefs();
+      const snapshot = readSnapshotObservation();
+      if (snapshot === null) fail('maintainer finalizer observer requires the exact V locator');
+      return {
+        [`refs/heads/${RELEASE_LINE}`]: { sha: releaseHeadSha, type: 'commit' },
+        [`refs/heads/${STAGED_LINE}`]: { sha: stagedSha, type: 'commit' },
+        [`refs/heads/${SNAPSHOT_REF}`]: { sha: snapshot.sha, type: 'commit' },
+      };
+    },
+
+    async acceptedSnapshot(snapshotSha) {
+      const { source, intent, merge, snapshot, tree, contentSha256, packages } =
+        await deriveTrustedSnapshotAuthority(process.cwd(), snapshotSha);
+      return {
+        schemaVersion: 2,
+        locator: `refs/heads/${SNAPSHOT_REF}`,
+        sourceSha: source.sha,
+        stagedSha: intent.sha,
+        mergeSha: merge.sha,
+        source,
+        intent,
+        merge,
+        snapshot,
+        treeSha: tree,
+        contentSha256,
+        packages,
+        qa: {
+          kind: 'accepted-snapshot-content',
+          treeSha: tree,
+          contentSha256,
+          label: `accepted-snapshot-content:${tree}:${contentSha256}`,
+        },
+      };
+    },
+
+    async commit(sha) {
+      return finalizerCommitShape(sha);
+    },
+
+    async isAncestor(ancestor, descendant) {
+      const result = runClosedGitStatus(['merge-base', '--is-ancestor', ancestor, descendant]);
+      if (result.status === 0) return true;
+      if (result.status === 1) return false;
+      fail('maintainer finalizer observer could not determine commit ancestry');
+    },
+
+    async mergeTree(first, second) {
+      const result = runClosedGitStatus(['merge-tree', '--write-tree', first, second]);
+      if (result.status === 1) return { clean: false, tree: null };
+      if (result.status !== 0) fail('maintainer finalizer observer could not derive the merge tree');
+      const tree = result.stdout.trim().split('\n')[0];
+      if (!SHA_PATTERN.test(tree ?? '')) fail('maintainer finalizer observer produced an invalid merge tree');
+      return { clean: true, tree };
+    },
+  };
+}
+
+function exactObserverRef(refs, name) {
+  const value = refs?.[name];
+  if (!value || value.type !== 'commit' || !SHA_PATTERN.test(value.sha ?? '')) {
+    fail(`maintainer finalizer observer did not return exact ${name}`);
+  }
+  return value.sha;
+}
+
+function assertSameCommitShape(first, second, label) {
+  if (
+    first.sha !== second.sha ||
+    JSON.stringify(first.parents) !== JSON.stringify(second.parents) ||
+    first.commitTree !== second.commitTree ||
+    first.message.trimEnd() !== second.message.trimEnd()
+  ) {
+    fail(`${label} changed across observer reclassification`);
+  }
+}
+
+export async function classifyMaintainerOwnershipWithDurableObserver({ observation, gitAdapter }) {
+  const initial = classifyMaintainerOwnershipInternal(observation, { allowPostMergePending: true });
+  if (initial.owner !== 'post-merge-observer-required') return { observation, decision: initial };
+  if (initial.context.snapshot === null) fail('post-M H/J ownership requires exact deterministic V');
+
+  const marker = await observeMaintainerPostMerge({
+    gitAdapter,
+    releaseHeadSha: observation.releaseHeadSha,
+    mergeSha: initial.context.merge.sha,
+    snapshotSha: initial.context.snapshot.sha,
+  });
+  const refsAfterObserver = await gitAdapter.listRefs();
+  if (
+    exactObserverRef(refsAfterObserver, `refs/heads/${RELEASE_LINE}`) !== observation.releaseHeadSha ||
+    exactObserverRef(refsAfterObserver, `refs/heads/${STAGED_LINE}`) !== observation.stagedSha ||
+    exactObserverRef(refsAfterObserver, `refs/heads/${SNAPSHOT_REF}`) !== initial.context.snapshot.sha
+  ) {
+    fail('release refs changed between the finalizer observer and maintainer reclassification');
+  }
+
+  const commits = { ...observation.commits };
+  const rereadHead = maintainerCommitShape(await gitAdapter.commit(observation.releaseHeadSha));
+  assertSameCommitShape(
+    requireCommit(observation, observation.releaseHeadSha, 'post-M release head'),
+    rereadHead,
+    'post-M release head',
+  );
+  commits[rereadHead.sha] = rereadHead;
+  if (marker.kind === 'normal-reconciliation') {
+    const late = maintainerCommitShape(await gitAdapter.commit(marker.lateHeadSha));
+    commits[late.sha] = late;
+  }
+  const enriched = { ...observation, commits, postMerge: marker };
+  const decision = classifyMaintainerOwnershipInternal(enriched, { trustedPostMerge: marker });
+  return { observation: enriched, decision };
+}
+
+function ownershipSnapshotFingerprint(snapshot) {
+  const commits = Object.fromEntries(
+    Object.entries(snapshot.observation.commits)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([sha, shape]) => [sha, shape]),
+  );
+  return JSON.stringify({
+    decision: snapshot.decision,
+    releaseHeadSha: snapshot.observation.releaseHeadSha,
+    stagedSha: snapshot.observation.stagedSha,
+    pulls: canonicalLifecycleHistory(snapshot.observation.pulls),
+    commits,
+    snapshot: snapshot.observation.snapshot,
+    postMerge: snapshot.observation.postMerge ?? null,
+  });
+}
+
+export function assertStableOwnershipSnapshots(first, second) {
+  if (ownershipSnapshotFingerprint(first) !== ownershipSnapshotFingerprint(second)) {
+    fail('release ownership changed across complete all-state classifications');
+  }
+}
+
+async function readOwnershipSnapshot() {
+  const { releaseHeadSha, stagedSha } = refreshObservedRefs();
+  let pulls = await readCompletePullHistory({ request: github });
+  const candidates = pulls.filter(isLifecycleCandidate);
+  let detail = null;
+  if (candidates.length > 0) {
+    const latest = candidates.reduce((left, right) => (left.number > right.number ? left : right));
+    detail = await github(`/repos/${REPOSITORY}/pulls/${latest.number}`);
+    assertHydratedPullMatches(latest, detail);
+    pulls = replacePull(pulls, detail);
+  }
+  const snapshot = readSnapshotObservation();
+  const commits = commitEvidence([
+    detail?.base?.sha,
+    detail?.head?.sha,
+    detail?.merge_commit_sha,
+    snapshot?.sha,
+    releaseHeadSha,
+  ]);
+  const observation = {
+    releaseHeadSha,
+    stagedSha,
+    pulls,
+    historyComplete: true,
+    commits,
+    snapshot,
+  };
+  const initial = classifyMaintainerOwnershipInternal(observation, { allowPostMergePending: true });
+  if (initial.owner !== 'post-merge-observer-required') return { observation, decision: initial };
+  return classifyMaintainerOwnershipWithDurableObserver({
+    observation,
+    gitAdapter: createMaintainerFinalizerGitAdapter(),
+  });
+}
+
+async function emitSummary(summary) {
+  console.log(JSON.stringify(summary, null, 2));
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    await appendFile(
+      process.env.GITHUB_STEP_SUMMARY,
+      `## Draft release maintenance\n\n\`\`\`json\n${JSON.stringify(summary, null, 2)}\n\`\`\`\n`,
+    );
+  }
+  return summary;
+}
+
+export async function main({ dryRun = process.argv.includes('--dry-run') } = {}) {
+  if (process.env.GITHUB_REPOSITORY !== REPOSITORY) {
+    fail(`refusing to write outside ${REPOSITORY}`);
+  }
+  if (!process.env.GITHUB_TOKEN) fail('GITHUB_TOKEN is required');
+  assertSafeGitConfiguration(process.cwd());
+  const wakeup = validateMaintainerWakeup({
+    eventName: process.env.GITHUB_EVENT_NAME,
+    event: JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')),
+  });
+  const rebind = async () => assertTrustedMaintainerMain();
+  await rebind();
+
+  const { releaseHeadSha: releaseSource, stagedSha: previousIntent } = refreshObservedRefs();
 
   const pull = await findReleasePull();
+  if (pull === null) {
+    const first = await readOwnershipSnapshot();
+    if (first.decision.owner !== 'finalizer-owns-release') {
+      fail('no-open ownership did not resolve to the finalizer');
+    }
+    const second = await readOwnershipSnapshot();
+    assertStableOwnershipSnapshots(first, second);
+    const { decision, observation } = second;
+    return emitSummary({
+      repository: REPOSITORY,
+      event: wakeup.event,
+      actor: wakeup.actor,
+      action: decision.owner,
+      ownershipState: decision.state,
+      releaseSource: observation.releaseHeadSha,
+      previousIntent: observation.stagedSha,
+      intent: observation.stagedSha,
+      qaDispatch: { action: 'not-dispatched-owner-handoff' },
+      pullRequest: decision.pullNumber ?? Math.max(...observation.pulls.filter(isLifecycleCandidate).map(({ number }) => number)),
+    });
+  }
   if (pull.head.sha !== previousIntent) fail('release PR head does not equal the staged ref');
+
+  const observedIntent = commitShape(previousIntent);
+  const observedVersion = intentVersion(observedIntent);
+  if (observedVersion === NEXT_RELEASE_VERSION) {
+    const first = await readOwnershipSnapshot();
+    if (first.decision.owner !== 'next-proposal-owned') {
+      fail('open 1.0.2 ownership did not resolve to the next proposal');
+    }
+    const second = await readOwnershipSnapshot();
+    assertStableOwnershipSnapshots(first, second);
+    const { decision, observation } = second;
+    return emitSummary({
+      repository: REPOSITORY,
+      event: wakeup.event,
+      actor: wakeup.actor,
+      action: decision.owner,
+      ownershipState: decision.state,
+      releaseSource: observation.releaseHeadSha,
+      previousIntent: observation.stagedSha,
+      intent: observation.stagedSha,
+      qaDispatch: { action: 'not-dispatched-owner-handoff' },
+      pullRequest: decision.pullNumber,
+    });
+  }
+  if (observedVersion !== RELEASE_VERSION) {
+    fail(`open release proposal has unexpected version ${observedVersion ?? '<missing>'}`);
+  }
 
   const baseline = validateBaseline(releaseSource);
   const alreadyCurrent = validateExistingStagedIntent(previousIntent, releaseSource);
@@ -275,6 +1048,7 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
     intent = createIntent(releaseSource);
     validateIntent(commitShape(intent), { source: releaseSource });
 
+    await rebind();
     if (refSha(RELEASE_LINE) !== releaseSource) {
       fail('release line advanced before the guarded staged write; a later wake-up must win');
     }
@@ -282,12 +1056,7 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
       fail('staged ref advanced before the guarded staged write; refusing to overwrite it');
     }
 
-    git(
-      'push',
-      `--force-with-lease=refs/heads/${STAGED_LINE}:${previousIntent}`,
-      'origin',
-      `${intent}:refs/heads/${STAGED_LINE}`,
-    );
+    pushStagedIntent({ previousIntent, intent });
 
     if (refSha(RELEASE_LINE) !== releaseSource || refSha(STAGED_LINE) !== intent) {
       fail('remote refs did not match the guarded staged update');
@@ -303,6 +1072,7 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
     const currentPull = await waitForPullHead(pull.number, intent);
 
     const body = buildPullRequestBody({ source: releaseSource, intent, includedCommits: commits });
+    await rebind();
     await github(`/repos/${REPOSITORY}/pulls/${pull.number}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -312,13 +1082,14 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
       pull: currentPull,
       intent,
       request: github,
+      rebind,
     });
   }
 
   const summary = {
     repository: REPOSITORY,
-    event: process.env.GITHUB_EVENT_NAME ?? 'local',
-    actor: process.env.GITHUB_ACTOR ?? 'local',
+    event: wakeup.event,
+    actor: wakeup.actor,
     pullRequest: pull.number,
     action: alreadyCurrent
       ? dryRun
@@ -333,13 +1104,7 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
     qaDispatch,
     includedCommits: commits.map(({ sha }) => sha),
   };
-  console.log(JSON.stringify(summary, null, 2));
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    await appendFile(
-      process.env.GITHUB_STEP_SUMMARY,
-      `## Draft release maintenance\n\n\`\`\`json\n${JSON.stringify(summary, null, 2)}\n\`\`\`\n`,
-    );
-  }
+  await emitSummary(summary);
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {

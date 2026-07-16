@@ -1,0 +1,66 @@
+name: Finalize release 1.0.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      fault:
+        description: Fixed retained-evidence fault point
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - after-github-release-post
+
+permissions: {}
+
+concurrency:
+  group: finalize-v1.0.1
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    if: github.repository == 'fablebookjs/lab-01' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out exact current trusted main
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+          ref: main
+
+      - name: Install the fixed Node runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Bootstrap the closed fixed npm packer
+        run: >-
+          node scripts/bootstrap-npm-cli.mjs
+          --repository-root "$GITHUB_WORKSPACE"
+          --path-file "$GITHUB_PATH"
+
+      - name: Observe and perform at most one durable finalizer action
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FINALIZER_FAULT: ${{ inputs.fault }}
+        run: >-
+          node scripts/finalize-release.mjs
+          --repository fablebookjs/lab-01
+          --fault "$FINALIZER_FAULT"
+          --evidence "$RUNNER_TEMP/finalize-release.json"
+
+      - name: Retain sanitized finalizer evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: finalize-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/finalize-release.json
+          if-no-files-found: error
+          retention-days: 30

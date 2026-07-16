@@ -4,10 +4,12 @@ import test from 'node:test';
 
 import {
   assertMatchingReleasePull,
+  assertTrustedMaintainerMain,
   buildPullRequestBody,
   dispatchReadyQaIfNeeded,
   parseIntentMessage,
   validateIntent,
+  validateMaintainerWakeup,
 } from '../scripts/maintain-release-draft.mjs';
 
 const releasePull = (draft) => ({
@@ -111,11 +113,11 @@ test('explicitly dispatches exact-head QA only for a ready release PR', async ()
   );
   assert.deepEqual(calls, [
     [
-      '/repos/fablebookjs/lab-01/actions/workflows/ready-release-qa.yml/dispatches',
+      '/repos/fablebookjs/lab-01/actions/workflows/ready-release-qa-controller.yml/dispatches',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ref: 'staged/v1.0' }),
+        body: JSON.stringify({ ref: 'main' }),
       },
     ],
   ]);
@@ -126,16 +128,76 @@ test('explicitly dispatches exact-head QA only for a ready release PR', async ()
   );
 });
 
-test('release-PR maintenance has only the authority needed for guarded refresh and QA dispatch', async () => {
-  const workflow = await readFile(
+test('release push is a fixed read-only signal and trusted main owns guarded refresh and QA dispatch', async () => {
+  const signal = await readFile(
     new URL('../.github/workflows/maintain-release-draft.yml', import.meta.url),
     'utf8',
   );
-  assert.match(
-    workflow,
-    /permissions:\n  actions: write\n  contents: write\n  pull-requests: write/,
-  );
-  assert.match(workflow, /node scripts\/maintain-release-draft\.mjs/);
+  assert.match(signal, /^name: Release maintenance signal$/m);
+  assert.match(signal, /^  push:\n    branches:\n      - releases\/v1\.0$/m);
+  assert.match(signal, /^permissions: \{\}$/m);
+  assert.doesNotMatch(signal, /actions\/checkout|node scripts|contents: write|pull-requests: write|workflow_dispatch/);
+
+  const controller = await readFile(new URL('../.github/workflows/maintain-release-draft-controller.yml', import.meta.url), 'utf8');
+  assert.match(controller, /^name: Maintain release draft$/m);
+  assert.match(controller, /workflow_run:\n    workflows:\n      - Release maintenance signal/);
+  assert.match(controller, /^  workflow_dispatch:$/m);
+  assert.match(controller, /^permissions: \{\}$/m);
+  assert.match(controller, /permissions:\n      actions: write\n      contents: write\n      pull-requests: write/);
+  assert.match(controller, /actions\/checkout@[0-9a-f]{40} # v6/);
+  assert.match(controller, /ref: \$\{\{ github\.workflow_sha \}\}/);
+  assert.match(controller, /persist-credentials: false/);
+  assert.match(controller, /EXPECTED_DISPATCH_SHA: \$\{\{ github\.sha \}\}/);
+  assert.match(controller, /EXPECTED_WORKFLOW_SHA: \$\{\{ github\.workflow_sha \}\}/);
+  assert.match(controller, /node scripts\/maintain-release-draft\.mjs/);
+});
+
+test('maintainer wake-ups are non-authoritative exact signal/manual shapes and every write rebinds main', () => {
+  const actor = { id: 7, login: 'maintainer' };
+  const repository = { id: 1301358254, full_name: 'fablebookjs/lab-01' };
+  const event = {
+    action: 'completed', repository, sender: actor,
+    workflow_run: {
+      id: 99, name: 'Release maintenance signal', event: 'push', status: 'completed', conclusion: 'success',
+      head_branch: 'releases/v1.0', repository, head_repository: repository, actor, triggering_actor: actor,
+    },
+  };
+  assert.deepEqual(validateMaintainerWakeup({ eventName: 'workflow_run', event }), { event: 'workflow_run', actor: 'maintainer', runId: 99 });
+  assert.deepEqual(validateMaintainerWakeup({ eventName: 'workflow_dispatch', event: { repository, sender: actor, inputs: {} } }), { event: 'workflow_dispatch', actor: 'maintainer' });
+  const unrelatedClose = structuredClone(event);
+  unrelatedClose.workflow_run.name = 'Release regeneration signal';
+  unrelatedClose.workflow_run.event = 'pull_request_target';
+  unrelatedClose.workflow_run.head_branch = 'fix+valid/_branch';
+  assert.deepEqual(validateMaintainerWakeup({ eventName: 'workflow_run', event: unrelatedClose }), {
+    event: 'workflow_run',
+    actor: 'maintainer',
+    runId: 99,
+    action: 'ignored-unrelated-signal',
+  });
+  const malformedClose = structuredClone(unrelatedClose);
+  malformedClose.workflow_run.head_branch = 'bad..branch';
+  assert.throws(() => validateMaintainerWakeup({ eventName: 'workflow_run', event: malformedClose }));
+  malformedClose.workflow_run.head_branch = '/suspicious';
+  assert.throws(() => validateMaintainerWakeup({ eventName: 'workflow_run', event: malformedClose }));
+  for (const mutate of [
+    (value) => { value.workflow_run.name = 'Maintain release draft'; },
+    (value) => { value.workflow_run.event = 'workflow_dispatch'; },
+    (value) => { value.workflow_run.head_branch = 'staged/v1.0'; },
+    (value) => { value.workflow_run.conclusion = 'failure'; },
+    (value) => { value.workflow_run.head_repository.full_name = 'fork/lab-01'; },
+  ]) {
+    const forged = structuredClone(event); mutate(forged);
+    assert.throws(() => validateMaintainerWakeup({ eventName: 'workflow_run', event: forged }));
+  }
+  const main = 'a'.repeat(40);
+  assert.equal(assertTrustedMaintainerMain({ environment: {
+    GITHUB_REPOSITORY: 'fablebookjs/lab-01', GITHUB_REF: 'refs/heads/main',
+    EXPECTED_DISPATCH_SHA: main, EXPECTED_WORKFLOW_SHA: main,
+  }, localSha: main, remoteMainSha: main }), main);
+  assert.throws(() => assertTrustedMaintainerMain({ environment: {
+    GITHUB_REPOSITORY: 'fablebookjs/lab-01', GITHUB_REF: 'refs/heads/main',
+    EXPECTED_DISPATCH_SHA: 'b'.repeat(40), EXPECTED_WORKFLOW_SHA: main,
+  }, localSha: main, remoteMainSha: main }), /drifted/);
 });
 
 test('renders the exact current intent and honest lifecycle limits', () => {
@@ -160,9 +222,11 @@ The structured empty commit is authoritative. This editable title and body are p
 
 ## Current lifecycle state
 
-Automatic release-PR maintenance is live. A push to \`releases/v1.0\` refreshes this same PR from the exact new release-line head while preserving its number, base, head, and draft-or-ready review state.
+Historical automation demonstrated release-proposal refresh, Ready QA, and close-and-regenerate. Default-main trusted controllers are now installed; release and PR workflows remain fixed read-only/no-checkout signals, and controllers re-observe every durable ref and PR fact before acting. The trusted-main maintainer dispatches \`ready-release-qa-controller.yml\` only at \`main\`, while npm trusted publishing uses the exact stable workflow filename \`publish-npm.yml\`.
 
-Ready-state exact-version QA is live. Marking the current proposal ready runs QA for that exact head. When a ready proposal refreshes, release-PR maintenance explicitly dispatches QA for the new staged head because GitHub leaves token-authored synchronize runs approval-required. The first ready proof is [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684), and the first automatically refreshed-head proof is [run 29414043206](https://github.com/fablebookjs/lab-01/actions/runs/29414043206). Close-and-regenerate is live: [run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336) closed historical PR #1, created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12), and converged on that same replacement when rerun. Publication, branch reconciliation, a \`v1.0.1\` tag, and a GitHub Release are not implemented. Do not merge this release PR.
+The manual operator-only exact \`1.0.0\` bootstrap exists but has not published. The trusted-main maintainer, Ready-QA controller, \`V\` preparation, direct-OIDC publisher, finalizer, and H/J handoff are installed but have not completed a real release. The \`npm-publish\` environment exists with no secrets or reviewers and permits only \`main\`. No current-head QA success, public package, snapshot, or finalization is claimed; baseline packages, both npm trusted-publisher settings, and a real post-installation QA run remain external gates.
+
+This maintainer never publishes, reconciles the release line, tags, or creates a GitHub Release. It validates the open \`1.0.1\` proposal, sealed merge \`M\`, exact deterministic \`V\`, concrete \`H\`, deterministic \`J\`, and an exact draft \`1.0.2\` proposal from trusted-main code. Caller-supplied H/J facts are rejected; two complete ownership snapshots rederive and reclassify the durable graph. The issue #19 operator gate remains closed.
 
 See [docs/release-process.md](https://github.com/fablebookjs/lab-01/blob/releases/v1.0/docs/release-process.md) for the current contract and safety boundary.`,
   );

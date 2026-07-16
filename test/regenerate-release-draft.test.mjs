@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -10,6 +13,7 @@ import {
   buildExpectedOldRefUpdate,
   classifyCloseEvent,
   reconcileClosedPull,
+  runRegenerationWakeup,
 } from '../scripts/regenerate-release-draft.mjs';
 
 const repository = 'fablebookjs/lab-01';
@@ -19,6 +23,64 @@ const closedIntent = '3333333333333333333333333333333333333333';
 const freshIntentA = '4444444444444444444444444444444444444444';
 const freshIntentB = '5555555555555555555555555555555555555555';
 const concurrentIntent = '6666666666666666666666666666666666666666';
+const repositoryIdentity = { id: 1301358254, full_name: repository };
+const liveActor = { id: 3070389, login: 'ndelangen' };
+
+function exactUnrelatedSignal() {
+  return {
+    action: 'completed',
+    repository: repositoryIdentity,
+    sender: liveActor,
+    workflow_run: {
+      id: 29480861541,
+      name: 'Release regeneration signal',
+      event: 'pull_request_target',
+      status: 'completed',
+      conclusion: 'success',
+      head_branch: 'codex/issue-19-main-install',
+      head_sha: 'e973de64fc030341d944b0208d073e38c485c669',
+      repository: repositoryIdentity,
+      head_repository: repositoryIdentity,
+      actor: liveActor,
+      triggering_actor: liveActor,
+    },
+  };
+}
+
+test('an unrelated trusted close signal is a successful no-effect wake-up', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'lab-01-unrelated-close-'));
+  const eventPath = join(root, 'event.json');
+  const outputPath = join(root, 'output.txt');
+  const summaryPath = join(root, 'summary.md');
+
+  try {
+    await writeFile(eventPath, JSON.stringify(exactUnrelatedSignal()));
+    const result = spawnSync(
+      process.execPath,
+      ['scripts/regenerate-release-draft.mjs', '--if-needed'],
+      {
+        cwd: new URL('..', import.meta.url),
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GITHUB_REPOSITORY: repository,
+          GITHUB_EVENT_NAME: 'workflow_run',
+          GITHUB_EVENT_PATH: eventPath,
+          GITHUB_TOKEN: 'test-token-never-used',
+          GITHUB_OUTPUT: outputPath,
+          GITHUB_STEP_SUMMARY: summaryPath,
+        },
+      },
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /"action": "ignored-unrelated-signal"/);
+    assert.equal(await readFile(outputPath, 'utf8'), 'maintain=false\n');
+    assert.match(await readFile(summaryPath, 'utf8'), /ignored-unrelated-signal/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 function pull({
   number,
@@ -145,6 +207,54 @@ test('an unmerged close writes one fresh intent and creates one draft replacemen
   );
   assert.match(harness.calls.createPull[0].body, new RegExp(sourceA));
   assert.match(harness.calls.createPull[0].body, new RegExp(freshIntentA));
+});
+
+test('trusted-main regeneration derives the latest closed proposal without caller event facts', async () => {
+  const closed = pull({ number: 7 });
+  const harness = fakeAdapter({
+    states: [state({ pulls: [closed] }), state({ stagedIntent: freshIntentA, pulls: [closed] })],
+    refs: [
+      { releaseSource: sourceA, stagedIntent: closedIntent },
+      { releaseSource: sourceA, stagedIntent: freshIntentA },
+      { releaseSource: sourceA, stagedIntent: freshIntentA },
+    ],
+    intents: [freshIntentA],
+  });
+  const result = await reconcileClosedPull({ adapter: harness.adapter });
+  assert.equal(result.action, 'created-replacement');
+  assert.equal(result.closedPullRequest, 7);
+  assert.deepEqual(harness.calls.updateStagedRef.map(({ expectedOld, intent }) => ({ expectedOld, intent })), [
+    { expectedOld: closedIntent, intent: freshIntentA },
+  ]);
+  assert.equal(harness.calls.createPull.length, 1);
+});
+
+test('the exact unrelated trusted close signal succeeds as a zero-effect no-op', async () => {
+  const effects = { durableState: 0, github: 0, refs: 0, pullRequests: 0, qa: 0 };
+  const output = [];
+  const result = await runRegenerationWakeup({
+    eventName: 'workflow_run',
+    event: exactUnrelatedSignal(),
+    operate: async () => {
+      effects.durableState += 1;
+      effects.github += 1;
+      effects.refs += 1;
+      effects.pullRequests += 1;
+      effects.qa += 1;
+      return { action: 'unexpected' };
+    },
+    emit: async ({ summary, maintain }) => output.push({ summary, maintain }),
+  });
+
+  assert.deepEqual(result, {
+    repository,
+    event: 'workflow_run',
+    actor: 'ndelangen',
+    runId: 29480861541,
+    action: 'ignored-unrelated-signal',
+  });
+  assert.deepEqual(effects, { durableState: 0, github: 0, refs: 0, pullRequests: 0, qa: 0 });
+  assert.deepEqual(output, [{ summary: result, maintain: false }]);
 });
 
 test('a latest merged release pull request is a no-op after durable event validation', async () => {
@@ -365,7 +475,7 @@ test('the staged update encodes the exact expected old SHA', () => {
   );
 });
 
-test('the installable workflow uses only trusted release code and bounded write authority', async () => {
+test('the close workflow is a fixed read-only signal consumed by the trusted-main controller', async () => {
   const workflow = await readFile(
     new URL('../.github/workflows/regenerate-release-draft.yml', import.meta.url),
     'utf8',
@@ -373,8 +483,13 @@ test('the installable workflow uses only trusted release code and bounded write 
 
   assert.match(workflow, /pull_request_target:/);
   assert.match(workflow, /types:\n      - closed/);
-  assert.match(workflow, /contents: write\n  pull-requests: write/);
-  assert.match(workflow, /uses: actions\/checkout@v7/);
-  assert.match(workflow, /ref: releases\/v1\.0/);
-  assert.doesNotMatch(workflow, /pull_request\.head|github\.head_ref/);
+  assert.match(workflow, /^permissions: \{\}$/m);
+  assert.match(
+    workflow,
+    /github\.event\.pull_request\.base\.repo\.full_name == 'fablebookjs\/lab-01' &&\n      github\.event\.pull_request\.base\.ref == 'releases\/v1\.0' &&\n      github\.event\.pull_request\.head\.repo\.full_name == 'fablebookjs\/lab-01' &&\n      github\.event\.pull_request\.head\.ref == 'staged\/v1\.0'/,
+  );
+  assert.doesNotMatch(workflow, /contents: write|pull-requests: write|actions\/checkout|node scripts|^\s+ref: releases\/v1\.0|github\.head_ref/m);
+  const controller = await readFile(new URL('../.github/workflows/maintain-release-draft-controller.yml', import.meta.url), 'utf8');
+  assert.match(controller, /workflows:\n      - Release maintenance signal\n      - Release regeneration signal/);
+  assert.match(controller, /node scripts\/regenerate-release-draft\.mjs --if-needed/);
 });

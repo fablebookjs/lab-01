@@ -1,34 +1,19 @@
-name: Maintain release draft
+name: Release maintenance signal
 
 on:
   push:
     branches:
       - releases/v1.0
-  workflow_dispatch:
 
-permissions:
-  actions: write
-  contents: write
-  pull-requests: write
-
-concurrency:
-  group: maintain-release-draft-v1.0
-  cancel-in-progress: false
+permissions: {}
 
 jobs:
-  maintain:
-    runs-on: ubuntu-latest
+  signal:
+    if: github.repository == 'fablebookjs/lab-01'
+    runs-on: ubuntu-24.04
     steps:
-      - name: Assert the laboratory repository
-        run: test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01"
-
-      - name: Check out the current release line
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          ref: releases/v1.0
-
-      - name: Maintain the existing release PR
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node scripts/maintain-release-draft.mjs
+      - name: Emit a fixed read-only release maintenance wake-up
+        run: >-
+          test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01" &&
+          test "$GITHUB_EVENT_NAME" = "push" &&
+          test "$GITHUB_REF" = "refs/heads/releases/v1.0"

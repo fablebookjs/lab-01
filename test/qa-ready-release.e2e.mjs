@@ -38,7 +38,7 @@ Release-Source: ${sourceSha}
   }).trim();
 }
 
-test('adversarial ambient npm config cannot redirect candidate, publish, or consumer traffic', async () => {
+test('adversarial ambient npm/Git config is rejected before candidate, publish, or consumer traffic', async () => {
   const repoRoot = git(process.cwd(), 'rev-parse', '--show-toplevel');
   const sourceSha = git(repoRoot, 'rev-parse', 'HEAD');
   const stagedSha = localIntent(repoRoot, sourceSha);
@@ -97,18 +97,16 @@ https-proxy=${trapOrigin}
       const previous = Object.fromEntries(Object.keys(hostile).map((key) => [key, process.env[key]]));
       Object.assign(process.env, hostile);
       try {
-        const evidence = await runReadyReleaseQa({
-          repository: REPOSITORY,
-          stagedSha,
-          sourceSha,
-          repoRoot,
-          authority: localAuthority(),
-        });
-        assert.equal(evidence.authority.mode, 'local');
-        assert.equal(evidence.authority.githubCurrent, false);
-        assert.notEqual(evidence.registry.origin, trapOrigin);
-        assert.equal(evidence.registry.noUplinks, true);
-        assert.equal(evidence.consumer.registryOrigin, evidence.registry.origin);
+        await assert.rejects(
+          runReadyReleaseQa({
+            repository: REPOSITORY,
+            stagedSha,
+            sourceSha,
+            repoRoot,
+            authority: localAuthority(),
+          }),
+          /AMBIENT_GIT_CONFIG_PROHIBITED/,
+        );
         assert.deepEqual(requests, []);
       } finally {
         for (const [key, value] of Object.entries(previous)) {

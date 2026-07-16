@@ -3,10 +3,14 @@ import { appendFile, readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
 import {
+  assertTrustedMaintainerMain,
   buildIntentMessage,
   buildPullRequestBody,
+  readCompletePullHistory,
   validateIntent,
+  validateMaintainerWakeup,
 } from './maintain-release-draft.mjs';
+import { assertSafeGitConfiguration, closedGitEnvironment } from './release-publication.mjs';
 
 const REPOSITORY = 'fablebookjs/lab-01';
 const RELEASE_LINE = 'releases/v1.0';
@@ -16,8 +20,9 @@ const RELEASE_VERSION = '1.0.1';
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
 
 const git = (...args) =>
-  execFileSync('git', args, {
+  execFileSync('git', args[0] === '--no-replace-objects' ? args : ['--no-replace-objects', ...args], {
     encoding: 'utf8',
+    env: closedGitEnvironment(),
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 
@@ -144,13 +149,13 @@ function assertReplacementPull(pull, stagedIntent) {
 }
 
 export async function reconcileClosedPull({
-  event,
+  event = null,
   repository = REPOSITORY,
   adapter,
   maxAttempts = 5,
 }) {
-  const wakeUp = classifyCloseEvent(event, repository);
-  if (wakeUp.action !== 'regenerate') return wakeUp;
+  let wakeUp = event === null ? null : classifyCloseEvent(event, repository);
+  if (wakeUp?.action !== undefined && wakeUp.action !== 'regenerate') return wakeUp;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     let state;
@@ -163,6 +168,22 @@ export async function reconcileClosedPull({
     assertState(state);
 
     const lifecyclePulls = selectLifecyclePulls(state.pulls);
+    if (wakeUp === null) {
+      const latestObserved = lifecyclePulls.at(-1);
+      if (!latestObserved) return { action: 'ignored-no-lifecycle' };
+      if (latestObserved.state === 'open') {
+        assertLifecyclePull(latestObserved);
+        return {
+          action: 'maintenance-required', pullRequest: latestObserved.number,
+          releaseSource: state.releaseSource, intent: state.stagedIntent,
+        };
+      }
+      if (latestObserved.merged === true || latestObserved.merged_at) {
+        return { action: 'ignored-merged', pullRequest: latestObserved.number };
+      }
+      if (latestObserved.state !== 'closed') fail('the latest release pull request has an unexpected state');
+      wakeUp = { action: 'regenerate', pullRequest: latestObserved.number, closedHead: latestObserved.head.sha };
+    }
     const eventPull = lifecyclePulls.find((pull) => pull.number === wakeUp.pullRequest);
     if (!eventPull) fail('the closed release pull request is absent from durable GitHub state');
     if (eventPull.head.sha !== wakeUp.closedHead) {
@@ -356,15 +377,14 @@ function createFreshIntent({ source, previousIntent }) {
   const intent = execFileSync('git', ['commit-tree', `${source}^{tree}`, '-p', source], {
     encoding: 'utf8',
     input: message,
-    env: {
-      ...process.env,
+    env: closedGitEnvironment({
       GIT_AUTHOR_NAME: 'github-actions[bot]',
       GIT_AUTHOR_EMAIL: '41898282+github-actions[bot]@users.noreply.github.com',
       GIT_AUTHOR_DATE: date,
       GIT_COMMITTER_NAME: 'github-actions[bot]',
       GIT_COMMITTER_EMAIL: '41898282+github-actions[bot]@users.noreply.github.com',
       GIT_COMMITTER_DATE: date,
-    },
+    }),
   }).trim();
   if (intent === previousIntent) fail('new release intent unexpectedly reused the closed intent SHA');
   validateIntent(commitShape(intent), { source });
@@ -392,9 +412,7 @@ async function github(path, options = {}) {
 }
 
 async function listLifecyclePulls() {
-  return github(
-    `/repos/${REPOSITORY}/pulls?state=all&base=${encodeURIComponent(RELEASE_LINE)}&sort=created&direction=desc&per_page=100`,
-  );
+  return readCompletePullHistory({ request: github });
 }
 
 async function readDurableState() {
@@ -430,47 +448,100 @@ async function readDurableState() {
   };
 }
 
-function workflowAdapter() {
+function pushWithToken(args) {
+  const authorization = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${process.env.GITHUB_TOKEN}`).toString('base64')}`;
+  return execFileSync('git', ['--no-replace-objects', ...args], {
+    encoding: 'utf8',
+    env: closedGitEnvironment({
+      GIT_CONFIG_COUNT: '3',
+      GIT_CONFIG_KEY_0: 'credential.helper',
+      GIT_CONFIG_VALUE_0: '',
+      GIT_CONFIG_KEY_1: 'push.followTags',
+      GIT_CONFIG_VALUE_1: 'false',
+      GIT_CONFIG_KEY_2: 'http.https://github.com/.extraheader',
+      GIT_CONFIG_VALUE_2: authorization,
+    }),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+}
+
+function workflowAdapter({ rebind }) {
   return {
     readState: readDurableState,
     readRemoteRefs: async () => remoteRefs(),
     createFreshIntent: async (input) => createFreshIntent(input),
     updateStagedRef: async (update) => {
-      git(...update.pushArgs);
+      await rebind();
+      pushWithToken(update.pushArgs);
     },
-    createPull: async (request) =>
-      github(`/repos/${REPOSITORY}/pulls`, {
+    createPull: async (request) => {
+      await rebind();
+      return github(`/repos/${REPOSITORY}/pulls`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(request),
-      }),
+      });
+    },
   };
 }
 
-export async function main() {
+export async function runRegenerationWakeup({ eventName, event, operate, emit }) {
+  const wakeup = validateMaintainerWakeup({ eventName, event });
+  if (wakeup.action === 'ignored-unrelated-signal') {
+    const summary = {
+      repository: REPOSITORY,
+      event: wakeup.event,
+      actor: wakeup.actor,
+      runId: wakeup.runId,
+      action: wakeup.action,
+    };
+    await emit({ summary, maintain: false });
+    return summary;
+  }
+  if (typeof operate !== 'function') fail('trusted regeneration requires an operation');
+  const summary = {
+    repository: REPOSITORY,
+    event: wakeup.event,
+    actor: wakeup.actor,
+    runId: wakeup.runId,
+    ...(await operate()),
+  };
+  await emit({
+    summary,
+    maintain: ['maintenance-required', 'ignored-merged'].includes(summary.action),
+  });
+  return summary;
+}
+
+export async function main(argv = process.argv.slice(2)) {
   if (process.env.GITHUB_REPOSITORY !== REPOSITORY) {
     fail(`refusing to write outside ${REPOSITORY}`);
   }
-  if (process.env.GITHUB_EVENT_NAME !== 'pull_request_target') {
-    fail('close-and-regenerate must run only for pull_request_target');
-  }
+  if (JSON.stringify(argv) !== JSON.stringify(['--if-needed'])) fail('trusted regeneration accepts only --if-needed');
   if (!process.env.GITHUB_EVENT_PATH) fail('GITHUB_EVENT_PATH is required');
   if (!process.env.GITHUB_TOKEN) fail('GITHUB_TOKEN is required');
 
   const event = JSON.parse(await readFile(process.env.GITHUB_EVENT_PATH, 'utf8'));
-  const summary = {
-    repository: REPOSITORY,
-    event: process.env.GITHUB_EVENT_NAME,
-    actor: process.env.GITHUB_ACTOR ?? 'unknown',
-    ...(await reconcileClosedPull({ event, adapter: workflowAdapter() })),
-  };
-  console.log(JSON.stringify(summary, null, 2));
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    await appendFile(
-      process.env.GITHUB_STEP_SUMMARY,
-      `## Closed release draft reconciliation\n\n\`\`\`json\n${JSON.stringify(summary, null, 2)}\n\`\`\`\n`,
-    );
-  }
+  return runRegenerationWakeup({
+    eventName: process.env.GITHUB_EVENT_NAME,
+    event,
+    operate: async () => {
+      assertSafeGitConfiguration(process.cwd());
+      const rebind = async () => assertTrustedMaintainerMain();
+      await rebind();
+      return reconcileClosedPull({ adapter: workflowAdapter({ rebind }) });
+    },
+    emit: async ({ summary, maintain }) => {
+      console.log(JSON.stringify(summary, null, 2));
+      if (process.env.GITHUB_OUTPUT) await appendFile(process.env.GITHUB_OUTPUT, `maintain=${maintain}\n`);
+      if (process.env.GITHUB_STEP_SUMMARY) {
+        await appendFile(
+          process.env.GITHUB_STEP_SUMMARY,
+          `## Closed release draft reconciliation\n\n\`\`\`json\n${JSON.stringify(summary, null, 2)}\n\`\`\`\n`,
+        );
+      }
+    },
+  });
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {

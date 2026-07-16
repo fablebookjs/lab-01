@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import { createServer } from 'node:net';
 import {
   access,
+  appendFile,
   copyFile,
   lstat,
   mkdir,
@@ -19,6 +20,7 @@ import { isDeepStrictEqual, promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
 import { validateIntent } from './maintain-release-draft.mjs';
+import { assertSafeGitConfiguration, closedGitEnvironment } from './release-publication.mjs';
 
 export const REPOSITORY = 'fablebookjs/lab-01';
 export const RELEASE_VERSION = '1.0.1';
@@ -42,6 +44,9 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const SHASUM_PATTERN = /^[0-9a-f]{40}$/;
 const INTEGRITY_PATTERN = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
 const execFileAsync = promisify(execFile);
+const READY_QA_SIGNAL = 'Ready release QA signal';
+const HISTORY_PAGE_SIZE = 100;
+const HISTORY_MAX_PAGES = 20;
 
 const fail = (message) => {
   throw new Error(message);
@@ -50,14 +55,20 @@ const fail = (message) => {
 const readJson = async (path) => JSON.parse(await readFile(path, 'utf8'));
 const writeJson = async (path, value) => writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
 
-const git = (cwd, ...args) =>
-  execFileSync('git', args, {
-    cwd,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  }).trim();
+const git = (cwd, ...args) => {
+  try {
+    return execFileSync('git', ['--no-replace-objects', ...args], {
+      cwd,
+      encoding: 'utf8',
+      env: closedGitEnvironment(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    fail('QA_GIT_OPERATION_FAILED');
+  }
+};
 
-async function command(commandName, args, options = {}) {
+export async function command(commandName, args, options = {}) {
   const started = process.hrtime.bigint();
   try {
     const result = await execFileAsync(commandName, args, {
@@ -71,14 +82,8 @@ async function command(commandName, args, options = {}) {
       stderr: result.stderr.trim(),
       durationMs: Number((process.hrtime.bigint() - started) / 1_000_000n),
     };
-  } catch (error) {
-    const stderr = error.stderr?.trim();
-    const stdout = error.stdout?.trim();
-    const detail = stderr || stdout;
-    throw new Error(
-      `${commandName} ${args.join(' ')} failed${detail ? `: ${detail.slice(-4000)}` : ''}`,
-      { cause: error },
-    );
+  } catch {
+    fail('QA_SUBPROCESS_FAILED');
   }
 }
 
@@ -230,7 +235,6 @@ function cleanupContract() {
 function expectedStepShape(steps) {
   const prefix = [
     ['candidate:install', 'npm ci --omit=dev --offline (loopback registry)'],
-    ['candidate:test', 'LAB_01_EXPECTED_PACKAGE_VERSION=1.0.1 npm test'],
   ];
   const suffix = [
     [`pack:${PACKAGE_SPECS[0].name}`, `npm pack ./${PACKAGE_SPECS[0].directory}`],
@@ -240,20 +244,9 @@ function expectedStepShape(steps) {
     ['consumer:install', 'npm install (loopback registry)'],
     ['consumer:test', 'npm test'],
   ];
-  const buildNames = [
-    '@fablebook/lab-01',
-    ...PACKAGE_SPECS.map(({ name }) => name),
-  ].map((name) => `build:${name}`);
-  const buildSteps = Array.isArray(steps) ? steps.slice(prefix.length, -suffix.length) : [];
-  const commands = [...prefix, ...buildSteps.map(({ name }) => [name, 'npm run build']), ...suffix];
+  const commands = [...prefix, ...suffix];
   if (
     !Array.isArray(steps) ||
-    buildSteps.length > buildNames.length ||
-    buildSteps.some(
-      (step, index) =>
-        !buildNames.includes(step?.name) ||
-        (index > 0 && buildNames.indexOf(step.name) <= buildNames.indexOf(buildSteps[index - 1].name)),
-    ) ||
     steps.length !== commands.length ||
     steps.some(
       (step, index) =>
@@ -633,6 +626,38 @@ function isAuthoritativePull(pull) {
   );
 }
 
+function validActor(actor) {
+  return Number.isInteger(actor?.id) && actor.id > 0 && /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(actor.login ?? '');
+}
+
+export function validateReadyQaWakeup({ eventName, event }) {
+  if (event?.repository?.full_name !== REPOSITORY || !Number.isInteger(event.repository.id) || event.repository.id < 1) {
+    fail('Ready QA wake-up repository identity is invalid');
+  }
+  if (!validActor(event.sender)) fail('Ready QA wake-up sender identity is invalid');
+  if (eventName === 'workflow_dispatch') {
+    if (event.inputs && Object.keys(event.inputs).length !== 0) fail('manual Ready QA wake-up cannot supply state');
+    return { event: eventName, actor: event.sender.login };
+  }
+  if (eventName !== 'workflow_run' || event.action !== 'completed') fail('Ready QA event is not an allowed wake-up');
+  const run = event.workflow_run;
+  if (
+    !Number.isInteger(run?.id) || run.id < 1 ||
+    run.name !== READY_QA_SIGNAL ||
+    run.event !== 'pull_request' ||
+    run.status !== 'completed' ||
+    run.conclusion !== 'success' ||
+    run.head_branch !== STAGED_LINE ||
+    run.repository?.full_name !== REPOSITORY ||
+    run.head_repository?.full_name !== REPOSITORY ||
+    !validActor(run.actor) ||
+    !validActor(run.triggering_actor)
+  ) {
+    fail('Ready QA signal wake-up identity is invalid');
+  }
+  return { event: eventName, actor: run.triggering_actor.login, runId: run.id };
+}
+
 export function validateGitHubAuthoritySnapshot({
   eventName,
   event,
@@ -640,12 +665,19 @@ export function validateGitHubAuthoritySnapshot({
   sourceRefSha,
   pulls,
   localHead,
+  mainRefSha,
+  expectedDispatchSha,
+  expectedWorkflowSha,
 }) {
   assertSha(stagedRefSha, 'current staged ref SHA');
   assertSha(sourceRefSha, 'current release ref SHA');
-  assertSha(localHead, 'checked-out staged SHA');
+  assertSha(localHead, 'checked-out trusted main SHA');
+  assertSha(mainRefSha, 'current main ref SHA');
   if (event?.repository?.full_name !== REPOSITORY) fail('GitHub event repository is not the laboratory');
-  if (localHead !== stagedRefSha) fail('checked-out staged SHA is not the current staged ref');
+  validateReadyQaWakeup({ eventName, event });
+  if (
+    localHead !== mainRefSha || expectedDispatchSha !== mainRefSha || expectedWorkflowSha !== mainRefSha
+  ) fail('checked-out QA controller is not exact current trusted main');
   const matching = pulls.filter(isAuthoritativePull);
   if (matching.length !== 1) {
     fail(`expected exactly one current authoritative ready release PR, found ${matching.length}`);
@@ -653,27 +685,6 @@ export function validateGitHubAuthoritySnapshot({
   const pull = matching[0];
   if (pull.head.sha !== stagedRefSha || pull.base.sha !== sourceRefSha) {
     fail('authoritative PR head/base do not equal the current staged/release refs');
-  }
-  if (eventName === 'pull_request') {
-    if (!['ready_for_review', 'synchronize'].includes(event.action)) {
-      fail('pull_request event is not an allowed ready-QA wake-up');
-    }
-    const eventPull = event.pull_request;
-    if (
-      eventPull?.number !== pull.number ||
-      eventPull.state !== 'open' ||
-      eventPull.draft !== false ||
-      eventPull.head?.repo?.full_name !== REPOSITORY ||
-      eventPull.head.ref !== STAGED_LINE ||
-      eventPull.head.sha !== stagedRefSha ||
-      eventPull.base?.repo?.full_name !== REPOSITORY ||
-      eventPull.base.ref !== RELEASE_LINE ||
-      eventPull.base.sha !== sourceRefSha
-    ) {
-      fail('pull_request event does not equal the current authoritative release PR');
-    }
-  } else if (eventName !== 'workflow_dispatch') {
-    fail('GitHub event is not an allowed ready-QA wake-up');
   }
   return {
     mode: 'github-current',
@@ -701,19 +712,71 @@ async function githubGet(path, token) {
   return body;
 }
 
+function canonicalReadyPulls(pulls) {
+  return pulls.map((pull) => ({
+    id: pull.id,
+    number: pull.number,
+    state: pull.state,
+    draft: pull.draft,
+    head: { repository: pull.head?.repo?.full_name, ref: pull.head?.ref, sha: pull.head?.sha },
+    base: { repository: pull.base?.repo?.full_name, ref: pull.base?.ref, sha: pull.base?.sha },
+  })).sort((left, right) => left.number - right.number);
+}
+
+async function readReadyPullSweep(token) {
+  const pulls = [];
+  const numbers = new Set();
+  const ids = new Set();
+  for (let page = 1; page <= HISTORY_MAX_PAGES; page += 1) {
+    const batch = await githubGet(
+      `/repos/${REPOSITORY}/pulls?state=open&base=${encodeURIComponent(RELEASE_LINE)}&per_page=${HISTORY_PAGE_SIZE}&page=${page}`,
+      token,
+    );
+    if (!Array.isArray(batch) || batch.length > HISTORY_PAGE_SIZE) fail('Ready QA PR history page is invalid');
+    for (const pull of batch) {
+      if (!Number.isInteger(pull?.number) || pull.number < 1 || numbers.has(pull.number) || !Number.isInteger(pull.id) || pull.id < 1 || ids.has(pull.id)) {
+        fail('Ready QA PR history has duplicate or malformed identity');
+      }
+      numbers.add(pull.number);
+      ids.add(pull.id);
+      pulls.push(pull);
+    }
+    if (batch.length < HISTORY_PAGE_SIZE) return pulls;
+  }
+  fail('Ready QA PR history exceeded its explicit bound');
+}
+
+async function readStableReadyPulls(token) {
+  const first = await readReadyPullSweep(token);
+  const second = await readReadyPullSweep(token);
+  if (JSON.stringify(canonicalReadyPulls(first)) !== JSON.stringify(canonicalReadyPulls(second))) {
+    fail('Ready QA PR history moved across complete sweeps');
+  }
+  return second;
+}
+
+function remoteBranchSha(repoRoot, branch) {
+  const output = git(repoRoot, 'ls-remote', '--refs', '--exit-code', 'origin', `refs/heads/${branch}`);
+  const rows = output.split('\n').filter(Boolean);
+  if (rows.length !== 1) fail(`remote ${branch} ref is not unique`);
+  const [sha, ref, extra] = rows[0].split(/\s+/);
+  assertSha(sha, `remote ${branch}`);
+  if (extra !== undefined || ref !== `refs/heads/${branch}`) fail(`remote ${branch} ref is malformed`);
+  return sha;
+}
+
+function fetchCandidateObjects(repoRoot, shas) {
+  git(repoRoot, 'fetch', '--force', '--no-tags', '--no-write-fetch-head', 'origin', ...shas);
+}
+
 async function resolveGitHubAuthority({ repoRoot, eventName, eventPath, token }) {
   if (!token) fail('read-only GITHUB_TOKEN is required for GitHub-current QA authority');
   const event = await readJson(eventPath);
-  const [stagedRef, sourceRef, pulls] = await Promise.all([
-    githubGet(`/repos/${REPOSITORY}/git/ref/heads/${STAGED_LINE}`, token),
-    githubGet(`/repos/${REPOSITORY}/git/ref/heads/${RELEASE_LINE}`, token),
-    githubGet(
-      `/repos/${REPOSITORY}/pulls?state=open&base=${encodeURIComponent(RELEASE_LINE)}&per_page=100`,
-      token,
-    ),
-  ]);
-  const stagedRefSha = stagedRef?.object?.sha;
-  const sourceRefSha = sourceRef?.object?.sha;
+  validateReadyQaWakeup({ eventName, event });
+  const mainRefSha = remoteBranchSha(repoRoot, 'main');
+  const stagedRefSha = remoteBranchSha(repoRoot, STAGED_LINE);
+  const sourceRefSha = remoteBranchSha(repoRoot, RELEASE_LINE);
+  const pulls = await readStableReadyPulls(token);
   const authority = validateGitHubAuthoritySnapshot({
     eventName,
     event,
@@ -721,7 +784,11 @@ async function resolveGitHubAuthority({ repoRoot, eventName, eventPath, token })
     sourceRefSha,
     pulls,
     localHead: git(repoRoot, 'rev-parse', 'HEAD'),
+    mainRefSha,
+    expectedDispatchSha: process.env.EXPECTED_DISPATCH_SHA,
+    expectedWorkflowSha: process.env.EXPECTED_WORKFLOW_SHA,
   });
+  fetchCandidateObjects(repoRoot, [stagedRefSha, sourceRefSha]);
   return { authority, stagedSha: stagedRefSha, sourceSha: sourceRefSha };
 }
 
@@ -771,7 +838,7 @@ async function reserveLoopbackPort() {
 async function waitForRegistry(origin, child, logs) {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) fail(`Verdaccio exited before readiness: ${logs.join('').slice(-2000)}`);
+    if (child.exitCode !== null) fail('QA_REGISTRY_EXITED_BEFORE_READY');
     try {
       const response = await fetch(new URL('/-/ping', origin));
       if (response.ok) return;
@@ -780,7 +847,7 @@ async function waitForRegistry(origin, child, logs) {
     }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
-  fail(`Verdaccio did not become ready: ${logs.join('').slice(-2000)}`);
+  fail('QA_REGISTRY_READY_TIMEOUT');
 }
 
 async function stopProcess(child) {
@@ -934,16 +1001,6 @@ async function verifyRegistryPackage(origin, candidate) {
   };
 }
 
-async function buildIfPresent(candidateDirectory, steps, env) {
-  for (const manifestPath of ['package.json', ...PACKAGE_SPECS.map(({ directory }) => `${directory}/package.json`)]) {
-    const manifest = await readJson(join(candidateDirectory, manifestPath));
-    if (!manifest.scripts?.build) continue;
-    const cwd = dirname(join(candidateDirectory, manifestPath));
-    const result = await command('npm', ['run', 'build'], { cwd, env });
-    steps.push({ name: `build:${manifest.name}`, command: 'npm run build', durationMs: result.durationMs });
-  }
-}
-
 async function proveConsumer(tempRoot, registryOrigin, registryPackages, steps, repoRoot) {
   const consumerDirectory = join(tempRoot, 'isolated-consumer');
   await mkdir(consumerDirectory);
@@ -1003,6 +1060,7 @@ export async function runReadyReleaseQa({
   authority,
   testHooks = {},
 }) {
+  assertSafeGitConfiguration(repoRoot);
   validateRepository(repoRoot, repository);
   assertAuthorityContract(authority, stagedSha, sourceSha);
   const sourceTree = validateStagedIntent(repoRoot, stagedSha, sourceSha);
@@ -1053,7 +1111,8 @@ export async function runReadyReleaseQa({
     registryOrigin = `http://127.0.0.1:${port}/`;
     assertLoopbackRegistry(registryOrigin);
     const logs = [];
-    const verdaccioBinary = join(repoRoot, 'node_modules/.bin/verdaccio');
+    const trustedToolRoot = process.env.LAB_01_TRUSTED_TOOL_ROOT || repoRoot;
+    const verdaccioBinary = join(trustedToolRoot, 'node_modules/.bin/verdaccio');
     await access(verdaccioBinary);
     verdaccio = spawn(verdaccioBinary, ['--config', configPath, '--listen', `127.0.0.1:${port}`], {
       cwd: tempRoot,
@@ -1098,21 +1157,6 @@ export async function runReadyReleaseQa({
       command: 'npm ci --omit=dev --offline (loopback registry)',
       durationMs: installed.durationMs,
     });
-    const tested = await command('npm', ['test'], {
-      cwd: candidateDirectory,
-      env: {
-        ...candidateNpmEnvironment,
-        LAB_01_EXPECTED_PACKAGE_VERSION: RELEASE_VERSION,
-        LAB_01_QA_CANDIDATE: '1',
-      },
-    });
-    steps.push({
-      name: 'candidate:test',
-      command: 'LAB_01_EXPECTED_PACKAGE_VERSION=1.0.1 npm test',
-      durationMs: tested.durationMs,
-    });
-    await buildIfPresent(candidateDirectory, steps, candidateNpmEnvironment);
-
     const packedPackages = await packCandidate(
       candidateDirectory,
       packDirectory,
@@ -1284,31 +1328,46 @@ function parseArguments(argv) {
 
 export async function main(argv = process.argv.slice(2)) {
   const args = parseArguments(argv);
-  const repoRoot = git(process.cwd(), 'rev-parse', '--show-toplevel');
-  const resolved =
-    args.authority === 'local'
-      ? {
-          authority: localAuthority(),
-          stagedSha: args['staged-sha'],
-          sourceSha: args['source-sha'],
-        }
-      : await resolveGitHubAuthority({
-          repoRoot,
-          eventName: args['event-name'],
-          eventPath: args['event-path'],
-          token: process.env.GITHUB_TOKEN,
-        });
-  const evidence = await runReadyReleaseQa({
-    repository: args.repository,
-    stagedSha: resolved.stagedSha,
-    sourceSha: resolved.sourceSha,
-    repoRoot,
-    authority: resolved.authority,
-  });
   const output = resolve(args.evidence);
   await mkdir(dirname(output), { recursive: true });
-  await writeJson(output, evidence);
-  console.log(JSON.stringify(evidence, null, 2));
+  try {
+    const repoRoot = git(process.cwd(), 'rev-parse', '--show-toplevel');
+    assertSafeGitConfiguration(repoRoot);
+    const resolved =
+      args.authority === 'local'
+        ? {
+            authority: localAuthority(),
+            stagedSha: args['staged-sha'],
+            sourceSha: args['source-sha'],
+          }
+        : await resolveGitHubAuthority({
+            repoRoot,
+            eventName: args['event-name'],
+            eventPath: args['event-path'],
+            token: process.env.GITHUB_TOKEN,
+          });
+    const evidence = await runReadyReleaseQa({
+      repository: args.repository,
+      stagedSha: resolved.stagedSha,
+      sourceSha: resolved.sourceSha,
+      repoRoot,
+      authority: resolved.authority,
+    });
+    await writeJson(output, evidence);
+    if (process.env.GITHUB_OUTPUT) {
+      await appendFile(process.env.GITHUB_OUTPUT, `staged_sha=${resolved.stagedSha}\n`);
+    }
+    console.log(JSON.stringify(evidence, null, 2));
+  } catch {
+    await writeJson(output, {
+      schemaVersion: 2,
+      repository: REPOSITORY,
+      operation: 'ready-release-qa',
+      status: 'failed',
+      error: { code: 'READY_QA_FAILED' },
+    });
+    fail('READY_QA_FAILED');
+  }
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {

@@ -1,4 +1,4 @@
-name: Ready release QA
+name: Ready release QA signal
 
 on:
   pull_request:
@@ -6,73 +6,15 @@ on:
       - releases/v1.0
     types:
       - ready_for_review
-  workflow_dispatch:
 
-permissions:
-  contents: read
-  pull-requests: read
-
-concurrency:
-  group: ready-release-qa-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
+permissions: {}
 
 jobs:
-  exact-version-qa:
-    if: >-
-      github.repository == 'fablebookjs/lab-01' &&
-      (github.event_name == 'workflow_dispatch' ||
-        (github.event.pull_request.draft == false &&
-         github.event.pull_request.state == 'open' &&
-         github.event.pull_request.head.repo.full_name == 'fablebookjs/lab-01' &&
-         github.event.pull_request.head.ref == 'staged/v1.0' &&
-         github.event.pull_request.base.repo.full_name == 'fablebookjs/lab-01' &&
-         github.event.pull_request.base.ref == 'releases/v1.0'))
-    runs-on: ubuntu-latest
-    env:
-      EXPECTED_REPOSITORY: fablebookjs/lab-01
+  signal:
+    if: github.repository == 'fablebookjs/lab-01'
+    runs-on: ubuntu-24.04
     steps:
-      - name: Assert the read-only laboratory boundary
-        run: test "$GITHUB_REPOSITORY" = "$EXPECTED_REPOSITORY"
-
-      - name: Check out the exact staged intent with authenticated full history
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-          persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || 'staged/v1.0' }}
-
-      - name: Bootstrap the pinned trusted QA tooling
-        run: |
-          test -z "$(find . -name .npmrc -print -quit)"
-          mkdir -p "$RUNNER_TEMP/qa-bootstrap-home" "$RUNNER_TEMP/qa-bootstrap-cache"
-          : > "$RUNNER_TEMP/qa-bootstrap-user.npmrc"
-          : > "$RUNNER_TEMP/qa-bootstrap-global.npmrc"
-          env -i \
-            PATH="$PATH" \
-            HOME="$RUNNER_TEMP/qa-bootstrap-home" \
-            CI=true \
-            NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/qa-bootstrap-user.npmrc" \
-            NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/qa-bootstrap-global.npmrc" \
-            NPM_CONFIG_CACHE="$RUNNER_TEMP/qa-bootstrap-cache" \
-            npm ci --include=dev --ignore-scripts --no-audit --no-fund \
-              --registry https://registry.npmjs.org/
-
-      - name: Test the exact proposed packages through loopback Verdaccio
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+      - name: Emit a fixed read-only Ready QA wake-up
         run: >-
-          node scripts/qa-ready-release.mjs
-          --authority github-current
-          --repository "$EXPECTED_REPOSITORY"
-          --event-name "$GITHUB_EVENT_NAME"
-          --event-path "$GITHUB_EVENT_PATH"
-          --evidence "$RUNNER_TEMP/ready-release-qa.json"
-
-      - name: Retain sanitized exact-snapshot evidence
-        uses: actions/upload-artifact@v6
-        with:
-          name: ready-release-qa-${{ github.event.pull_request.head.sha || github.sha }}
-          path: ${{ runner.temp }}/ready-release-qa.json
-          if-no-files-found: error
-          retention-days: 7
+          test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01" &&
+          test "$GITHUB_EVENT_NAME" = "pull_request"
