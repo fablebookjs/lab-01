@@ -31,9 +31,9 @@ draft `1.0.2` PR #44 are retained.
   [run 29490566032](https://github.com/fablebookjs/lab-01/actions/runs/29490566032)
   made zero mutations on convergence.
 
-## Installation prerequisite and maintainer seam
+## Installed maintainer seam
 
-This release-line candidate integrates the separately reviewed maintainer
+This release line integrates the separately reviewed maintainer
 handoff with the installed finalizer observer. The workflow and both H/J and
 next-proposal handoffs have now run; the remaining sections preserve the exact
 operator contract and rerun semantics.
@@ -162,10 +162,12 @@ identity permanently stops before reconciliation.
 
 ## Reconciliation and recovery
 
-Normal late work is one first-parent commit H over M. H must be absent from V;
-`git merge-tree H V` must be clean. Normal J has that exact tree, ordered
-parents `[H,V]`, and deterministic structured metadata. Every push has an exact
-old-to-new lease; stale rejection refetches complete state.
+Normal late work is either one first-parent commit H over M or the demonstrated
+ordinary merge `H=[M,P]`, where patch P has sole parent M and H has P's exact
+tree. H must be absent from V; `git merge-tree H V` must be clean. Normal J has
+that exact tree, ordered parents `[H,V]`, and deterministic structured metadata.
+Every push has an exact old-to-new lease; stale rejection refetches complete
+state.
 
 A real conflict is never repaired here. The finalizer points to the retained
 issue #15 proof. Recorded recovery is exact `recovery/v1.0/1.0.1 = H`, where H

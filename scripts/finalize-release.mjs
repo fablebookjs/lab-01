@@ -264,7 +264,7 @@ export function nextProposalBody(state) {
     `- Merge the current green proposal to authorize publication.\n` +
     `- Close an unmerged proposal to request one clean replacement draft.\n\n` +
     `The ${TAG_NAME} tag remains bound to snapshot \`${state.graph.snapshot.sha}\`; the commits above were not part of ${RELEASE_VERSION}.\n\n` +
-    `See [docs/release-process.md](https://github.com/${REPOSITORY}/blob/${RELEASE_LINE}/docs/release-process.md) for the current contract and safety boundary.`;
+    `See [docs/release-process.md](https://github.com/${REPOSITORY}/blob/main/docs/release-process.md) for the current contract and safety boundary.`;
 }
 
 export function githubReleaseBody(state) {
