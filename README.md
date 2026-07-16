@@ -112,6 +112,8 @@ their accepted release-line source candidate. The manual operator-only exact
 the immutable tagged baseline, and an external consumer installed them
 together successfully. The `npm-publish` environment exists with no secrets or
 reviewers and permits only `main`. Current staged QA is successful; configuring
-the exact trusted publisher on both npm package pages is the remaining external
-npm gate. No `1.0.1` snapshot, publication, reconciliation, tag, GitHub
-Release, or next proposal is claimed.
+the exact trusted publisher on both npm package pages is complete. Each package
+allows only `npm publish` from `fablebookjs/lab-01` workflow `publish-npm.yml`
+and environment `npm-publish`, and requires 2FA while disallowing traditional
+tokens. No `1.0.1` snapshot, publication, reconciliation, tag, GitHub Release,
+or next proposal is claimed.
