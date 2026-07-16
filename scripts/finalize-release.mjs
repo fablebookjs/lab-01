@@ -12,6 +12,7 @@ import {
   REPOSITORY_URL,
   SNAPSHOT_REF,
   STAGED_LINE,
+  assertSafeGitConfiguration,
   assertSha,
   deriveTrustedSnapshotAuthority,
   fail,
@@ -749,7 +750,7 @@ export async function observeDurableState({ gitAdapter, githubAdapter, npmAdapte
       const state = pullState(pull);
       if (state === 'closed-merged') fail('a 1.0.2 proposal is already merged during 1.0.1 finalization');
       if (
-        pull.draft !== true ||
+        (state === 'open' ? pull.draft !== true : typeof pull.draft !== 'boolean') ||
         pull.head.sha !== stagedSha ||
         pull.base.sha !== line.headSha ||
         pull.title !== expectedTitle ||
@@ -1410,7 +1411,8 @@ function assertClosedHttpEnvironment() {
 }
 
 function runGit(args, { cwd = process.cwd(), input, env = {}, allowFailure = false } = {}) {
-  const result = spawnSync('git', args, {
+  const safeArgs = args[0] === '--no-replace-objects' ? args : ['--no-replace-objects', ...args];
+  const result = spawnSync('git', safeArgs, {
     cwd,
     encoding: 'utf8',
     input,
@@ -1454,6 +1456,9 @@ export class LiveGitAdapter {
   }
 
   assertClosedTransport() {
+    // This local-only gate must run before any remote advertisement or API/npm
+    // read. It rejects both replacement refs and alternate object databases.
+    assertSafeGitConfiguration(this.cwd);
     const hostile = hostileEnvironmentKeys(HOSTILE_GIT_ENVIRONMENT);
     if (hostile.length > 0) fail(`hostile inherited Git environment: ${hostile.sort().join(', ')}`);
     const localResult = runGit(['config', '--local', '--null', '--list', '--includes'], { cwd: this.cwd, allowFailure: true });
@@ -1654,7 +1659,21 @@ export class LiveGitAdapter {
     if (context) await this.assertTrustedMain(context);
     const args = buildLeasedPushArguments(ref, expected, next);
     this.operations.push({ transport: 'git', method: 'push', mutation: true, repository: REPOSITORY, ref, expected, next });
-    const result = runGit(args, { cwd: this.cwd, allowFailure: true });
+    if (!process.env.GITHUB_TOKEN) fail('GITHUB_TOKEN is required for guarded finalizer Git writes');
+    const authorization = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${process.env.GITHUB_TOKEN}`).toString('base64')}`;
+    const result = runGit(args, {
+      cwd: this.cwd,
+      allowFailure: true,
+      env: {
+        GIT_CONFIG_COUNT: '3',
+        GIT_CONFIG_KEY_0: 'credential.helper',
+        GIT_CONFIG_VALUE_0: '',
+        GIT_CONFIG_KEY_1: 'push.followTags',
+        GIT_CONFIG_VALUE_1: 'false',
+        GIT_CONFIG_KEY_2: 'http.https://github.com/.extraheader',
+        GIT_CONFIG_VALUE_2: authorization,
+      },
+    });
     const refLines = result.stdout.split('\n').filter((line) => /^[!*=+ -]\t/.test(line));
     if (result.status !== 0) {
       const exact = `!\t${next}:${ref}\t[rejected] (stale info)`;

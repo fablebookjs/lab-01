@@ -14,6 +14,8 @@ export const BASE_VERSION = '1.0.0';
 export const RELEASE_VERSION = '1.0.1';
 export const REGISTRY = 'https://registry.npmjs.org/';
 export const REPOSITORY_URL = 'git+https://github.com/fablebookjs/lab-01.git';
+export const REPOSITORY_ID = '1301358254';
+export const REPOSITORY_OWNER_ID = '304851919';
 export const NPM_VERSION = '11.18.0';
 export const PACKAGE_SPECS = Object.freeze([
   Object.freeze({
@@ -41,12 +43,80 @@ const SHA = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const SHASUM = /^[0-9a-f]{40}$/;
 const INTEGRITY = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
+const POSITIVE_DECIMAL = /^[1-9]\d*$/;
+const PUBLISH_WORKFLOW_REF = `${REPOSITORY}/.github/workflows/publish-npm.yml@refs/heads/main`;
 
 export const fail = (code) => {
   const error = new Error(code);
   error.code = code;
   throw error;
 };
+
+export function githubProvenanceClaims(environment = process.env) {
+  const required = [
+    'ACTIONS_ID_TOKEN_REQUEST_URL',
+    'ACTIONS_ID_TOKEN_REQUEST_TOKEN',
+    'GITHUB_ACTIONS',
+    'GITHUB_EVENT_NAME',
+    'GITHUB_REF',
+    'GITHUB_REF_NAME',
+    'GITHUB_REPOSITORY',
+    'GITHUB_REPOSITORY_ID',
+    'GITHUB_REPOSITORY_OWNER_ID',
+    'GITHUB_RUN_ATTEMPT',
+    'GITHUB_RUN_ID',
+    'GITHUB_RUN_NUMBER',
+    'GITHUB_SERVER_URL',
+    'GITHUB_SHA',
+    'GITHUB_WORKFLOW',
+    'GITHUB_WORKFLOW_REF',
+    'GITHUB_WORKFLOW_SHA',
+    'RUNNER_ENVIRONMENT',
+  ];
+  if (required.some((key) => typeof environment[key] !== 'string' || environment[key] === '')) {
+    fail('GitHub OIDC provenance environment is incomplete');
+  }
+  let tokenUrl;
+  try { tokenUrl = new URL(environment.ACTIONS_ID_TOKEN_REQUEST_URL); }
+  catch { fail('GitHub OIDC token request URL is malformed'); }
+  if (tokenUrl.protocol !== 'https:') fail('GitHub OIDC token request URL is malformed');
+  if (
+    environment.GITHUB_ACTIONS !== 'true' ||
+    environment.GITHUB_EVENT_NAME !== 'workflow_dispatch' ||
+    environment.GITHUB_REF !== 'refs/heads/main' ||
+    environment.GITHUB_REF_NAME !== 'main' ||
+    environment.GITHUB_REPOSITORY !== REPOSITORY ||
+    environment.GITHUB_REPOSITORY_ID !== REPOSITORY_ID ||
+    environment.GITHUB_REPOSITORY_OWNER_ID !== REPOSITORY_OWNER_ID ||
+    environment.GITHUB_SERVER_URL !== 'https://github.com' ||
+    environment.GITHUB_WORKFLOW !== 'Publish npm package' ||
+    environment.GITHUB_WORKFLOW_REF !== PUBLISH_WORKFLOW_REF ||
+    environment.GITHUB_WORKFLOW_SHA !== environment.GITHUB_SHA ||
+    environment.RUNNER_ENVIRONMENT !== 'github-hosted' ||
+    !SHA.test(environment.GITHUB_SHA) ||
+    ![environment.GITHUB_RUN_ATTEMPT, environment.GITHUB_RUN_ID, environment.GITHUB_RUN_NUMBER].every((value) => POSITIVE_DECIMAL.test(value))
+  ) {
+    fail('GitHub OIDC publication identity is incompatible');
+  }
+  return {
+    workflow: {
+      ref: 'refs/heads/main',
+      repository: `${environment.GITHUB_SERVER_URL}/${environment.GITHUB_REPOSITORY}`,
+      path: '.github/workflows/publish-npm.yml',
+    },
+    github: {
+      event_name: environment.GITHUB_EVENT_NAME,
+      repository_id: environment.GITHUB_REPOSITORY_ID,
+      repository_owner_id: environment.GITHUB_REPOSITORY_OWNER_ID,
+    },
+    dependency: {
+      uri: `git+${environment.GITHUB_SERVER_URL}/${environment.GITHUB_REPOSITORY}@${environment.GITHUB_REF}`,
+      digest: { gitCommit: environment.GITHUB_SHA },
+    },
+    builder: { id: `https://github.com/actions/runner/${environment.RUNNER_ENVIRONMENT}` },
+    invocationId: `${environment.GITHUB_SERVER_URL}/${environment.GITHUB_REPOSITORY}/actions/runs/${environment.GITHUB_RUN_ID}/attempts/${environment.GITHUB_RUN_ATTEMPT}`,
+  };
+}
 
 export function assertSha(value, label) {
   if (!SHA.test(value ?? '')) fail(`${label} must be a full lowercase SHA`);
@@ -442,14 +512,7 @@ export async function createClosedNpmEnvironment(tempRoot, { oidc = false } = {}
     NPM_CONFIG_FETCH_RETRIES: '0',
   };
   if (oidc) {
-    if (
-      process.env.GITHUB_ACTIONS !== 'true' ||
-      process.env.GITHUB_REPOSITORY !== REPOSITORY ||
-      process.env.RUNNER_ENVIRONMENT !== 'github-hosted' ||
-      !process.env.GITHUB_WORKFLOW_REF?.includes('/.github/workflows/publish-npm.yml@')
-    ) {
-      fail('GitHub OIDC publication identity is incompatible');
-    }
+    githubProvenanceClaims();
     const githubEnvironment = [
       'ACTIONS_ID_TOKEN_REQUEST_URL',
       'ACTIONS_ID_TOKEN_REQUEST_TOKEN',
@@ -459,10 +522,12 @@ export async function createClosedNpmEnvironment(tempRoot, { oidc = false } = {}
       'GITHUB_REF_NAME',
       'GITHUB_REPOSITORY',
       'GITHUB_REPOSITORY_ID',
+      'GITHUB_REPOSITORY_OWNER_ID',
       'GITHUB_RUN_ATTEMPT',
       'GITHUB_RUN_ID',
       'GITHUB_RUN_NUMBER',
       'GITHUB_SHA',
+      'GITHUB_SERVER_URL',
       'GITHUB_WORKFLOW',
       'GITHUB_WORKFLOW_REF',
       'GITHUB_WORKFLOW_SHA',

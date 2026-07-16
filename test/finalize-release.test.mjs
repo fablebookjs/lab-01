@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -727,6 +727,10 @@ test('closed next proposals regenerate once, while duplicates and merged/wrong i
   value.gitAdapter.refs[PROPOSAL_ATTEMPT_REF] = { sha: ids.nextIntent, type: 'commit' };
   assert.equal(classifyNextAction(await observe(value)).type, 'reauthorize-next-proposal-after-close');
 
+  value.githubAdapter.pulls.at(-1).draft = false;
+  assert.equal(classifyNextAction(await observe(value)).type, 'reauthorize-next-proposal-after-close');
+  value.githubAdapter.pulls.at(-1).draft = true;
+
   const duplicate = fixture();
   duplicate.githubAdapter.pulls.push(structuredClone(duplicate.githubAdapter.pulls[0]));
   await assert.rejects(observe(duplicate), /duplicate pull request number/);
@@ -1151,8 +1155,14 @@ test('Git, GitHub, and npm adapters reject hostile configuration and destination
   try {
     execFileSync('git', ['init', root], { stdio: 'ignore' });
     execFileSync('git', ['-C', root, 'remote', 'add', 'origin', 'https://github.com/fablebookjs/lab-01.git']);
+    execFileSync('git', ['-C', root, 'config', 'user.name', 'Test']);
+    execFileSync('git', ['-C', root, 'config', 'user.email', 'test@example.invalid']);
+    execFileSync('git', ['-C', root, 'commit', '--allow-empty', '-m', 'first'], { stdio: 'ignore' });
+    const firstCommit = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    execFileSync('git', ['-C', root, 'commit', '--allow-empty', '-m', 'second'], { stdio: 'ignore' });
+    const secondCommit = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
     execFileSync('git', ['-C', root, 'config', 'push.followTags', 'true']);
-    assert.throws(() => new LiveGitAdapter({ cwd: root }).assertClosedTransport(), /non-allowlisted setting/);
+    assert.throws(() => new LiveGitAdapter({ cwd: root }).assertClosedTransport(), /UNSAFE_GIT_CONFIG|non-allowlisted setting/);
     execFileSync('git', ['-C', root, 'config', '--unset', 'push.followTags']);
     for (const [key, value] of [
       ['http.proxy', 'http://127.0.0.1:1'],
@@ -1169,7 +1179,7 @@ test('Git, GitHub, and npm adapters reject hostile configuration and destination
       ['url.https://attacker.invalid/.insteadOf', 'https://github.com/'],
     ]) {
       execFileSync('git', ['-C', root, 'config', key, value]);
-      assert.throws(() => new LiveGitAdapter({ cwd: root }).assertClosedTransport(), /non-allowlisted setting|rewriting is forbidden/);
+      assert.throws(() => new LiveGitAdapter({ cwd: root }).assertClosedTransport(), /UNSAFE_GIT_CONFIG|non-allowlisted setting|rewriting is forbidden/);
       execFileSync('git', ['-C', root, 'config', '--unset-all', key]);
     }
     process.env.GIT_EXEC_PATH = '/tmp/hostile-git-exec';
@@ -1197,7 +1207,29 @@ test('Git, GitHub, and npm adapters reject hostile configuration and destination
       githubAdapter: neverGitHub,
       npmAdapter: neverNpm,
       context: { enforceTrustedMain: false },
-    }), /non-allowlisted setting/);
+    }), /UNSAFE_GIT_CONFIG|non-allowlisted setting/);
+    assert.equal(apiReads, 0);
+
+    execFileSync('git', ['-C', root, 'config', '--unset', 'http.sslVerify']);
+    execFileSync('git', ['-C', root, 'replace', firstCommit, secondCommit]);
+    await assert.rejects(observeDurableState({
+      gitAdapter: new LiveGitAdapter({ cwd: root }),
+      githubAdapter: neverGitHub,
+      npmAdapter: neverNpm,
+      context: { enforceTrustedMain: false },
+    }), /GIT_REPLACE_REFS_PROHIBITED/);
+    assert.equal(apiReads, 0);
+    execFileSync('git', ['-C', root, 'replace', '-d', firstCommit]);
+
+    const alternateDirectory = join(root, '.git', 'objects', 'info');
+    await mkdir(alternateDirectory, { recursive: true });
+    await writeFile(join(alternateDirectory, 'alternates'), '/tmp/hostile-object-database\n');
+    await assert.rejects(observeDurableState({
+      gitAdapter: new LiveGitAdapter({ cwd: root }),
+      githubAdapter: neverGitHub,
+      npmAdapter: neverNpm,
+      context: { enforceTrustedMain: false },
+    }), /GIT_ALTERNATES_PROHIBITED/);
     assert.equal(apiReads, 0);
   } finally {
     if (oldGitExecPath === undefined) delete process.env.GIT_EXEC_PATH;

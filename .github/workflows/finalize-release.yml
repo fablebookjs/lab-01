@@ -31,6 +31,7 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
           ref: main
 
       - name: Install the fixed Node runtime
