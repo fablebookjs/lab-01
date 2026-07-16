@@ -478,7 +478,7 @@ const EXPECTED_STATE_WORKFLOW = {
         },
         {
           name: 'Check out trusted main code',
-          uses: 'actions/checkout@v7',
+          uses: 'actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10',
           with: { 'fetch-depth': 0, 'persist-credentials': false, ref: '${{ github.sha }}' },
         },
         {
@@ -513,7 +513,7 @@ const EXPECTED_CHECK_WORKFLOW = {
       steps: [
         {
           name: 'Check out the exact trusted calibration base',
-          uses: 'actions/checkout@v7',
+          uses: 'actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10',
           with: {
             'fetch-depth': 1,
             'persist-credentials': false,

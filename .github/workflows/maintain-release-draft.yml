@@ -1,11 +1,9 @@
-name: Ready release QA signal
+name: Release maintenance signal
 
 on:
-  pull_request:
+  push:
     branches:
       - releases/v1.0
-    types:
-      - ready_for_review
 
 permissions: {}
 
@@ -14,7 +12,8 @@ jobs:
     if: github.repository == 'fablebookjs/lab-01'
     runs-on: ubuntu-24.04
     steps:
-      - name: Emit a fixed read-only Ready QA wake-up
+      - name: Emit a fixed read-only release maintenance wake-up
         run: >-
           test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01" &&
-          test "$GITHUB_EVENT_NAME" = "pull_request"
+          test "$GITHUB_EVENT_NAME" = "push" &&
+          test "$GITHUB_REF" = "refs/heads/releases/v1.0"

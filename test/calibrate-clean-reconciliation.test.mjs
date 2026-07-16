@@ -153,7 +153,7 @@ test('the workflow is manual, main-bound, and has only contents write authority'
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /contents: write/);
   assert.match(workflow, /test "\$GITHUB_REF" = "refs\/heads\/main"/);
-  assert.match(workflow, /actions\/checkout@v7/);
+  assert.match(workflow, /actions\/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6/);
   assert.match(workflow, /persist-credentials: true/);
   assert.match(workflow, /ref: \$\{\{ github\.sha \}\}/);
   assert.doesNotMatch(workflow, /pull-requests:|issues:|packages:|secrets\.GITHUB_TOKEN/);
