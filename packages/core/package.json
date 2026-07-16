@@ -1,6 +1,6 @@
 {
   "name": "@fablebook/lab-01-core",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "exports": "./src/index.js",
   "files": [
