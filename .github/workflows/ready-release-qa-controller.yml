@@ -1,0 +1,70 @@
+name: Ready release QA controller
+
+on:
+  workflow_run:
+    workflows:
+      - Ready release QA signal
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ready-release-qa-controller-v1.0
+  cancel-in-progress: true
+
+jobs:
+  exact-version-qa:
+    if: >-
+      github.repository == 'fablebookjs/lab-01' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out the exact trusted default-main QA controller
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: false
+          persist-credentials: false
+          ref: ${{ github.workflow_sha }}
+
+      - name: Install pinned Node without package-manager cache
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Bootstrap closed npm and trusted QA tooling outside candidate data
+        run: >-
+          node scripts/bootstrap-npm-cli.mjs
+          --repository-root "$GITHUB_WORKSPACE"
+          --path-file "$GITHUB_PATH"
+          --project-tools
+
+      - name: Derive current authority and test staged/source as inert data
+        id: qa
+        env:
+          EXPECTED_DISPATCH_SHA: ${{ github.sha }}
+          EXPECTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          LAB_01_TRUSTED_TOOL_ROOT: ${{ github.workspace }}
+        run: >-
+          node scripts/qa-ready-release.mjs
+          --authority github-current
+          --repository fablebookjs/lab-01
+          --event-name "$GITHUB_EVENT_NAME"
+          --event-path "$GITHUB_EVENT_PATH"
+          --evidence "$RUNNER_TEMP/ready-release-qa.json"
+
+      - name: Retain sanitized exact-snapshot evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ready-release-qa-${{ steps.qa.outputs.staged_sha || github.run_id }}
+          path: ${{ runner.temp }}/ready-release-qa.json
+          if-no-files-found: warn
+          retention-days: 30

@@ -1115,7 +1115,7 @@ test('workflows are manual trusted-main jobs with fixed non-cancelling concurren
     assert.match(yaml, /test "\$GITHUB_REPOSITORY" = "fablebookjs\/lab-01"/);
     assert.match(yaml, /test "\$GITHUB_EVENT_NAME" = "workflow_dispatch"/);
     assert.match(yaml, /test "\$GITHUB_REF" = "refs\/heads\/main"/);
-    assert.match(yaml, /actions\/checkout@v7/);
+    assert.match(yaml, /actions\/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6/);
     assert.match(yaml, /persist-credentials: false/);
     assert.match(yaml, /ref: \$\{\{ github\.sha \}\}/);
     assert.doesNotMatch(yaml, /pull_request(?:_target)?:|schedule:|push:|issues:|packages:|actions:|id-token:/);

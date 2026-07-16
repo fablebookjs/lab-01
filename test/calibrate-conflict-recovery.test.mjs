@@ -1559,7 +1559,7 @@ test('workflow is manual, trusted-main-only, fixed-concurrency, and minimally pe
   );
   assert.match(workflow, /group: calibration-g1-conflict-recovery\n/);
   assert.match(workflow, /test "\$GITHUB_REF" = "refs\/heads\/main"/);
-  assert.match(workflow, /actions\/checkout@v7/);
+  assert.match(workflow, /actions\/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6/);
   assert.match(workflow, /persist-credentials: true/);
   assert.match(workflow, /ref: \$\{\{ github\.sha \}\}/);
   assert.match(workflow, /continue-on-error: true/);

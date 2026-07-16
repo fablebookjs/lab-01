@@ -1,32 +1,18 @@
-name: Regenerate closed release draft
+name: Release regeneration signal
 
 on:
   pull_request_target:
     types:
       - closed
 
-permissions:
-  contents: write
-  pull-requests: write
-
-concurrency:
-  group: maintain-release-draft-v1.0
-  cancel-in-progress: false
+permissions: {}
 
 jobs:
-  regenerate:
-    runs-on: ubuntu-latest
+  signal:
+    if: github.repository == 'fablebookjs/lab-01'
+    runs-on: ubuntu-24.04
     steps:
-      - name: Assert the laboratory repository
-        run: test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01"
-
-      - name: Check out trusted release-line code
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          ref: releases/v1.0
-
-      - name: Reconcile the closed release draft
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node scripts/regenerate-release-draft.mjs
+      - name: Emit a fixed read-only close wake-up
+        run: >-
+          test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01" &&
+          test "$GITHUB_EVENT_NAME" = "pull_request_target"

@@ -1,0 +1,73 @@
+name: Prepare release snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_pr:
+        description: Expected latest merged staged release PR number
+        required: true
+        type: string
+      qa_run:
+        description: Optional expectation for the latest successful exact-head ready-QA run
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: prepare-release-snapshot-v1.0.1
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'fablebookjs/lab-01' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Check out exact trusted default-main controller
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: false
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Install pinned Node without package-manager cache
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Bootstrap closed npm and trusted QA tooling outside the project
+        run: >-
+          node scripts/bootstrap-npm-cli.mjs
+          --repository-root "$GITHUB_WORKSPACE"
+          --path-file "$GITHUB_PATH"
+          --project-tools
+
+      - name: Reconstruct QA and create or reuse exact deterministic V
+        env:
+          EXPECTED_DISPATCH_SHA: ${{ github.sha }}
+          EXPECTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_PR: ${{ inputs.release_pr }}
+          QA_RUN: ${{ inputs.qa_run }}
+          LAB_01_TRUSTED_TOOL_ROOT: ${{ github.workspace }}
+        run: >-
+          node scripts/prepare-release-snapshot.mjs
+          --repository fablebookjs/lab-01
+          --release-pr "$RELEASE_PR"
+          --qa-run "$QA_RUN"
+          --evidence "$RUNNER_TEMP/prepare-release-snapshot.json"
+
+      - name: Retain sanitized snapshot evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: prepare-release-snapshot-${{ github.run_id }}
+          path: ${{ runner.temp }}/prepare-release-snapshot.json
+          if-no-files-found: warn
+          retention-days: 30
