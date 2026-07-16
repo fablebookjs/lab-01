@@ -1,8 +1,14 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { appendFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
-import { parseSnapshotMessage } from './release-publication.mjs';
+import { observeMaintainerPostMerge, reconciliationMessage } from './finalize-release.mjs';
+import {
+  closedGitEnvironment,
+  deriveTrustedSnapshotAuthority,
+  git as closedGit,
+  parseSnapshotMessage,
+} from './release-publication.mjs';
 
 const REPOSITORY = 'fablebookjs/lab-01';
 const RELEASE_LINE = 'releases/v1.0';
@@ -95,9 +101,9 @@ ${commits}
 
 Automatic release-PR maintenance is live. A push to \`${RELEASE_LINE}\` refreshes this same PR from the exact new release-line head while preserving its number, base, head, and draft-or-ready review state.
 
-Ready-state exact-version QA is live. Marking the current proposal ready runs QA for that exact head. When a ready proposal refreshes, release-PR maintenance explicitly dispatches QA for the new staged head because GitHub leaves token-authored synchronize runs approval-required. The first ready proof is [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684), and the first automatically refreshed-head proof is [run 29414043206](https://github.com/fablebookjs/lab-01/actions/runs/29414043206). Close-and-regenerate is live: [run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336) closed historical PR #1, created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12), and converged on that same replacement when rerun. The manual operator-only exact \`1.0.0\` bootstrap and trusted-main \`V\`/direct-OIDC publisher exist only in this offline changeset: the bootstrap has not published, and the trusted publisher is not installed or live. Public baseline packages, npm trusted-publisher settings, the GitHub environment, and current-head QA remain external gates.
+Ready-state exact-version QA is live. Marking the current proposal ready runs QA for that exact head. When a ready proposal refreshes, release-PR maintenance explicitly dispatches QA for the new staged head because GitHub leaves token-authored synchronize runs approval-required. The first ready proof is [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684), and the first automatically refreshed-head proof is [run 29414043206](https://github.com/fablebookjs/lab-01/actions/runs/29414043206). Close-and-regenerate is live: [run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336) closed historical PR #1, created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12), and converged on that same replacement when rerun. The manual operator-only exact \`1.0.0\` bootstrap, trusted-main \`V\`/direct-OIDC publisher, and finalizer/H/J handoff exist only in this offline changeset: the bootstrap has not published, and the publisher and finalizer are not installed or live. Public baseline packages, npm trusted-publisher settings, the GitHub environment, and current-head QA remain external gates.
 
-This maintainer never publishes, reconciles the release line, tags, or creates a GitHub Release. It validates the open \`1.0.1\` proposal, sealed merge \`M\`, the exact deterministic \`V\` snapshot, and an exact draft \`1.0.2\` proposal without crossing ownership boundaries. H/J ownership intentionally fails closed until the finalizer provides a committed durable observer/schema. No finalizer is installed by this changeset, so the issue #19 operator gate remains closed while the external gates are unmet.
+This maintainer never publishes, reconciles the release line, tags, or creates a GitHub Release. It validates the open \`1.0.1\` proposal, sealed merge \`M\`, the exact deterministic \`V\` snapshot, concrete \`H\` and deterministic \`J\` through the trusted finalizer observer, and an exact draft \`1.0.2\` proposal without crossing ownership boundaries. Caller-supplied H/J facts are rejected; two complete ownership snapshots rederive and reclassify the durable graph. The finalizer workflow is not installed or live, so the issue #19 operator gate remains closed while the external gates are unmet.
 
 See [docs/release-process.md](https://github.com/${REPOSITORY}/blob/${RELEASE_LINE}/docs/release-process.md) for the current contract and safety boundary.`;
 }
@@ -303,20 +309,93 @@ function validateSnapshot(snapshot, { source, intent, merge }) {
   return commit;
 }
 
-// Integration seam for the finalizer ticket: replace this fail-closed function
-// with a concrete imported Git observer that consumes only the already
-// validated repository evidence below and validates the finalizer's committed
-// H/J schema. Caller-authored observer facts are not accepted here.
-function classifyPostMergeOwnershipFromDurableGit({ releaseHeadSha, source, intent, merge, snapshot }) {
-  void releaseHeadSha;
-  void source;
-  void intent;
-  void merge;
-  void snapshot;
-  fail('post-M H/J ownership awaits a concrete durable finalizer observer');
+// Only the imported finalizer observer may supply this private H/J marker.
+// The public classifier never accepts caller-authored observer facts.
+function assertExactKeys(value, expected, label) {
+  const actual = Object.keys(value ?? {}).sort();
+  const wanted = [...expected].sort();
+  if (JSON.stringify(actual) !== JSON.stringify(wanted)) fail(`${label} has unexpected fields`);
 }
 
-export function classifyMaintainerOwnership(observation) {
+function classifyPostMergeOwnershipFromDurableGit(marker, { releaseHeadSha, merge, snapshot }, observation) {
+  if (marker === null) fail('post-M H/J ownership requires the concrete durable finalizer observer');
+  if (snapshot === null) fail('post-M H/J ownership requires exact deterministic V');
+  const common = {
+    observer: 'issue-19-finalizer',
+    schemaVersion: 1,
+    line: RELEASE_LINE,
+    version: RELEASE_VERSION,
+    mergeSha: merge.sha,
+    headSha: releaseHeadSha,
+    snapshotSha: snapshot.sha,
+  };
+  for (const [key, value] of Object.entries(common)) {
+    if (marker?.[key] !== value) fail(`post-M finalizer observation has an invalid ${key}`);
+  }
+
+  const head = requireCommit(observation, releaseHeadSha, 'post-M release head');
+  if (marker.kind === 'late-head') {
+    assertExactKeys(marker, [...Object.keys(common), 'kind', 'verifiedMergeSha'], 'post-M H observation');
+    if (
+      marker.verifiedMergeSha !== merge.sha ||
+      head.parents.length !== 1 ||
+      head.parents[0] !== merge.sha ||
+      head.sha === snapshot.sha
+    ) {
+      fail('post-M H observation is not one exact late head over M');
+    }
+    return { owner: 'finalizer-owns-release', state: 'late-head', mergeSha: merge.sha, headSha: head.sha };
+  }
+
+  if (marker.kind === 'normal-reconciliation') {
+    assertExactKeys(
+      marker,
+      [...Object.keys(common), 'kind', 'lateHeadSha', 'expectedTreeSha', 'metadata'],
+      'post-M J observation',
+    );
+    const late = requireCommit(observation, marker.lateHeadSha, 'post-M late head');
+    assertExactKeys(
+      marker.metadata,
+      ['schemaVersion', 'line', 'version', 'mergeSha', 'snapshotSha', 'lateHeadSha'],
+      'post-M J metadata',
+    );
+    if (
+      late.parents.length !== 1 ||
+      late.parents[0] !== merge.sha ||
+      head.parents.length !== 2 ||
+      head.parents[0] !== late.sha ||
+      head.parents[1] !== snapshot.sha ||
+      marker.expectedTreeSha !== head.commitTree ||
+      marker.metadata.schemaVersion !== 1 ||
+      marker.metadata.line !== RELEASE_LINE ||
+      marker.metadata.version !== RELEASE_VERSION ||
+      marker.metadata.mergeSha !== merge.sha ||
+      marker.metadata.snapshotSha !== snapshot.sha ||
+      marker.metadata.lateHeadSha !== late.sha ||
+      head.message.trimEnd() !== reconciliationMessage({
+        mergeSha: merge.sha,
+        lateSha: late.sha,
+        snapshotSha: snapshot.sha,
+      }).trimEnd()
+    ) {
+      fail('post-M J observation is not the exact deterministic normal reconciliation');
+    }
+    return {
+      owner: 'finalizer-owns-release',
+      state: 'normal-reconciliation',
+      mergeSha: merge.sha,
+      headSha: head.sha,
+      lateHeadSha: late.sha,
+    };
+  }
+
+  fail('post-M finalizer observation accepts only exact H or normal J');
+}
+
+function classifyMaintainerOwnershipInternal(
+  observation,
+  { trustedPostMerge = null, allowPostMergePending = false } = {},
+) {
   if (!SHA_PATTERN.test(observation?.releaseHeadSha ?? '') || !SHA_PATTERN.test(observation?.stagedSha ?? '')) {
     fail('maintainer observation has an invalid current ref SHA');
   }
@@ -374,13 +453,18 @@ export function classifyMaintainerOwnership(observation) {
   if (context.snapshot !== null && observation.releaseHeadSha === context.snapshot.sha) {
     return { owner: 'finalizer-owns-release', state: 'version-snapshot', mergeSha: context.merge.sha };
   }
-  return classifyPostMergeOwnershipFromDurableGit({
+  if (allowPostMergePending && trustedPostMerge === null) {
+    return { owner: 'post-merge-observer-required', state: 'pending', context };
+  }
+  return classifyPostMergeOwnershipFromDurableGit(trustedPostMerge, {
     releaseHeadSha: observation.releaseHeadSha,
-    source: context.source,
-    intent: context.intent,
     merge: context.merge,
     snapshot: context.snapshot,
-  });
+  }, observation);
+}
+
+export function classifyMaintainerOwnership(observation) {
+  return classifyMaintainerOwnershipInternal(observation);
 }
 
 export async function settleMaintainerOwnership({ observation, effects }) {
@@ -553,6 +637,152 @@ function refreshObservedRefs() {
   return { releaseHeadSha, stagedSha };
 }
 
+function finalizerCommitShape(sha) {
+  if (!SHA_PATTERN.test(sha ?? '')) fail('finalizer Git adapter requires a full commit SHA');
+  const row = closedGit(process.cwd(), 'rev-list', '--parents', '-n', '1', sha).split(' ');
+  return {
+    sha,
+    parents: row.slice(1),
+    tree: closedGit(process.cwd(), 'rev-parse', `${sha}^{tree}`),
+    message: `${closedGit(process.cwd(), 'show', '-s', '--format=%B', sha).trimEnd()}\n`,
+  };
+}
+
+function maintainerCommitShape(commit) {
+  return {
+    sha: commit.sha,
+    parents: [...commit.parents],
+    commitTree: commit.tree,
+    parentTree: '',
+    message: commit.message.trimEnd(),
+  };
+}
+
+function runClosedGitStatus(args) {
+  return spawnSync('git', ['--no-replace-objects', ...args], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    env: closedGitEnvironment(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+export function createMaintainerFinalizerGitAdapter() {
+  return {
+    async listRefs() {
+      const { releaseHeadSha, stagedSha } = refreshObservedRefs();
+      const snapshot = readSnapshotObservation();
+      if (snapshot === null) fail('maintainer finalizer observer requires the exact V locator');
+      return {
+        [`refs/heads/${RELEASE_LINE}`]: { sha: releaseHeadSha, type: 'commit' },
+        [`refs/heads/${STAGED_LINE}`]: { sha: stagedSha, type: 'commit' },
+        [`refs/heads/${SNAPSHOT_REF}`]: { sha: snapshot.sha, type: 'commit' },
+      };
+    },
+
+    async acceptedSnapshot(snapshotSha) {
+      const { source, intent, merge, snapshot, tree, contentSha256, packages } =
+        await deriveTrustedSnapshotAuthority(process.cwd(), snapshotSha);
+      return {
+        schemaVersion: 2,
+        locator: `refs/heads/${SNAPSHOT_REF}`,
+        sourceSha: source.sha,
+        stagedSha: intent.sha,
+        mergeSha: merge.sha,
+        source,
+        intent,
+        merge,
+        snapshot,
+        treeSha: tree,
+        contentSha256,
+        packages,
+        qa: {
+          kind: 'accepted-snapshot-content',
+          treeSha: tree,
+          contentSha256,
+          label: `accepted-snapshot-content:${tree}:${contentSha256}`,
+        },
+      };
+    },
+
+    async commit(sha) {
+      return finalizerCommitShape(sha);
+    },
+
+    async isAncestor(ancestor, descendant) {
+      const result = runClosedGitStatus(['merge-base', '--is-ancestor', ancestor, descendant]);
+      if (result.status === 0) return true;
+      if (result.status === 1) return false;
+      fail('maintainer finalizer observer could not determine commit ancestry');
+    },
+
+    async mergeTree(first, second) {
+      const result = runClosedGitStatus(['merge-tree', '--write-tree', first, second]);
+      if (result.status === 1) return { clean: false, tree: null };
+      if (result.status !== 0) fail('maintainer finalizer observer could not derive the merge tree');
+      const tree = result.stdout.trim().split('\n')[0];
+      if (!SHA_PATTERN.test(tree ?? '')) fail('maintainer finalizer observer produced an invalid merge tree');
+      return { clean: true, tree };
+    },
+  };
+}
+
+function exactObserverRef(refs, name) {
+  const value = refs?.[name];
+  if (!value || value.type !== 'commit' || !SHA_PATTERN.test(value.sha ?? '')) {
+    fail(`maintainer finalizer observer did not return exact ${name}`);
+  }
+  return value.sha;
+}
+
+function assertSameCommitShape(first, second, label) {
+  if (
+    first.sha !== second.sha ||
+    JSON.stringify(first.parents) !== JSON.stringify(second.parents) ||
+    first.commitTree !== second.commitTree ||
+    first.message.trimEnd() !== second.message.trimEnd()
+  ) {
+    fail(`${label} changed across observer reclassification`);
+  }
+}
+
+export async function classifyMaintainerOwnershipWithDurableObserver({ observation, gitAdapter }) {
+  const initial = classifyMaintainerOwnershipInternal(observation, { allowPostMergePending: true });
+  if (initial.owner !== 'post-merge-observer-required') return { observation, decision: initial };
+  if (initial.context.snapshot === null) fail('post-M H/J ownership requires exact deterministic V');
+
+  const marker = await observeMaintainerPostMerge({
+    gitAdapter,
+    releaseHeadSha: observation.releaseHeadSha,
+    mergeSha: initial.context.merge.sha,
+    snapshotSha: initial.context.snapshot.sha,
+  });
+  const refsAfterObserver = await gitAdapter.listRefs();
+  if (
+    exactObserverRef(refsAfterObserver, `refs/heads/${RELEASE_LINE}`) !== observation.releaseHeadSha ||
+    exactObserverRef(refsAfterObserver, `refs/heads/${STAGED_LINE}`) !== observation.stagedSha ||
+    exactObserverRef(refsAfterObserver, `refs/heads/${SNAPSHOT_REF}`) !== initial.context.snapshot.sha
+  ) {
+    fail('release refs changed between the finalizer observer and maintainer reclassification');
+  }
+
+  const commits = { ...observation.commits };
+  const rereadHead = maintainerCommitShape(await gitAdapter.commit(observation.releaseHeadSha));
+  assertSameCommitShape(
+    requireCommit(observation, observation.releaseHeadSha, 'post-M release head'),
+    rereadHead,
+    'post-M release head',
+  );
+  commits[rereadHead.sha] = rereadHead;
+  if (marker.kind === 'normal-reconciliation') {
+    const late = maintainerCommitShape(await gitAdapter.commit(marker.lateHeadSha));
+    commits[late.sha] = late;
+  }
+  const enriched = { ...observation, commits, postMerge: marker };
+  const decision = classifyMaintainerOwnershipInternal(enriched, { trustedPostMerge: marker });
+  return { observation: enriched, decision };
+}
+
 function ownershipSnapshotFingerprint(snapshot) {
   const commits = Object.fromEntries(
     Object.entries(snapshot.observation.commits)
@@ -566,6 +796,7 @@ function ownershipSnapshotFingerprint(snapshot) {
     pulls: canonicalLifecycleHistory(snapshot.observation.pulls),
     commits,
     snapshot: snapshot.observation.snapshot,
+    postMerge: snapshot.observation.postMerge ?? null,
   });
 }
 
@@ -602,7 +833,12 @@ async function readOwnershipSnapshot() {
     commits,
     snapshot,
   };
-  return { observation, decision: classifyMaintainerOwnership(observation) };
+  const initial = classifyMaintainerOwnershipInternal(observation, { allowPostMergePending: true });
+  if (initial.owner !== 'post-merge-observer-required') return { observation, decision: initial };
+  return classifyMaintainerOwnershipWithDurableObserver({
+    observation,
+    gitAdapter: createMaintainerFinalizerGitAdapter(),
+  });
 }
 
 async function emitSummary(summary) {

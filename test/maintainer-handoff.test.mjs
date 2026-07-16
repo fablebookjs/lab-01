@@ -4,9 +4,11 @@ import test from 'node:test';
 import {
   assertStableOwnershipSnapshots,
   classifyMaintainerOwnership,
+  classifyMaintainerOwnershipWithDurableObserver,
   readCompletePullHistory,
   settleMaintainerOwnership,
 } from '../scripts/maintain-release-draft.mjs';
+import { reconciliationMessage } from '../scripts/finalize-release.mjs';
 import { buildSnapshotMessage } from '../scripts/release-publication.mjs';
 
 const SOURCE = '1'.repeat(40);
@@ -20,6 +22,8 @@ const CORE_SHASUM = '8'.repeat(40);
 const ADDON_SHASUM = '9'.repeat(40);
 const SNAPSHOT_TREE = 'a'.repeat(40);
 const CONTENT_SHA256 = 'b'.repeat(64);
+const SOURCE_TREE = 'c'.repeat(40);
+const RECONCILIATION_TREE = 'd'.repeat(40);
 const REPOSITORY = 'fablebookjs/lab-01';
 const RELEASE_LINE = 'releases/v1.0';
 const STAGED_LINE = 'staged/v1.0';
@@ -76,14 +80,14 @@ const baseObservation = () => ({
   pulls: [mergedPull()],
   historyComplete: true,
   commits: {
-    [SOURCE]: commit({ sha: SOURCE, tree: 'tree-source' }),
+    [SOURCE]: commit({ sha: SOURCE, tree: SOURCE_TREE }),
     [INTENT]: commit({
       sha: INTENT,
       parents: [SOURCE],
-      tree: 'tree-source',
+      tree: SOURCE_TREE,
       message: intentMessage('1.0.1', SOURCE),
     }),
-    [MERGE]: commit({ sha: MERGE, parents: [SOURCE, INTENT], tree: 'tree-source' }),
+    [MERGE]: commit({ sha: MERGE, parents: [SOURCE, INTENT], tree: SOURCE_TREE }),
   },
   snapshot: null,
   postMerge: null,
@@ -156,6 +160,97 @@ const reconciliationObservation = () => ({
   },
 });
 
+const trustedLateObservation = () => ({
+  ...baseObservation(),
+  releaseHeadSha: LATE,
+  snapshot: snapshot(),
+  commits: {
+    ...baseObservation().commits,
+    [LATE]: commit({ sha: LATE, parents: [MERGE], tree: RECONCILIATION_TREE, message: 'fix: late work' }),
+  },
+  postMerge: null,
+});
+
+const trustedReconciliationObservation = () => ({
+  ...trustedLateObservation(),
+  releaseHeadSha: RECONCILIATION,
+  commits: {
+    ...trustedLateObservation().commits,
+    [RECONCILIATION]: commit({
+      sha: RECONCILIATION,
+      parents: [LATE, SNAPSHOT],
+      tree: RECONCILIATION_TREE,
+      message: reconciliationMessage({ mergeSha: MERGE, lateSha: LATE, snapshotSha: SNAPSHOT }),
+    }),
+  },
+});
+
+const toFinalizerCommit = (value) => ({
+  sha: value.sha,
+  parents: [...value.parents],
+  tree: value.commitTree,
+  message: `${value.message.trimEnd()}\n`,
+});
+
+function acceptedSnapshotAuthority(observation) {
+  const source = toFinalizerCommit(observation.commits[SOURCE]);
+  const intent = toFinalizerCommit(observation.commits[INTENT]);
+  const merge = toFinalizerCommit(observation.commits[MERGE]);
+  const accepted = toFinalizerCommit(observation.snapshot.commit);
+  const packages = [
+    { name: '@fablebook/lab-01-core', integrity: 'sha512-AAAA', shasum: CORE_SHASUM },
+    { name: '@fablebook/lab-01-addon', integrity: 'sha512-BBBB', shasum: ADDON_SHASUM },
+  ];
+  return {
+    schemaVersion: 2,
+    locator: 'refs/heads/release-snapshots/v1.0.1',
+    sourceSha: SOURCE,
+    stagedSha: INTENT,
+    mergeSha: MERGE,
+    source,
+    intent,
+    merge,
+    snapshot: accepted,
+    treeSha: SNAPSHOT_TREE,
+    contentSha256: CONTENT_SHA256,
+    packages,
+    qa: {
+      kind: 'accepted-snapshot-content',
+      treeSha: SNAPSHOT_TREE,
+      contentSha256: CONTENT_SHA256,
+      label: `accepted-snapshot-content:${SNAPSHOT_TREE}:${CONTENT_SHA256}`,
+    },
+  };
+}
+
+function durableGitAdapter(observation, { driftOnRead = null, mergeClean = true } = {}) {
+  let reads = 0;
+  const commits = new Map(Object.values(observation.commits).map((value) => [value.sha, toFinalizerCommit(value)]));
+  return {
+    async listRefs() {
+      reads += 1;
+      const release = reads === driftOnRead ? 'e'.repeat(40) : observation.releaseHeadSha;
+      return {
+        'refs/heads/releases/v1.0': { sha: release, type: 'commit' },
+        'refs/heads/staged/v1.0': { sha: observation.stagedSha, type: 'commit' },
+        'refs/heads/release-snapshots/v1.0.1': { sha: SNAPSHOT, type: 'commit' },
+      };
+    },
+    async acceptedSnapshot() {
+      return acceptedSnapshotAuthority(observation);
+    },
+    async commit(sha) {
+      return structuredClone(commits.get(sha));
+    },
+    async isAncestor() {
+      return false;
+    },
+    async mergeTree() {
+      return mergeClean ? { clean: true, tree: RECONCILIATION_TREE } : { clean: false, tree: null };
+    },
+  };
+}
+
 const nextObservation = () => ({
   releaseHeadSha: RECONCILIATION,
   stagedSha: NEXT_INTENT,
@@ -210,6 +305,80 @@ test('accepted handoff states never access a maintenance write or dispatch adapt
     assert.notEqual(result.owner, 'maintainer');
   }
   assert.equal(calls, 0);
+});
+
+test('concrete finalizer observer accepts exact H and deterministic J then reclassifies them', async () => {
+  const late = trustedLateObservation();
+  const lateSnapshot = await classifyMaintainerOwnershipWithDurableObserver({
+    observation: late,
+    gitAdapter: durableGitAdapter(late),
+  });
+  assert.deepEqual(lateSnapshot.decision, {
+    owner: 'finalizer-owns-release',
+    state: 'late-head',
+    mergeSha: MERGE,
+    headSha: LATE,
+  });
+  assert.equal(lateSnapshot.observation.postMerge.observer, 'issue-19-finalizer');
+  const repeatedLateSnapshot = await classifyMaintainerOwnershipWithDurableObserver({
+    observation: structuredClone(late),
+    gitAdapter: durableGitAdapter(late),
+  });
+  assert.doesNotThrow(() => assertStableOwnershipSnapshots(lateSnapshot, repeatedLateSnapshot));
+
+  const reconciled = trustedReconciliationObservation();
+  const reconciledSnapshot = await classifyMaintainerOwnershipWithDurableObserver({
+    observation: reconciled,
+    gitAdapter: durableGitAdapter(reconciled),
+  });
+  assert.deepEqual(reconciledSnapshot.decision, {
+    owner: 'finalizer-owns-release',
+    state: 'normal-reconciliation',
+    mergeSha: MERGE,
+    headSha: RECONCILIATION,
+    lateHeadSha: LATE,
+  });
+  assert.equal(reconciledSnapshot.observation.postMerge.kind, 'normal-reconciliation');
+});
+
+test('concrete finalizer observer rejects ref drift and malformed/conflicting H/J shapes', async () => {
+  const late = trustedLateObservation();
+  await assert.rejects(
+    classifyMaintainerOwnershipWithDurableObserver({
+      observation: late,
+      gitAdapter: durableGitAdapter(late, { driftOnRead: 3 }),
+    }),
+    /changed between the finalizer observer and maintainer reclassification/,
+  );
+
+  const reconciled = trustedReconciliationObservation();
+  await assert.rejects(
+    classifyMaintainerOwnershipWithDurableObserver({
+      observation: reconciled,
+      gitAdapter: durableGitAdapter(reconciled, { mergeClean: false }),
+    }),
+    /normal J fails exact parents, merge-tree, or structured reconciliation metadata/,
+  );
+
+  const malformed = trustedReconciliationObservation();
+  malformed.commits[RECONCILIATION].message = 'self-attested but wrong';
+  await assert.rejects(
+    classifyMaintainerOwnershipWithDurableObserver({
+      observation: malformed,
+      gitAdapter: durableGitAdapter(malformed),
+    }),
+    /structured reconciliation metadata/,
+  );
+
+  const recovery = trustedReconciliationObservation();
+  recovery.commits[RECONCILIATION].parents = [SNAPSHOT, LATE];
+  await assert.rejects(
+    classifyMaintainerOwnershipWithDurableObserver({
+      observation: recovery,
+      gitAdapter: durableGitAdapter(recovery),
+    }),
+    /accepts only one exact late H over M or deterministic normal J/,
+  );
 });
 
 test('preserves the existing exact open 1.0.1 maintainer path', async () => {
@@ -424,7 +593,7 @@ test('fails closed on duplicate, malformed, stale, wrong-version, and non-draft 
   }
 });
 
-test('fails closed on merged, snapshot, and pending H/J state', () => {
+test('fails closed on malformed merged/snapshot and caller-authored H/J state', () => {
   const cases = [
     [
       'reversed M parents',
@@ -447,7 +616,7 @@ test('fails closed on merged, snapshot, and pending H/J state', () => {
     [
       'arbitrary H self-attestation',
       lateObservation,
-      /awaits a concrete durable finalizer observer/,
+      /requires the concrete durable finalizer observer/,
     ],
     [
       'wrong V parent',
@@ -479,7 +648,7 @@ test('fails closed on merged, snapshot, and pending H/J state', () => {
     [
       'arbitrary J self-attestation',
       reconciliationObservation,
-      /awaits a concrete durable finalizer observer/,
+      /requires the concrete durable finalizer observer/,
     ],
   ];
   for (const [name, fixture, pattern] of cases) {

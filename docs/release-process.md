@@ -20,10 +20,11 @@ This repository currently demonstrates only the first visible release intent:
    the historical review and comment record. The first live transition closed
    PR #1 and created draft PR #12.
 6. When the uniquely latest lifecycle PR is merged with the exact ordered
-   `[source, intent]` graph, the maintainer validates exact `M` or the concrete
-   deterministic `V` snapshot and yields ownership without changing
-   `staged/v1.0`, PR text, or QA state. H/J remain fail-closed pending the
-   finalizer's durable observer/schema.
+   `[source, intent]` graph, the maintainer validates exact `M`, the concrete
+   deterministic `V` snapshot, one exact late `H`, or deterministic normal
+   reconciliation `J` and yields ownership without changing `staged/v1.0`, PR
+   text, or QA state. H/J are derived by the trusted finalizer observer and
+   reclassified in two complete ownership snapshots; caller facts fail closed.
 7. When the finalizer later creates one exact draft `1.0.2` proposal from the
    current line, the maintainer validates and yields to that proposal instead
    of applying the fixed G1 `1.0.1` refresh or QA behavior.
@@ -66,9 +67,10 @@ open release PR remained.
 
 The new issue #19 surfaces described below are present only in this offline
 integration. The manual operator-only exact `1.0.0` bootstrap exists but has
-not published. The trusted-main `V` preparation and direct-OIDC publisher also
-exist locally but are not installed or live. No public package, finalization,
-or new live-workflow state is claimed by this changeset.
+not published. The trusted-main `V` preparation, direct-OIDC publisher,
+finalizer, and maintainer H/J handoff also exist locally but are not installed
+or live. No public package, finalization, or new live-workflow state is claimed
+by this changeset.
 
 ## One-time public baseline bootstrap
 
@@ -155,23 +157,29 @@ The current release line may currently be:
 
 - exact `M`;
 - deterministic snapshot `V` at `release-snapshots/v1.0.1`, with one parent
-  `M` and the exact structured snapshot trailers.
+  `M` and the exact structured snapshot trailers;
+- one exact late `H` over `M`; or
+- deterministic normal `J` with ordered parents `[H,V]`, the exact merge tree,
+  and structured reconciliation message.
 
-H/J ownership is intentionally pending because the finalizer's committed
-durable observer and reconciliation marker schema are not settled yet. The
-maintainer does not accept caller-authored facts or infer those states from
-arbitrary ancestry; H/J therefore fail closed. Missing pages, duplicate
-or malformed lifecycle PRs, a closed-unmerged latest PR, stale staged state,
-wrong versions, unexplained line heads, or contradictory M/V evidence fail
-closed.
+For H/J, the maintainer imports the finalizer's committed durable observer and
+provides only stable closed Git reads for refs, accepted schema-2 `V`, commits,
+ancestry, and merge-tree derivation. The observer derives H/J from current refs;
+optional SHAs are equality expectations only. The maintainer then rereads the
+refs and fully reclassifies the returned H/J graph and metadata. This occurs in
+each of two complete ownership snapshots. Ref drift, caller-authored facts,
+arbitrary ancestry, malformed J, and conflict/recovery shapes fail closed.
+Missing pages, duplicate or malformed lifecycle PRs, a closed-unmerged latest
+PR, stale staged state, wrong versions, unexplained line heads, or contradictory
+M/V evidence also fail closed.
 
-Every accepted M/V finalizer-owned state returns before staged/ref/PR-body/QA
-writes. An exact next proposal is accepted only when it is the unique latest
-open lifecycle PR, remains draft, its PR base SHA equals the current release
-head, and its empty `1.0.2` intent has that exact source and unchanged tree.
-Before returning, the maintainer repeats the complete bounded all-state history
-snapshot, rehydrates the latest lifecycle PR, and reclassifies every exact
-identity; a created, closed, reordered, or changed PR fails the run.
+Every accepted M/V/H/J finalizer-owned state returns before
+staged/ref/PR-body/QA writes. An exact next proposal is accepted only when it is
+the unique latest open lifecycle PR, remains draft, its PR base SHA equals the
+current release head, and its empty `1.0.2` intent has that exact source and
+unchanged tree. Before returning, the maintainer repeats the complete bounded
+all-state history snapshot, rehydrates the latest lifecycle PR, and reclassifies
+every exact identity; a created, closed, reordered, or changed PR fails the run.
 
 ## Ready-state exact-version QA
 
@@ -251,9 +259,9 @@ created the clean draft replacement, and its duplicate attempt converged on the
 same PR without another ref or PR write.
 
 Branch reconciliation, tagging `v1.0.1`, and creating a GitHub Release remain
-intentionally **OUTSIDE THIS PREPARATION SLICE**. The draft maintainer does not
-execute pull-request-head code, and no workflow may mutate a Storybook
-resource.
+outside the installed/live state. The offline finalizer implements the bounded
+controller but has not run. The draft maintainer does not execute
+pull-request-head code, and no workflow may mutate a Storybook resource.
 
 ## Offline trusted-publishing preparation
 
@@ -384,9 +392,10 @@ normal reconciliation or conflict recovery begins. Consequently this slice
 never reconciles the release line while either package is absent and never
 creates `v1.0.1`, a GitHub Release, or a `1.0.2` proposal.
 
-The issue #19 public-package finalizer is intentionally not installed by this
-offline integration. The maintainer validates the open `1.0.1` proposal, exact
-`M`, exact deterministic `V`, and the exact draft `1.0.2` proposal, then yields
-without publication, reconciliation, tag, Release, or Storybook writes. H/J
-remain fail-closed pending a concrete committed finalizer observer/schema. The
-draft maintainer does not execute pull-request-head code.
+The issue #19 public-package finalizer and maintainer H/J handoff are implemented
+in this offline integration but are not installed or live. The maintainer
+validates the open `1.0.1` proposal, exact `M`, deterministic `V`, concrete `H`,
+deterministic `J`, and the exact draft `1.0.2` proposal, then yields without
+publication, reconciliation, tag, Release, or Storybook writes. The draft
+maintainer does not execute pull-request-head code. The finalizer's full
+offline operator contract is in [`docs/finalize-release.md`](finalize-release.md).

@@ -4,11 +4,17 @@ This is the focused operator contract for the bounded issue #19 finalizer. It
 describes offline implementation and proof only; it does not claim a live npm
 write, tag, GitHub Release, workflow run, or Storybook change.
 
+In the combined offline state, the manual exact `1.0.0` bootstrap exists but
+has not published; the trusted-main `V` preparation and direct-OIDC publisher
+exist but are not installed or live; and this finalizer plus its maintainer H/J
+handoff are likewise local-only. Public package and finalization state remain
+unchanged.
+
 ## Installation prerequisite and maintainer seam
 
-The separately reviewed maintainer handoff must be integrated before this
-workflow is installed or dispatched. The finalizer intentionally does not edit
-`scripts/maintain-release-draft.mjs`.
+This offline branch integrates the separately reviewed maintainer handoff with
+the finalizer observer. Neither the finalizer workflow nor the H/J handoff is
+installed or live, and this document does not authorize dispatch.
 
 The handoff imports and calls the pure exported seam:
 

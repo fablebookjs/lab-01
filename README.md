@@ -28,15 +28,17 @@ closed PR #1 and created [draft PR #12](https://github.com/fablebookjs/lab-01/pu
 rerunning the same delivery recognized the existing replacement without
 creating another PR.
 
-This prerequisite gives the maintainer an explicit ownership handoff for the
-issue #19 finalizer. With no open proposal, it accepts only the uniquely latest
-merged `staged/v1.0` lifecycle PR, its exact ordered merge `M`, and the concrete
-deterministic `V` snapshot. It performs no ref, PR-body, or QA dispatch write in
-those states. H/J ownership remains deliberately fail-closed until the
-finalizer supplies a committed durable observer/schema. After the finalizer
-creates one exact draft `1.0.2` intent from the current line, the maintainer
-recognizes that proposal without applying its fixed `1.0.1` behavior. The
-finalizer itself is not added or claimed live by this prerequisite.
+This offline integration gives the maintainer an explicit ownership handoff for
+the issue #19 finalizer. With no open proposal, it accepts only the uniquely
+latest merged `staged/v1.0` lifecycle PR, its exact ordered merge `M`, the
+concrete deterministic `V` snapshot, one exact late `H`, or deterministic
+normal reconciliation `J`. H/J are derived by the imported finalizer observer
+from stable Git facts and then reclassified in two complete ownership
+snapshots; caller-authored markers are not authority. The maintainer performs
+no ref, PR-body, or QA dispatch write in those states. It also recognizes one
+exact draft `1.0.2` intent without applying its fixed `1.0.1` behavior. The
+finalizer workflow and H/J handoff are implemented locally but are not
+installed or live.
 
 See [the release-process note](docs/release-process.md) for the current contract
 and explicit automation limits.
@@ -68,9 +70,10 @@ isolated home/config/cache paths, and both default and `@fablebook` registries
 pinned to the generated loopback origin. Candidate installation omits the
 development-only QA toolchain and cannot use public npm.
 
-The issue #19 preparation adds two deliberately separate public-release
-surfaces. `Prepare release snapshot` runs from exact current default `main` and
-may create only the deterministic `release-snapshots/v1.0.1` locator after
+The issue #19 publication preparation adds two deliberately separate
+public-release surfaces. `Prepare release snapshot` runs from exact current
+default `main` and may create only the deterministic
+`release-snapshots/v1.0.1` locator after
 validating the unique latest merged release intent `M`, the latest successful
 exact-head ready-QA authorization, and a fresh isolated regeneration. The run
 ID is not part of `V`, so equivalent current QA runs converge. `Publish npm
@@ -79,12 +82,14 @@ current-main code, treats `V` as inert Git data, independently reconstructs the
 allowed tree from `M`, and can publish or reuse only `core` first and then
 `addon`. It cannot execute candidate code, move the release line, tag, create a
 GitHub Release, or create the next proposal. Late descendants of `M` do not
-block incomplete package publication.
+block incomplete package publication. A third offline-only finalizer controller
+handles later reconciliation, tag, GitHub Release, and next-proposal actions;
+it is not installed or live.
 
 The issue #19 additions in this branch are offline-only. The manual
 operator-only exact `1.0.0` bootstrap exists but has not published. The
-trusted-main `V` preparation and direct-OIDC publisher exist locally but are
-not installed or live. No public package, finalization, or new live-workflow
-state is claimed. The external operator gate therefore remains closed until
-the baseline packages, both npm trusted publishers, the `npm-publish`
-environment, and refreshed current-head QA are all present.
+trusted-main `V` preparation, direct-OIDC publisher, finalizer, and H/J handoff
+exist locally but are not installed or live. No public package, finalization,
+or new live-workflow state is claimed. The external operator gate therefore
+remains closed until the baseline packages, both npm trusted publishers, the
+`npm-publish` environment, and refreshed current-head QA are all present.
