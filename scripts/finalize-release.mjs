@@ -1464,6 +1464,10 @@ function allowedLocalGitConfiguration({ key, value }) {
   return false;
 }
 
+export function buildRefAdvertisementArguments() {
+  return ['ls-remote', '--refs', 'origin', 'refs/heads/*', 'refs/tags/*'];
+}
+
 export class LiveGitAdapter {
   constructor({ cwd = process.cwd() } = {}) {
     this.cwd = cwd;
@@ -1521,7 +1525,7 @@ export class LiveGitAdapter {
   advertiseRefs() {
     this.assertClosedTransport();
     this.operations.push({ transport: 'git', method: 'ls-remote', mutation: false, repository: REPOSITORY });
-    const result = runGit(['ls-remote', '--refs', 'origin'], { cwd: this.cwd, allowFailure: true });
+    const result = runGit(buildRefAdvertisementArguments(), { cwd: this.cwd, allowFailure: true });
     if (result.status !== 0) fail('closed Git ref advertisement failed');
     return this.parseAdvertisement(result.stdout);
   }
