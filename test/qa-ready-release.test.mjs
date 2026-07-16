@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import {
+  assertAuthorityContract,
   PACKAGE_SPECS,
   RELEASE_VERSION,
   REPOSITORY,
@@ -255,10 +256,15 @@ function githubFixture() {
 }
 
 test('GitHub authority requires the one current same-repository release PR and refs', () => {
-  const { snapshot } = githubFixture();
+  const { snapshot, stagedSha, sourceSha } = githubFixture();
   const authority = validateGitHubAuthoritySnapshot(snapshot);
   assert.equal(authority.mode, 'github-current');
   assert.equal(authority.pullRequest.number, 1);
+  assert.doesNotThrow(() => assertAuthorityContract(authority, stagedSha, sourceSha));
+  assert.throws(
+    () => assertAuthorityContract({ ...authority, event: 'pull_request' }, stagedSha, sourceSha),
+    /not the exact current release PR and refs/,
+  );
 
   const failures = [
     ['stale checkout', (value) => (value.localHead = 'd'.repeat(40))],

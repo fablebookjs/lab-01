@@ -261,7 +261,7 @@ function expectedStepShape(steps) {
   }
 }
 
-function assertAuthorityContract(authority, stagedSha, sourceSha) {
+export function assertAuthorityContract(authority, stagedSha, sourceSha) {
   if (authority?.mode === 'local') {
     if (!isDeepStrictEqual(authority, localAuthority())) {
       fail('local QA authority has unexpected or GitHub-current fields');
@@ -272,7 +272,7 @@ function assertAuthorityContract(authority, stagedSha, sourceSha) {
     authority?.mode !== 'github-current' ||
     authority.githubCurrent !== true ||
     authority.repository !== REPOSITORY ||
-    !['pull_request', 'workflow_dispatch'].includes(authority.event) ||
+    !['workflow_run', 'workflow_dispatch'].includes(authority.event) ||
     authority.refs?.staged?.name !== STAGED_LINE ||
     authority.refs.staged.sha !== stagedSha ||
     authority.refs?.source?.name !== RELEASE_LINE ||
