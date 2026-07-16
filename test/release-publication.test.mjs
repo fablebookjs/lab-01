@@ -11,6 +11,7 @@ import {
   assertTrustedPreparationMain,
   ensureSnapshotRef,
   retainedArtifactAvailable,
+  liveAdapter as snapshotLiveAdapter,
   validateLatestMergedAuthority,
 } from '../scripts/prepare-release-snapshot.mjs';
 import {
@@ -25,6 +26,8 @@ import {
   RELEASE_LINE,
   RELEASE_VERSION,
   REPOSITORY,
+  REPOSITORY_ID,
+  REPOSITORY_OWNER_ID,
   REPOSITORY_URL,
   SNAPSHOT_REF,
   TRANSFORMED_FILES,
@@ -35,6 +38,7 @@ import {
   createClosedNpmEnvironment,
   deriveTrustedSnapshotAuthority,
   materializeInertPackages,
+  githubProvenanceClaims,
   parseSnapshotMessage,
   readBlob,
   reconstructExpectedSnapshot,
@@ -142,6 +146,7 @@ function authorityFixture() {
     id: 12,
     number: 12,
     state: 'closed',
+    draft: false,
     merged: true,
     merged_at: '2026-07-15T10:00:00Z',
     base: { repo: { full_name: REPOSITORY }, ref: RELEASE_LINE, sha: sourceSha },
@@ -151,12 +156,10 @@ function authorityFixture() {
   return {
     pull,
     pulls: [structuredClone(pull)],
-    runs: {
-      workflow_runs: [
-        { id: 98, created_at: '2026-07-15T10:01:00Z', status: 'completed', conclusion: 'success', path: '.github/workflows/ready-release-qa.yml', head_sha: stagedSha, event: 'pull_request' },
-        { id: 99, created_at: '2026-07-15T10:02:00Z', status: 'completed', conclusion: 'success', path: '.github/workflows/ready-release-qa.yml', head_sha: stagedSha, event: 'workflow_dispatch' },
-      ],
-    },
+    runs: [
+      { id: 98, name: 'Ready release QA controller', created_at: '2026-07-15T10:01:00Z', status: 'completed', conclusion: 'success', path: '.github/workflows/ready-release-qa-controller.yml', head_branch: 'main', head_sha: sourceSha, event: 'workflow_run', repository: { full_name: REPOSITORY }, head_repository: { full_name: REPOSITORY }, artifact_names: [`ready-release-qa-${stagedSha}`] },
+      { id: 99, name: 'Ready release QA controller', created_at: '2026-07-15T10:02:00Z', status: 'completed', conclusion: 'success', path: '.github/workflows/ready-release-qa-controller.yml', head_branch: 'main', head_sha: sourceSha, event: 'workflow_dispatch', repository: { full_name: REPOSITORY }, head_repository: { full_name: REPOSITORY }, artifact_names: [`ready-release-qa-${stagedSha}`] },
+    ],
     prNumber: '12',
     qaRunExpectation: '',
   };
@@ -184,8 +187,67 @@ test('preparation requires the unique latest merged lifecycle PR and latest succ
     /QA_RUN_EXPECTATION_STALE/,
   );
   const wrongHead = structuredClone(fixture);
-  wrongHead.runs.workflow_runs.forEach((run) => { run.head_sha = sourceSha; });
+  wrongHead.runs.forEach((run) => { run.artifact_names = ['ready-release-qa-wrong']; });
   assert.throws(() => validateLatestMergedAuthority(wrongHead), /CURRENT_READY_QA_AUTHORIZATION_MISSING/);
+});
+
+test('snapshot authority reads and hydrates more than 100 PRs and QA runs across two complete stable sweeps', async () => {
+  const unrelatedPulls = Array.from({ length: 100 }, (_, index) => ({
+    id: 1000 + index,
+    number: index + 1,
+    state: 'closed', draft: false, merged: false, merged_at: null, merge_commit_sha: null,
+    base: { repo: { full_name: REPOSITORY }, ref: 'main', sha: sourceSha },
+    head: { repo: { full_name: REPOSITORY }, ref: `unrelated/${index + 1}`, sha: stagedSha },
+  }));
+  const lifecycle = { ...structuredClone(authorityFixture().pull), id: 2000, number: 101 };
+  const pulls = [...unrelatedPulls, lifecycle];
+  const runs = Array.from({ length: 101 }, (_, index) => ({
+    id: 3000 + index,
+    name: 'Ready release QA controller',
+    path: '.github/workflows/ready-release-qa-controller.yml',
+    event: index % 2 ? 'workflow_dispatch' : 'workflow_run',
+    status: 'completed', conclusion: 'success', head_branch: 'main', head_sha: sourceSha,
+    created_at: `2026-07-15T10:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}Z`,
+    updated_at: '2026-07-15T12:00:00Z',
+    repository: { full_name: REPOSITORY }, head_repository: { full_name: REPOSITORY },
+  }));
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = 'read-only-test-token';
+  const collectionCounts = new Map();
+  globalThis.fetch = async (url) => {
+    const parsed = new URL(url);
+    const path = `${parsed.pathname}${parsed.search}`;
+    const page = Number(parsed.searchParams.get('page') ?? '1');
+    let body;
+    if (parsed.pathname === `/repos/${REPOSITORY}/pulls`) {
+      collectionCounts.set('pulls', (collectionCounts.get('pulls') ?? 0) + 1);
+      body = pulls.slice((page - 1) * 100, page * 100);
+    } else if (/\/pulls\/[1-9]\d*$/.test(parsed.pathname)) {
+      body = pulls.find(({ number }) => String(number) === parsed.pathname.split('/').at(-1));
+    } else if (parsed.pathname.endsWith('/actions/workflows/ready-release-qa-controller.yml/runs')) {
+      collectionCounts.set('runs', (collectionCounts.get('runs') ?? 0) + 1);
+      body = { workflow_runs: runs.slice((page - 1) * 100, page * 100) };
+    } else if (/\/actions\/runs\/[1-9]\d*\/artifacts$/.test(parsed.pathname)) {
+      const id = Number(parsed.pathname.split('/').at(-2));
+      body = { artifacts: page === 1 ? [{ id: 9000 + id, name: `ready-release-qa-${stagedSha}`, expired: false }] : [] };
+    } else if (/\/actions\/runs\/[1-9]\d*$/.test(parsed.pathname)) {
+      body = runs.find(({ id }) => String(id) === parsed.pathname.split('/').at(-1));
+    } else {
+      throw new Error(`unexpected mocked GitHub path ${path}`);
+    }
+    return { ok: true, status: 200, json: async () => structuredClone(body) };
+  };
+  try {
+    assert.equal((await snapshotLiveAdapter.releasePulls()).length, 101);
+    assert.equal((await snapshotLiveAdapter.qaRuns()).length, 101);
+    assert.equal(collectionCounts.get('pulls'), 4);
+    assert.equal(collectionCounts.get('runs'), 4);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousToken === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
+  }
 });
 
 test('expired, missing, or unreadable retained artifacts do not prevent trusted regeneration', async () => {
@@ -471,6 +533,81 @@ test('closed npm environment strips tokens, ambient registry, and project cwd au
   }
 });
 
+test('pinned npm provenance claims retain the exact immutable GitHub repository, workflow, run, and source identity', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'lab-01-provenance-env-'));
+  const previous = { ...process.env };
+  const sha = 'a'.repeat(40);
+  const fixture = {
+    ACTIONS_ID_TOKEN_REQUEST_URL: 'https://pipelines.actions.githubusercontent.com/example/token',
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'ephemeral-oidc-request-token',
+    GITHUB_ACTIONS: 'true',
+    GITHUB_EVENT_NAME: 'workflow_dispatch',
+    GITHUB_REF: 'refs/heads/main',
+    GITHUB_REF_NAME: 'main',
+    GITHUB_REPOSITORY: REPOSITORY,
+    GITHUB_REPOSITORY_ID: REPOSITORY_ID,
+    GITHUB_REPOSITORY_OWNER_ID: REPOSITORY_OWNER_ID,
+    GITHUB_RUN_ATTEMPT: '2',
+    GITHUB_RUN_ID: '700',
+    GITHUB_RUN_NUMBER: '31',
+    GITHUB_SERVER_URL: 'https://github.com',
+    GITHUB_SHA: sha,
+    GITHUB_WORKFLOW: 'Publish npm package',
+    GITHUB_WORKFLOW_REF: `${REPOSITORY}/.github/workflows/publish-npm.yml@refs/heads/main`,
+    GITHUB_WORKFLOW_SHA: sha,
+    RUNNER_ENVIRONMENT: 'github-hosted',
+  };
+  try {
+    Object.assign(process.env, fixture, {
+      NPM_TOKEN: 'ambient-token',
+      NODE_AUTH_TOKEN: 'ambient-token',
+      GITHUB_ACTOR: 'unnecessary-ambient-claim',
+    });
+    const claims = githubProvenanceClaims();
+    assert.deepEqual(claims, {
+      workflow: {
+        ref: 'refs/heads/main',
+        repository: `https://github.com/${REPOSITORY}`,
+        path: '.github/workflows/publish-npm.yml',
+      },
+      github: {
+        event_name: 'workflow_dispatch',
+        repository_id: REPOSITORY_ID,
+        repository_owner_id: REPOSITORY_OWNER_ID,
+      },
+      dependency: {
+        uri: `git+https://github.com/${REPOSITORY}@refs/heads/main`,
+        digest: { gitCommit: sha },
+      },
+      builder: { id: 'https://github.com/actions/runner/github-hosted' },
+      invocationId: `https://github.com/${REPOSITORY}/actions/runs/700/attempts/2`,
+    });
+    const env = await createClosedNpmEnvironment(directory, { oidc: true });
+    assert.deepEqual(
+      Object.fromEntries(Object.keys(fixture).map((key) => [key, env[key]])),
+      fixture,
+    );
+    assert.equal(env.NPM_TOKEN, undefined);
+    assert.equal(env.NODE_AUTH_TOKEN, undefined);
+    assert.equal(env.GITHUB_ACTOR, undefined);
+
+    for (const [key, bad] of [
+      ['GITHUB_SERVER_URL', 'https://github.example.invalid'],
+      ['GITHUB_REPOSITORY_OWNER_ID', '1'],
+      ['GITHUB_WORKFLOW_REF', `${REPOSITORY}/.github/workflows/other.yml@refs/heads/main`],
+      ['GITHUB_WORKFLOW_SHA', 'b'.repeat(40)],
+      ['GITHUB_RUN_ID', '0'],
+    ]) {
+      const forged = { ...fixture, [key]: bad };
+      assert.throws(() => githubProvenanceClaims(forged), /GitHub OIDC/);
+    }
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
+    Object.assign(process.env, previous);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('raw child output, causes, properties, and temp paths never cross an error boundary', async () => {
   const secret = `SECRET-${Date.now()}-/private/tmp/path`;
   let observed;
@@ -592,8 +729,8 @@ test('npm bootstrap creates an absent root before configs across concurrent fres
   await assert.rejects(readFile(parent), /ENOENT|EISDIR/);
 });
 
-test('all release workflows bootstrap closed npm before any npm command and retain evidence', async () => {
-  for (const name of ['ready-release-qa.yml', 'prepare-release-snapshot.yml', 'publish-npm.yml']) {
+test('all trusted release controllers bootstrap closed npm before any npm command and retain evidence', async () => {
+  for (const name of ['ready-release-qa-controller.yml', 'prepare-release-snapshot.yml', 'publish-npm.yml']) {
     const workflow = await readFile(new URL(`../.github/workflows/${name}`, import.meta.url), 'utf8');
     assert.match(workflow, /scripts\/bootstrap-npm-cli\.mjs/);
     assert.doesNotMatch(workflow.slice(0, workflow.indexOf('bootstrap-npm-cli.mjs')), /^\s+npm(?:@|\s)/m);
@@ -621,14 +758,14 @@ test('publish workflow executes only exact default-main trusted code under minim
 });
 
 test('Ready QA pins every external action and separates trusted controller from candidate data', async () => {
-  const workflow = await readFile(new URL('../.github/workflows/ready-release-qa.yml', import.meta.url), 'utf8');
-  assert.match(workflow, /actions\/checkout@[0-9a-f]{40} # v7/g);
+  const workflow = await readFile(new URL('../.github/workflows/ready-release-qa-controller.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /actions\/checkout@[0-9a-f]{40} # v6/);
   assert.match(workflow, /actions\/setup-node@[0-9a-f]{40} # v6/);
   assert.match(workflow, /actions\/upload-artifact@[0-9a-f]{40} # v6/);
-  assert.match(workflow, /ref: releases\/v1\.0\n          path: trusted/);
-  assert.match(workflow, /path: candidate/);
-  assert.match(workflow, /node \.\.\/trusted\/scripts\/qa-ready-release\.mjs/);
-  assert.match(workflow, /persist-credentials: false/g);
+  assert.match(workflow, /ref: \$\{\{ github\.workflow_sha \}\}/);
+  assert.doesNotMatch(workflow, /path: candidate|ref: releases\/v1\.0|ref: staged\/v1\.0/);
+  assert.match(workflow, /node scripts\/qa-ready-release\.mjs/);
+  assert.match(workflow, /persist-credentials: false/);
 });
 
 test('checked-in workflows contain no traditional npm credential or auth configuration', async () => {
@@ -638,4 +775,27 @@ test('checked-in workflows contain no traditional npm credential or auth configu
     assert.doesNotMatch(workflow, /secrets\.(?:NPM|NODE_AUTH)|_authToken\s*=|NODE_AUTH_TOKEN:\s|NPM_TOKEN:\s/);
   }
   assert.equal(SNAPSHOT_REF, 'refs/heads/release-snapshots/v1.0.1');
+});
+
+test('every write-capable workflow executes only pinned default-main code and every moving-ref workflow is a trivial signal', async () => {
+  const directory = new URL('../.github/workflows/', import.meta.url);
+  const movingSignals = new Set([
+    'maintain-release-draft.yml',
+    'ready-release-qa.yml',
+    'regenerate-release-draft.yml',
+  ]);
+  for (const name of await readdir(directory)) {
+    const workflow = await readFile(new URL(name, directory), 'utf8');
+    const writes = /(?:actions|contents|pull-requests|id-token): write/.test(workflow);
+    if (movingSignals.has(name)) {
+      assert.match(workflow, /^permissions: \{\}$/m, name);
+      assert.doesNotMatch(workflow, /\buses:|node scripts|npm\s|contents: write|pull-requests: write|actions: write|id-token: write/, name);
+    }
+    if (writes) {
+      assert.doesNotMatch(workflow, /ref: (?:releases\/v1\.0|staged\/v1\.0|release-snapshots\/|\$\{\{ github\.event\.pull_request)/, name);
+      for (const line of workflow.split('\n').filter((value) => value.trim().startsWith('uses:'))) {
+        assert.match(line, /@[0-9a-f]{40}(?: # v6)?$/, `${name}: ${line}`);
+      }
+    }
+  }
 });

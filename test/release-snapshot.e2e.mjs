@@ -44,6 +44,7 @@ test('full trusted preparation regenerates expired QA and converges across equiv
       id: 12,
       number: 12,
       state: 'closed',
+      draft: false,
       merged: true,
       merged_at: '2026-07-16T10:00:00Z',
       merge_commit_sha: mergeSha,
@@ -51,7 +52,7 @@ test('full trusted preparation regenerates expired QA and converges across equiv
       head: { repo: { full_name: REPOSITORY }, ref: 'staged/v1.0', sha: stagedSha },
     };
     const runs = [
-      { id: 99, created_at: '2026-07-16T10:01:00Z', status: 'completed', conclusion: 'success', path: '.github/workflows/ready-release-qa.yml', head_sha: stagedSha, event: 'pull_request' },
+      { id: 99, name: 'Ready release QA controller', created_at: '2026-07-16T10:01:00Z', status: 'completed', conclusion: 'success', path: '.github/workflows/ready-release-qa-controller.yml', head_branch: 'main', head_sha: sourceSha, event: 'workflow_run', repository: { full_name: REPOSITORY }, head_repository: { full_name: REPOSITORY }, artifact_names: [`ready-release-qa-${stagedSha}`] },
     ];
     const refs = new Map([
       ['refs/heads/main', sourceSha],
@@ -61,7 +62,7 @@ test('full trusted preparation regenerates expired QA and converges across equiv
     const adapter = {
       pull: async () => structuredClone(pull),
       releasePulls: async () => [structuredClone(pull)],
-      qaRuns: async () => ({ workflow_runs: structuredClone(runs) }),
+      qaRuns: async () => structuredClone(runs),
       artifacts: async () => ({ total_count: 1, artifacts: [{ id: 7, expired: true }] }),
       ref: async (_root, ref) => refs.get(ref) ?? null,
       fetchObjects: async () => {},

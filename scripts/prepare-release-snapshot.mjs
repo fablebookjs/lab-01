@@ -35,6 +35,10 @@ import {
 } from './release-publication.mjs';
 
 const POSITIVE_DECIMAL = /^[1-9]\d*$/;
+const PAGE_SIZE = 100;
+const MAX_PAGES = 20;
+const READY_QA_WORKFLOW = 'ready-release-qa-controller.yml';
+const READY_QA_WORKFLOW_PATH = `.github/workflows/${READY_QA_WORKFLOW}`;
 
 function githubHeaders() {
   if (!process.env.GITHUB_TOKEN) fail('GITHUB_AUTHORITY_TOKEN_MISSING');
@@ -113,11 +117,137 @@ function pushSnapshot(repoRoot, sha) {
   }
 }
 
+function pullTuple(pull) {
+  return {
+    id: pull?.id,
+    number: pull?.number,
+    state: pull?.state,
+    draft: pull?.draft,
+    merged: pull?.merged,
+    merged_at: pull?.merged_at,
+    merge_commit_sha: pull?.merge_commit_sha,
+    base: { repository: pull?.base?.repo?.full_name, ref: pull?.base?.ref, sha: pull?.base?.sha },
+    head: { repository: pull?.head?.repo?.full_name, ref: pull?.head?.ref, sha: pull?.head?.sha },
+  };
+}
+
+function assertHydratedPull(listed, detail) {
+  if (
+    !Number.isInteger(detail?.id) || detail.id < 1 || !Number.isInteger(detail.number) || detail.number < 1 ||
+    detail.id !== listed.id || detail.number !== listed.number ||
+    detail.state !== listed.state || detail.base?.repo?.full_name !== listed.base?.repo?.full_name ||
+    detail.base?.ref !== listed.base?.ref || detail.base?.sha !== listed.base?.sha ||
+    detail.head?.repo?.full_name !== listed.head?.repo?.full_name || detail.head?.ref !== listed.head?.ref ||
+    detail.head?.sha !== listed.head?.sha || typeof detail.draft !== 'boolean' || typeof detail.merged !== 'boolean'
+  ) fail('PULL_HYDRATION_IDENTITY_MISMATCH');
+  if (!['open', 'closed'].includes(detail.state)) fail('PULL_STATE_INVALID');
+  if (detail.merged) {
+    if (detail.state !== 'closed' || typeof detail.merged_at !== 'string') fail('PULL_MERGED_TUPLE_INVALID');
+    assertSha(detail.merge_commit_sha, 'merged pull commit');
+  } else if (detail.merged_at !== null) fail('PULL_MERGED_TUPLE_INVALID');
+  assertSha(detail.base.sha, 'pull base');
+  assertSha(detail.head.sha, 'pull head');
+  return detail;
+}
+
+async function pullSweep() {
+  const pulls = [];
+  const numbers = new Set();
+  const ids = new Set();
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
+    const listed = await githubGet(`/repos/${REPOSITORY}/pulls?state=all&sort=created&direction=asc&per_page=${PAGE_SIZE}&page=${page}`);
+    if (!Array.isArray(listed) || listed.length > PAGE_SIZE) fail('PULL_HISTORY_PAGE_INVALID');
+    for (const summary of listed) {
+      if (!Number.isInteger(summary?.number) || summary.number < 1 || numbers.has(summary.number) || !Number.isInteger(summary.id) || summary.id < 1 || ids.has(summary.id)) {
+        fail('PULL_HISTORY_DUPLICATE_OR_INVALID');
+      }
+      numbers.add(summary.number);
+      ids.add(summary.id);
+      pulls.push(assertHydratedPull(summary, await githubGet(`/repos/${REPOSITORY}/pulls/${summary.number}`)));
+    }
+    if (listed.length < PAGE_SIZE) return pulls;
+  }
+  fail('PULL_HISTORY_OVERFLOW');
+}
+
+async function stableReleasePulls() {
+  const first = await pullSweep();
+  const second = await pullSweep();
+  if (JSON.stringify(first.map(pullTuple)) !== JSON.stringify(second.map(pullTuple))) fail('PULL_HISTORY_MOVED');
+  return second;
+}
+
+function runTuple(run) {
+  return {
+    id: run?.id,
+    name: run?.name,
+    path: run?.path,
+    event: run?.event,
+    status: run?.status,
+    conclusion: run?.conclusion,
+    head_branch: run?.head_branch,
+    head_sha: run?.head_sha,
+    created_at: run?.created_at,
+    updated_at: run?.updated_at,
+    repository: run?.repository?.full_name,
+    head_repository: run?.head_repository?.full_name,
+    artifact_names: [...(run?.artifact_names ?? [])].sort(),
+  };
+}
+
+async function artifactNames(runId) {
+  const names = [];
+  const ids = new Set();
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
+    const value = await githubGet(`/repos/${REPOSITORY}/actions/runs/${runId}/artifacts?per_page=${PAGE_SIZE}&page=${page}`);
+    const batch = value?.artifacts;
+    if (!Array.isArray(batch) || batch.length > PAGE_SIZE) fail('QA_ARTIFACT_PAGE_INVALID');
+    for (const artifact of batch) {
+      if (!Number.isInteger(artifact?.id) || artifact.id < 1 || ids.has(artifact.id) || typeof artifact.name !== 'string') fail('QA_ARTIFACT_IDENTITY_INVALID');
+      ids.add(artifact.id);
+      names.push(artifact.name);
+    }
+    if (batch.length < PAGE_SIZE) return names.sort();
+  }
+  fail('QA_ARTIFACT_HISTORY_OVERFLOW');
+}
+
+async function runSweep() {
+  const runs = [];
+  const ids = new Set();
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
+    const value = await githubGet(`/repos/${REPOSITORY}/actions/workflows/${READY_QA_WORKFLOW}/runs?status=success&per_page=${PAGE_SIZE}&page=${page}`);
+    const listed = value?.workflow_runs;
+    if (!Array.isArray(listed) || listed.length > PAGE_SIZE) fail('QA_RUN_HISTORY_PAGE_INVALID');
+    for (const summary of listed) {
+      if (!Number.isInteger(summary?.id) || summary.id < 1 || ids.has(summary.id)) fail('QA_RUN_HISTORY_DUPLICATE_OR_INVALID');
+      ids.add(summary.id);
+      const detail = await githubGet(`/repos/${REPOSITORY}/actions/runs/${summary.id}`);
+      if (detail?.id !== summary.id) fail('QA_RUN_HYDRATION_IDENTITY_MISMATCH');
+      if (JSON.stringify(runTuple(summary)) !== JSON.stringify(runTuple(detail))) {
+        fail('QA_RUN_HYDRATION_IDENTITY_MISMATCH');
+      }
+      assertSha(detail.head_sha, 'QA controller head');
+      detail.artifact_names = await artifactNames(detail.id);
+      runs.push(detail);
+    }
+    if (listed.length < PAGE_SIZE) return runs;
+  }
+  fail('QA_RUN_HISTORY_OVERFLOW');
+}
+
+async function stableQaRuns() {
+  const first = await runSweep();
+  const second = await runSweep();
+  if (JSON.stringify(first.map(runTuple)) !== JSON.stringify(second.map(runTuple))) fail('QA_RUN_HISTORY_MOVED');
+  return second;
+}
+
 export const liveAdapter = {
   pull: (number) => githubGet(`/repos/${REPOSITORY}/pulls/${number}`),
-  releasePulls: () => githubGet(`/repos/${REPOSITORY}/pulls?state=all&base=${encodeURIComponent(RELEASE_LINE)}&head=fablebookjs%3A${encodeURIComponent(STAGED_LINE)}&per_page=100`),
-  qaRuns: () => githubGet(`/repos/${REPOSITORY}/actions/workflows/ready-release-qa.yml/runs?status=success&per_page=100`),
-  artifacts: (id) => githubGet(`/repos/${REPOSITORY}/actions/runs/${id}/artifacts?per_page=100`),
+  releasePulls: stableReleasePulls,
+  qaRuns: stableQaRuns,
+  artifacts: (id) => githubGet(`/repos/${REPOSITORY}/actions/runs/${id}/artifacts?per_page=100&page=1`),
   ref: remoteRef,
   fetchObjects,
   pushSnapshot,
@@ -138,6 +268,9 @@ export function validateLatestMergedAuthority({ pull, pulls, runs, prNumber, qaR
     candidate.head?.repo?.full_name === REPOSITORY && candidate.head.ref === STAGED_LINE,
   );
   const latest = newest(lifecycle, 'merged_at');
+  if (latest && lifecycle.filter((candidate) => candidate.merged_at === latest.merged_at).length !== 1) {
+    fail('LATEST_MERGED_RELEASE_PR_AMBIGUOUS');
+  }
   if (
     !latest || latest.number !== Number(prNumber) || pull.number !== latest.number || pull.merged !== true ||
     pull.state !== 'closed' || typeof pull.merged_at !== 'string' ||
@@ -146,11 +279,14 @@ export function validateLatestMergedAuthority({ pull, pulls, runs, prNumber, qaR
   ) {
     fail('LATEST_MERGED_RELEASE_PR_MISMATCH');
   }
-  if (pull.merge_commit_sha !== latest.merge_commit_sha || pull.head.sha !== latest.head.sha) fail('MERGED_RELEASE_PR_AMBIGUOUS');
-  const matchingRuns = runs.workflow_runs.filter((run) =>
+  if (JSON.stringify(pullTuple(pull)) !== JSON.stringify(pullTuple(latest))) fail('MERGED_RELEASE_PR_AMBIGUOUS');
+  const matchingRuns = runs.filter((run) =>
     run.status === 'completed' && run.conclusion === 'success' &&
-    run.path === '.github/workflows/ready-release-qa.yml' && run.head_sha === pull.head.sha &&
-    ['pull_request', 'workflow_dispatch'].includes(run.event),
+    run.name === 'Ready release QA controller' && run.path === READY_QA_WORKFLOW_PATH &&
+    run.head_branch === 'main' && run.repository?.full_name === REPOSITORY &&
+    run.head_repository?.full_name === REPOSITORY &&
+    ['workflow_run', 'workflow_dispatch'].includes(run.event) &&
+    run.artifact_names?.includes(`ready-release-qa-${pull.head.sha}`),
   );
   const canonicalRun = newest(matchingRuns, 'created_at');
   if (!canonicalRun) fail('CURRENT_READY_QA_AUTHORIZATION_MISSING');
