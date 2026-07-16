@@ -214,7 +214,9 @@ The current release line may currently be:
 - exact `M`;
 - deterministic snapshot `V` at `release-snapshots/v1.0.1`, with one parent
   `M` and the exact structured snapshot trailers;
-- one exact late `H` over `M`; or
+- one exact late `H` over `M`, either a direct commit or an ordinary no-ff PR
+  merge `[M,P]` whose single patch `P` has parent `M` and the same tree as
+  `H`; or
 - deterministic normal `J` with ordered parents `[H,V]`, the exact merge tree,
   and structured reconciliation message.
 

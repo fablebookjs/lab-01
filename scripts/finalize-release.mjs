@@ -940,7 +940,22 @@ export async function observeMaintainerPostMerge({
     headSha: head.sha,
     snapshotSha: snapshot.sha,
   };
-  if (head.parents.length === 1 && head.parents[0] === merge.sha) {
+
+  const isExactOneLateHead = async (candidate) => {
+    if (candidate.parents.length === 1 && candidate.parents[0] === merge.sha) return true;
+    if (candidate.parents.length !== 2 || candidate.parents[0] !== merge.sha) return false;
+    const patch = await gitAdapter.commit(candidate.parents[1]);
+    if (
+      patch.parents.length !== 1 ||
+      patch.parents[0] !== merge.sha ||
+      patch.tree !== candidate.tree
+    ) {
+      fail('post-M ordinary late merge is not one exact patch over M');
+    }
+    return true;
+  };
+
+  if (await isExactOneLateHead(head)) {
     if (await gitAdapter.isAncestor(head.sha, snapshot.sha)) fail('post-M late H is unexpectedly reachable from V');
     const mergeResult = await gitAdapter.mergeTree(head.sha, snapshot.sha);
     if (mergeResult.clean && !SHA.test(mergeResult.tree ?? '')) fail('post-M H,V clean merge has no exact tree');
@@ -951,7 +966,7 @@ export async function observeMaintainerPostMerge({
   }
   if (head.parents.length === 2 && head.parents[1] === snapshot.sha) {
     const late = await gitAdapter.commit(head.parents[0]);
-    if (late.parents.length !== 1 || late.parents[0] !== merge.sha) {
+    if (!(await isExactOneLateHead(late))) {
       fail('post-M normal J has multiple or unbound late commits');
     }
     if (await gitAdapter.isAncestor(late.sha, snapshot.sha)) fail('post-M normal J late H is reachable from V');
