@@ -44,6 +44,7 @@ import {
 import {
   assertNoAmbientPackageConfiguration,
   assertNoProjectNpmrc,
+  bootstrapNpm,
 } from '../scripts/bootstrap-npm-cli.mjs';
 import { command as qaCommand } from '../scripts/qa-ready-release.mjs';
 
@@ -545,6 +546,50 @@ test('publisher writes sanitized durable evidence even when validation stops bef
     await rm(evidencePath, { force: true });
     await rm(fixture.directory, { recursive: true, force: true });
   }
+});
+
+test('npm bootstrap creates an absent root before configs across concurrent fresh runs and clean reruns', async () => {
+  const parent = await mkdtemp(join(tmpdir(), 'lab-01-bootstrap-order-'));
+  const previous = { ...process.env };
+  const calls = [];
+  const npmRunner = async (file, args, options) => {
+    calls.push({ file, args: [...args], cwd: options.cwd });
+    return { stdout: args[0] === '--version' ? '11.18.0\n' : '', stderr: '' };
+  };
+  try {
+    for (const key of Object.keys(process.env)) {
+      if (/^(?:npm_config_|NPM_CONFIG_|NPM_TOKEN$|NODE_AUTH_TOKEN$|HTTP_PROXY$|HTTPS_PROXY$|ALL_PROXY$|http_proxy$|https_proxy$|all_proxy$|NO_PROXY$|no_proxy$|CURL_CA_BUNDLE$|SSL_CERT_FILE$)/.test(key)) {
+        delete process.env[key];
+      }
+    }
+    const runs = Array.from({ length: 32 }, (_, index) => ({
+      base: join(parent, `fresh-${index}`),
+      pathFile: join(parent, `fresh-${index}`, 'github-path'),
+    }));
+    const results = await Promise.all(runs.map(({ base, pathFile }) => bootstrapNpm({
+      repoRoot: process.cwd(),
+      base,
+      pathFile,
+      npmRunner,
+    })));
+    assert.ok(results.every(({ version }) => version === '11.18.0'));
+    for (const { base, pathFile } of runs) {
+      const root = join(base, 'lab-01-npm-bootstrap');
+      assert.equal(await readFile(join(root, 'user.npmrc'), 'utf8'), 'registry=https://registry.npmjs.org/\n@fablebook:registry=https://registry.npmjs.org/\n');
+      assert.equal(await readFile(join(root, 'global.npmrc'), 'utf8'), '');
+      assert.match(await readFile(pathFile, 'utf8'), /lab-01-npm-bootstrap\/toolchain\/bin\n$/);
+    }
+
+    const rerun = runs[0];
+    assert.equal((await bootstrapNpm({ repoRoot: process.cwd(), ...rerun, npmRunner })).version, '11.18.0');
+    assert.equal((await readFile(rerun.pathFile, 'utf8')).trim().split('\n').length, 2);
+    assert.equal(calls.length, 66);
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
+    Object.assign(process.env, previous);
+    await rm(parent, { recursive: true, force: true });
+  }
+  await assert.rejects(readFile(parent), /ENOENT|EISDIR/);
 });
 
 test('all release workflows bootstrap closed npm before any npm command and retain evidence', async () => {

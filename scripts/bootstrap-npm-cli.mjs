@@ -65,7 +65,13 @@ async function runNpm(npm, args, options) {
   }
 }
 
-export async function bootstrapNpm({ repoRoot, pathFile, projectTools = false, base = process.env.RUNNER_TEMP ?? tmpdir() }) {
+export async function bootstrapNpm({
+  repoRoot,
+  pathFile,
+  projectTools = false,
+  base = process.env.RUNNER_TEMP ?? tmpdir(),
+  npmRunner = runNpm,
+}) {
   await assertNoProjectNpmrc(repoRoot);
   assertNoAmbientPackageConfiguration();
   const root = resolve(base, 'lab-01-npm-bootstrap');
@@ -73,26 +79,30 @@ export async function bootstrapNpm({ repoRoot, pathFile, projectTools = false, b
   const bin = join(prefix, 'bin');
   const neutral = join(root, 'neutral');
   await Promise.all([
+    mkdir(root, { recursive: true }),
     mkdir(join(root, 'home'), { recursive: true }),
     mkdir(join(root, 'tmp'), { recursive: true }),
     mkdir(join(root, 'cache'), { recursive: true }),
     mkdir(neutral, { recursive: true }),
     mkdir(prefix, { recursive: true }),
+    mkdir(bin, { recursive: true }),
+  ]);
+  await Promise.all([
     writeFile(join(root, 'user.npmrc'), `registry=${REGISTRY}\n@fablebook:registry=${REGISTRY}\n`, { mode: 0o600 }),
     writeFile(join(root, 'global.npmrc'), '', { mode: 0o600 }),
   ]);
   const ambientNpm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
   const environment = closedEnvironment(root, bin);
-  await runNpm(
+  await npmRunner(
     ambientNpm,
     ['install', '--global', `--prefix=${prefix}`, `npm@${VERSION}`, '--ignore-scripts', '--no-audit', '--no-fund', `--registry=${REGISTRY}`],
     { cwd: neutral, env: { ...environment, PATH: process.env.PATH } },
   );
   const npm = join(bin, process.platform === 'win32' ? 'npm.cmd' : 'npm');
-  const observed = await runNpm(npm, ['--version'], { cwd: neutral, env: environment });
+  const observed = await npmRunner(npm, ['--version'], { cwd: neutral, env: environment });
   if (observed.stdout.trim() !== VERSION) fail('NPM_BOOTSTRAP_VERSION_MISMATCH');
   if (projectTools) {
-    await runNpm(
+    await npmRunner(
       npm,
       ['ci', `--prefix=${repoRoot}`, '--include=dev', '--ignore-scripts', '--no-audit', '--no-fund', `--registry=${REGISTRY}`],
       { cwd: neutral, env: environment },
