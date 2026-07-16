@@ -750,7 +750,7 @@ test('normal J advances the old staged intent, then creates exactly one draft wi
   assert.match(value.githubAdapter.pulls.at(-1).body, /structured empty commit is authoritative/i);
   assert.match(value.githubAdapter.pulls.at(-1).body, /Mark this draft ready/);
   assert.match(value.githubAdapter.pulls.at(-1).body, /Close an unmerged proposal/);
-  assert.match(value.githubAdapter.pulls.at(-1).body, /https:\/\/github\.com\/fablebookjs\/lab-01\/blob\/releases\/v1\.0\/docs\/release-process\.md/);
+  assert.match(value.githubAdapter.pulls.at(-1).body, /https:\/\/github\.com\/fablebookjs\/lab-01\/blob\/main\/docs\/release-process\.md/);
 
   const rerun = await runFinalizerInvocation({ adapters: value, context: value.context });
   assert.equal(rerun.action.type, 'maintain-next-proposal');

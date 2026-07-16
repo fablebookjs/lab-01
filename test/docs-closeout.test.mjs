@@ -7,6 +7,7 @@ const calibration = readFileSync(
   'utf8',
 );
 const demo = readFileSync(new URL('../docs/demo.md', import.meta.url), 'utf8');
+const finalizer = readFileSync(new URL('../docs/finalize-release.md', import.meta.url), 'utf8');
 const publicReleaseEvidence = readFileSync(
   new URL('../docs/issue-19-live-evidence.md', import.meta.url),
   'utf8',
@@ -106,10 +107,16 @@ test('README surfaces the demo and changed Markdown is structurally clean', () =
   const opening = readme.split('\n').slice(0, 12).join('\n');
   assert.match(opening, /\[five-minute screen-share script\]\(docs\/demo\.md\)/);
   assert.match(opening, /https:\/\/fablebookjs\.github\.io\/release-state-explorer\//);
+  assert.match(finalizer, /ordinary merge `H=\[M,P\]`/);
+  assert.doesNotMatch(finalizer, /Installation prerequisite|release-line candidate/);
+  assert.doesNotMatch(readme, /Current staged QA is successful|release-line source candidate/);
+  assert.match(readme, /Exact `1\.0\.1` staged QA succeeded before M/);
+  assert.match(readme, /current staged ref is the draft `1\.0\.2` intent/);
   for (const [name, markdown] of [
     ['README', readme],
     ['calibration', calibration],
     ['demo', demo],
+    ['finalizer', finalizer],
     ['public release evidence', publicReleaseEvidence],
   ]) {
     assert.doesNotMatch(markdown, /[ \t]+$/m, `${name} has trailing whitespace`);

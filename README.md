@@ -29,7 +29,7 @@ completed finalizer published immutable snapshot `V`, reconciled the deliberate
 late fix as `J=[X,V]`, and created [draft PR #44](https://github.com/fablebookjs/lab-01/pull/44)
 as the zero-file `1.0.2` carry-forward proposal.
 
-The installed default-main controller and this release-line candidate give the
+The installed default-main controller and this release line give the
 maintainer an explicit ownership handoff for
 the issue #19 finalizer. With no open proposal, it accepts only the uniquely
 latest merged `staged/v1.0` lifecycle PR, its exact ordered merge `M`, the
@@ -102,13 +102,15 @@ block incomplete package publication. The separate finalizer controller
 completed reconciliation, tag, GitHub Release, and next-proposal actions only
 after both public packages matched `V`.
 
-The issue #19 controllers are installed on default `main`, and this branch is
-their accepted release-line source candidate. The manual operator-only exact
+The issue #19 controllers are installed on default `main`, and this branch was
+their accepted `1.0.1` release source. The manual operator-only exact
 `1.0.0` bootstrap completed on 2026-07-16; both public package tarballs match
 the immutable tagged baseline, and an external consumer installed them
 together successfully. The `npm-publish` environment exists with no secrets or
-reviewers and permits only `main`. Current staged QA is successful; configuring
-the exact trusted publisher on both npm package pages is complete. Each package
+reviewers and permits only `main`. Exact `1.0.1` staged QA succeeded before M;
+the current staged ref is the draft `1.0.2` intent and has no QA until that
+proposal is marked ready. Configuring the exact trusted publisher on both npm
+package pages is complete. Each package
 allows only `npm publish` from `fablebookjs/lab-01` workflow `publish-npm.yml`
 and environment `npm-publish`, and requires 2FA while disallowing traditional
 tokens. Both public `1.0.1` packages now match `V` and carry provenance; tag
