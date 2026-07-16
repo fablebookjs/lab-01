@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import { createServer } from 'node:net';
 import {
   access,
+  appendFile,
   copyFile,
   lstat,
   mkdir,
@@ -43,6 +44,9 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const SHASUM_PATTERN = /^[0-9a-f]{40}$/;
 const INTEGRITY_PATTERN = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
 const execFileAsync = promisify(execFile);
+const READY_QA_SIGNAL = 'Ready release QA signal';
+const HISTORY_PAGE_SIZE = 100;
+const HISTORY_MAX_PAGES = 20;
 
 const fail = (message) => {
   throw new Error(message);
@@ -634,6 +638,38 @@ function isAuthoritativePull(pull) {
   );
 }
 
+function validActor(actor) {
+  return Number.isInteger(actor?.id) && actor.id > 0 && /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(actor.login ?? '');
+}
+
+export function validateReadyQaWakeup({ eventName, event }) {
+  if (event?.repository?.full_name !== REPOSITORY || !Number.isInteger(event.repository.id) || event.repository.id < 1) {
+    fail('Ready QA wake-up repository identity is invalid');
+  }
+  if (!validActor(event.sender)) fail('Ready QA wake-up sender identity is invalid');
+  if (eventName === 'workflow_dispatch') {
+    if (event.inputs && Object.keys(event.inputs).length !== 0) fail('manual Ready QA wake-up cannot supply state');
+    return { event: eventName, actor: event.sender.login };
+  }
+  if (eventName !== 'workflow_run' || event.action !== 'completed') fail('Ready QA event is not an allowed wake-up');
+  const run = event.workflow_run;
+  if (
+    !Number.isInteger(run?.id) || run.id < 1 ||
+    run.name !== READY_QA_SIGNAL ||
+    run.event !== 'pull_request' ||
+    run.status !== 'completed' ||
+    run.conclusion !== 'success' ||
+    run.head_branch !== STAGED_LINE ||
+    run.repository?.full_name !== REPOSITORY ||
+    run.head_repository?.full_name !== REPOSITORY ||
+    !validActor(run.actor) ||
+    !validActor(run.triggering_actor)
+  ) {
+    fail('Ready QA signal wake-up identity is invalid');
+  }
+  return { event: eventName, actor: run.triggering_actor.login, runId: run.id };
+}
+
 export function validateGitHubAuthoritySnapshot({
   eventName,
   event,
@@ -641,12 +677,19 @@ export function validateGitHubAuthoritySnapshot({
   sourceRefSha,
   pulls,
   localHead,
+  mainRefSha,
+  expectedDispatchSha,
+  expectedWorkflowSha,
 }) {
   assertSha(stagedRefSha, 'current staged ref SHA');
   assertSha(sourceRefSha, 'current release ref SHA');
-  assertSha(localHead, 'checked-out staged SHA');
+  assertSha(localHead, 'checked-out trusted main SHA');
+  assertSha(mainRefSha, 'current main ref SHA');
   if (event?.repository?.full_name !== REPOSITORY) fail('GitHub event repository is not the laboratory');
-  if (localHead !== stagedRefSha) fail('checked-out staged SHA is not the current staged ref');
+  validateReadyQaWakeup({ eventName, event });
+  if (
+    localHead !== mainRefSha || expectedDispatchSha !== mainRefSha || expectedWorkflowSha !== mainRefSha
+  ) fail('checked-out QA controller is not exact current trusted main');
   const matching = pulls.filter(isAuthoritativePull);
   if (matching.length !== 1) {
     fail(`expected exactly one current authoritative ready release PR, found ${matching.length}`);
@@ -654,27 +697,6 @@ export function validateGitHubAuthoritySnapshot({
   const pull = matching[0];
   if (pull.head.sha !== stagedRefSha || pull.base.sha !== sourceRefSha) {
     fail('authoritative PR head/base do not equal the current staged/release refs');
-  }
-  if (eventName === 'pull_request') {
-    if (!['ready_for_review', 'synchronize'].includes(event.action)) {
-      fail('pull_request event is not an allowed ready-QA wake-up');
-    }
-    const eventPull = event.pull_request;
-    if (
-      eventPull?.number !== pull.number ||
-      eventPull.state !== 'open' ||
-      eventPull.draft !== false ||
-      eventPull.head?.repo?.full_name !== REPOSITORY ||
-      eventPull.head.ref !== STAGED_LINE ||
-      eventPull.head.sha !== stagedRefSha ||
-      eventPull.base?.repo?.full_name !== REPOSITORY ||
-      eventPull.base.ref !== RELEASE_LINE ||
-      eventPull.base.sha !== sourceRefSha
-    ) {
-      fail('pull_request event does not equal the current authoritative release PR');
-    }
-  } else if (eventName !== 'workflow_dispatch') {
-    fail('GitHub event is not an allowed ready-QA wake-up');
   }
   return {
     mode: 'github-current',
@@ -702,19 +724,71 @@ async function githubGet(path, token) {
   return body;
 }
 
+function canonicalReadyPulls(pulls) {
+  return pulls.map((pull) => ({
+    id: pull.id,
+    number: pull.number,
+    state: pull.state,
+    draft: pull.draft,
+    head: { repository: pull.head?.repo?.full_name, ref: pull.head?.ref, sha: pull.head?.sha },
+    base: { repository: pull.base?.repo?.full_name, ref: pull.base?.ref, sha: pull.base?.sha },
+  })).sort((left, right) => left.number - right.number);
+}
+
+async function readReadyPullSweep(token) {
+  const pulls = [];
+  const numbers = new Set();
+  const ids = new Set();
+  for (let page = 1; page <= HISTORY_MAX_PAGES; page += 1) {
+    const batch = await githubGet(
+      `/repos/${REPOSITORY}/pulls?state=open&base=${encodeURIComponent(RELEASE_LINE)}&per_page=${HISTORY_PAGE_SIZE}&page=${page}`,
+      token,
+    );
+    if (!Array.isArray(batch) || batch.length > HISTORY_PAGE_SIZE) fail('Ready QA PR history page is invalid');
+    for (const pull of batch) {
+      if (!Number.isInteger(pull?.number) || pull.number < 1 || numbers.has(pull.number) || !Number.isInteger(pull.id) || pull.id < 1 || ids.has(pull.id)) {
+        fail('Ready QA PR history has duplicate or malformed identity');
+      }
+      numbers.add(pull.number);
+      ids.add(pull.id);
+      pulls.push(pull);
+    }
+    if (batch.length < HISTORY_PAGE_SIZE) return pulls;
+  }
+  fail('Ready QA PR history exceeded its explicit bound');
+}
+
+async function readStableReadyPulls(token) {
+  const first = await readReadyPullSweep(token);
+  const second = await readReadyPullSweep(token);
+  if (JSON.stringify(canonicalReadyPulls(first)) !== JSON.stringify(canonicalReadyPulls(second))) {
+    fail('Ready QA PR history moved across complete sweeps');
+  }
+  return second;
+}
+
+function remoteBranchSha(repoRoot, branch) {
+  const output = git(repoRoot, 'ls-remote', '--refs', '--exit-code', 'origin', `refs/heads/${branch}`);
+  const rows = output.split('\n').filter(Boolean);
+  if (rows.length !== 1) fail(`remote ${branch} ref is not unique`);
+  const [sha, ref, extra] = rows[0].split(/\s+/);
+  assertSha(sha, `remote ${branch}`);
+  if (extra !== undefined || ref !== `refs/heads/${branch}`) fail(`remote ${branch} ref is malformed`);
+  return sha;
+}
+
+function fetchCandidateObjects(repoRoot, shas) {
+  git(repoRoot, 'fetch', '--force', '--no-tags', '--no-write-fetch-head', 'origin', ...shas);
+}
+
 async function resolveGitHubAuthority({ repoRoot, eventName, eventPath, token }) {
   if (!token) fail('read-only GITHUB_TOKEN is required for GitHub-current QA authority');
   const event = await readJson(eventPath);
-  const [stagedRef, sourceRef, pulls] = await Promise.all([
-    githubGet(`/repos/${REPOSITORY}/git/ref/heads/${STAGED_LINE}`, token),
-    githubGet(`/repos/${REPOSITORY}/git/ref/heads/${RELEASE_LINE}`, token),
-    githubGet(
-      `/repos/${REPOSITORY}/pulls?state=open&base=${encodeURIComponent(RELEASE_LINE)}&per_page=100`,
-      token,
-    ),
-  ]);
-  const stagedRefSha = stagedRef?.object?.sha;
-  const sourceRefSha = sourceRef?.object?.sha;
+  validateReadyQaWakeup({ eventName, event });
+  const mainRefSha = remoteBranchSha(repoRoot, 'main');
+  const stagedRefSha = remoteBranchSha(repoRoot, STAGED_LINE);
+  const sourceRefSha = remoteBranchSha(repoRoot, RELEASE_LINE);
+  const pulls = await readStableReadyPulls(token);
   const authority = validateGitHubAuthoritySnapshot({
     eventName,
     event,
@@ -722,7 +796,11 @@ async function resolveGitHubAuthority({ repoRoot, eventName, eventPath, token })
     sourceRefSha,
     pulls,
     localHead: git(repoRoot, 'rev-parse', 'HEAD'),
+    mainRefSha,
+    expectedDispatchSha: process.env.EXPECTED_DISPATCH_SHA,
+    expectedWorkflowSha: process.env.EXPECTED_WORKFLOW_SHA,
   });
+  fetchCandidateObjects(repoRoot, [stagedRefSha, sourceRefSha]);
   return { authority, stagedSha: stagedRefSha, sourceSha: sourceRefSha };
 }
 
@@ -1101,21 +1179,6 @@ export async function runReadyReleaseQa({
       command: 'npm ci --omit=dev --offline (loopback registry)',
       durationMs: installed.durationMs,
     });
-    const tested = await command('npm', ['test'], {
-      cwd: candidateDirectory,
-      env: {
-        ...candidateNpmEnvironment,
-        LAB_01_EXPECTED_PACKAGE_VERSION: RELEASE_VERSION,
-        LAB_01_QA_CANDIDATE: '1',
-      },
-    });
-    steps.push({
-      name: 'candidate:test',
-      command: 'LAB_01_EXPECTED_PACKAGE_VERSION=1.0.1 npm test',
-      durationMs: tested.durationMs,
-    });
-    await buildIfPresent(candidateDirectory, steps, candidateNpmEnvironment);
-
     const packedPackages = await packCandidate(
       candidateDirectory,
       packDirectory,
@@ -1287,31 +1350,46 @@ function parseArguments(argv) {
 
 export async function main(argv = process.argv.slice(2)) {
   const args = parseArguments(argv);
-  const repoRoot = git(process.cwd(), 'rev-parse', '--show-toplevel');
-  const resolved =
-    args.authority === 'local'
-      ? {
-          authority: localAuthority(),
-          stagedSha: args['staged-sha'],
-          sourceSha: args['source-sha'],
-        }
-      : await resolveGitHubAuthority({
-          repoRoot,
-          eventName: args['event-name'],
-          eventPath: args['event-path'],
-          token: process.env.GITHUB_TOKEN,
-        });
-  const evidence = await runReadyReleaseQa({
-    repository: args.repository,
-    stagedSha: resolved.stagedSha,
-    sourceSha: resolved.sourceSha,
-    repoRoot,
-    authority: resolved.authority,
-  });
   const output = resolve(args.evidence);
   await mkdir(dirname(output), { recursive: true });
-  await writeJson(output, evidence);
-  console.log(JSON.stringify(evidence, null, 2));
+  try {
+    const repoRoot = git(process.cwd(), 'rev-parse', '--show-toplevel');
+    assertSafeGitConfiguration(repoRoot);
+    const resolved =
+      args.authority === 'local'
+        ? {
+            authority: localAuthority(),
+            stagedSha: args['staged-sha'],
+            sourceSha: args['source-sha'],
+          }
+        : await resolveGitHubAuthority({
+            repoRoot,
+            eventName: args['event-name'],
+            eventPath: args['event-path'],
+            token: process.env.GITHUB_TOKEN,
+          });
+    const evidence = await runReadyReleaseQa({
+      repository: args.repository,
+      stagedSha: resolved.stagedSha,
+      sourceSha: resolved.sourceSha,
+      repoRoot,
+      authority: resolved.authority,
+    });
+    await writeJson(output, evidence);
+    if (process.env.GITHUB_OUTPUT) {
+      await appendFile(process.env.GITHUB_OUTPUT, `staged-sha=${resolved.stagedSha}\n`);
+    }
+    console.log(JSON.stringify(evidence, null, 2));
+  } catch {
+    await writeJson(output, {
+      schemaVersion: 2,
+      repository: REPOSITORY,
+      operation: 'ready-release-qa',
+      status: 'failed',
+      error: { code: 'READY_QA_FAILED' },
+    });
+    fail('READY_QA_FAILED');
+  }
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {

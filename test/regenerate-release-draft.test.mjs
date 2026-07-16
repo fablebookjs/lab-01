@@ -147,6 +147,26 @@ test('an unmerged close writes one fresh intent and creates one draft replacemen
   assert.match(harness.calls.createPull[0].body, new RegExp(freshIntentA));
 });
 
+test('trusted-main regeneration derives the latest closed proposal without caller event facts', async () => {
+  const closed = pull({ number: 7 });
+  const harness = fakeAdapter({
+    states: [state({ pulls: [closed] }), state({ stagedIntent: freshIntentA, pulls: [closed] })],
+    refs: [
+      { releaseSource: sourceA, stagedIntent: closedIntent },
+      { releaseSource: sourceA, stagedIntent: freshIntentA },
+      { releaseSource: sourceA, stagedIntent: freshIntentA },
+    ],
+    intents: [freshIntentA],
+  });
+  const result = await reconcileClosedPull({ adapter: harness.adapter });
+  assert.equal(result.action, 'created-replacement');
+  assert.equal(result.closedPullRequest, 7);
+  assert.deepEqual(harness.calls.updateStagedRef.map(({ expectedOld, intent }) => ({ expectedOld, intent })), [
+    { expectedOld: closedIntent, intent: freshIntentA },
+  ]);
+  assert.equal(harness.calls.createPull.length, 1);
+});
+
 test('a latest merged release pull request is a no-op after durable event validation', async () => {
   const merged = pull({
     number: 7,
@@ -365,7 +385,7 @@ test('the staged update encodes the exact expected old SHA', () => {
   );
 });
 
-test('the installable workflow uses only trusted release code and bounded write authority', async () => {
+test('the close workflow is a fixed read-only signal consumed by the trusted-main controller', async () => {
   const workflow = await readFile(
     new URL('../.github/workflows/regenerate-release-draft.yml', import.meta.url),
     'utf8',
@@ -373,8 +393,9 @@ test('the installable workflow uses only trusted release code and bounded write 
 
   assert.match(workflow, /pull_request_target:/);
   assert.match(workflow, /types:\n      - closed/);
-  assert.match(workflow, /contents: write\n  pull-requests: write/);
-  assert.match(workflow, /uses: actions\/checkout@v7/);
-  assert.match(workflow, /ref: releases\/v1\.0/);
-  assert.doesNotMatch(workflow, /pull_request\.head|github\.head_ref/);
+  assert.match(workflow, /^permissions: \{\}$/m);
+  assert.doesNotMatch(workflow, /contents: write|pull-requests: write|actions\/checkout|node scripts|ref: releases\/v1\.0|pull_request\.head|github\.head_ref/);
+  const controller = await readFile(new URL('../.github/workflows/maintain-release-draft-controller.yml', import.meta.url), 'utf8');
+  assert.match(controller, /workflows:\n      - Release maintenance signal\n      - Release regeneration signal/);
+  assert.match(controller, /node scripts\/regenerate-release-draft\.mjs --if-needed/);
 });

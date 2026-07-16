@@ -14,9 +14,11 @@ import {
   buildExpectedEvidenceContract,
   createIsolatedNpmEnvironment,
   localAuthority,
+  main as qaMain,
   transformCandidate,
   validateEvidenceBinding,
   validateGitHubAuthoritySnapshot,
+  validateReadyQaWakeup,
   withTemporaryDirectory,
 } from '../scripts/qa-ready-release.mjs';
 
@@ -218,6 +220,9 @@ test('one-field-at-a-time evidence forgeries fail across every authoritative sec
 function githubFixture() {
   const stagedSha = 'a'.repeat(40);
   const sourceSha = 'b'.repeat(40);
+  const mainSha = 'c'.repeat(40);
+  const actor = { id: 7, login: 'maintainer' };
+  const repository = { id: 1301358254, full_name: REPOSITORY };
   const pull = {
     number: 1,
     state: 'open',
@@ -228,20 +233,24 @@ function githubFixture() {
     body: 'not authority',
   };
   return {
-    stagedSha,
-    sourceSha,
+    stagedSha, sourceSha, mainSha,
     pull,
     snapshot: {
-      eventName: 'pull_request',
+      eventName: 'workflow_run',
       event: {
-        action: 'synchronize',
-        repository: { full_name: REPOSITORY },
-        pull_request: structuredClone(pull),
+        action: 'completed', repository, sender: actor,
+        workflow_run: {
+          id: 88, name: 'Ready release QA signal', event: 'pull_request', status: 'completed', conclusion: 'success',
+          head_branch: STAGED_LINE, repository, head_repository: repository, actor, triggering_actor: actor,
+        },
       },
       stagedRefSha: stagedSha,
       sourceRefSha: sourceSha,
       pulls: [pull],
-      localHead: stagedSha,
+      localHead: mainSha,
+      mainRefSha: mainSha,
+      expectedDispatchSha: mainSha,
+      expectedWorkflowSha: mainSha,
     },
   };
 }
@@ -253,9 +262,11 @@ test('GitHub authority requires the one current same-repository release PR and r
   assert.equal(authority.pullRequest.number, 1);
 
   const failures = [
-    ['stale checkout', (value) => (value.localHead = 'c'.repeat(40))],
-    ['stale event head', (value) => (value.event.pull_request.head.sha = 'c'.repeat(40))],
+    ['stale checkout', (value) => (value.localHead = 'd'.repeat(40))],
+    ['stale workflow SHA', (value) => (value.expectedWorkflowSha = 'd'.repeat(40))],
     ['wrong event repo', (value) => (value.event.repository.full_name = 'storybookjs/storybook')],
+    ['spoofed signal name', (value) => (value.event.workflow_run.name = 'Ready release QA controller')],
+    ['wrong signal event', (value) => (value.event.workflow_run.event = 'workflow_dispatch')],
     ['side-branch head', (value) => (value.pulls[0].head.ref = 'side/branch')],
     ['wrong head repo', (value) => (value.pulls[0].head.repo.full_name = 'fork/lab-01')],
     ['wrong base ref', (value) => (value.pulls[0].base.ref = 'main')],
@@ -274,9 +285,9 @@ test('GitHub authority requires the one current same-repository release PR and r
 
   const dispatch = structuredClone(snapshot);
   dispatch.eventName = 'workflow_dispatch';
-  delete dispatch.event.pull_request;
-  delete dispatch.event.action;
+  dispatch.event = { repository: snapshot.event.repository, sender: snapshot.event.sender, inputs: {} };
   assert.equal(validateGitHubAuthoritySnapshot(dispatch).event, 'workflow_dispatch');
+  assert.deepEqual(validateReadyQaWakeup({ eventName: 'workflow_dispatch', event: dispatch.event }), { event: 'workflow_dispatch', actor: 'maintainer' });
 });
 
 test('isolated npm environment ignores ambient registry, auth, proxy, and config inputs', async () => {
@@ -346,31 +357,31 @@ test('isolated npm environment ignores ambient registry, auth, proxy, and config
   });
 });
 
-test('workflow runs pinned trusted release-line QA code against exact staged candidate data', async () => {
-  const workflow = await readFile(
+test('Ready QA uses a read-only signal and exact default-main controller with inert candidate materialization', async () => {
+  const signal = await readFile(
     new URL('../.github/workflows/ready-release-qa.yml', import.meta.url),
     'utf8',
   );
-  assert.match(workflow, /permissions:\n  contents: read\n  pull-requests: read/);
-  assert.match(workflow, /uses: actions\/checkout@[0-9a-f]{40} # v7/g);
-  assert.match(workflow, /fetch-depth: 0/);
-  assert.match(workflow, /fetch-tags: true/);
-  assert.match(workflow, /persist-credentials: false/);
-  assert.match(workflow, /ref: releases\/v1\.0\n          path: trusted/);
-  assert.match(workflow, /ref: .*pull_request\.head\.sha.*staged\/v1\.0/);
-  assert.match(workflow, /path: candidate/);
-  assert.match(workflow, /head\.repo\.full_name == 'fablebookjs\/lab-01'/);
-  assert.match(workflow, /head\.ref == 'staged\/v1\.0'/);
-  assert.match(workflow, /base\.repo\.full_name == 'fablebookjs\/lab-01'/);
-  assert.match(workflow, /base\.ref == 'releases\/v1\.0'/);
-  assert.match(workflow, /--authority github-current/);
-  assert.match(workflow, /GITHUB_TOKEN: \$\{\{ github\.token \}\}/);
-  assert.doesNotMatch(workflow, /- synchronize/);
-  assert.match(workflow, /ready-release-qa-.*github\.sha/);
-  assert.match(workflow, /node \.\.\/trusted\/scripts\/qa-ready-release\.mjs/);
-  assert.match(workflow, /uses: actions\/setup-node@[0-9a-f]{40} # v6/);
-  assert.match(workflow, /uses: actions\/upload-artifact@[0-9a-f]{40} # v6/);
-  assert.doesNotMatch(workflow, /git fetch|staged_sha:|source_sha:/);
+  assert.match(signal, /^name: Ready release QA signal$/m);
+  assert.match(signal, /^permissions: \{\}$/m);
+  assert.doesNotMatch(signal, /actions\/checkout|setup-node|upload-artifact|node scripts|contents: read|pull-requests: read|workflow_dispatch/);
+
+  const controller = await readFile(new URL('../.github/workflows/ready-release-qa-controller.yml', import.meta.url), 'utf8');
+  assert.match(controller, /workflow_run:\n    workflows:\n      - Ready release QA signal/);
+  assert.match(controller, /^  workflow_dispatch:$/m);
+  assert.match(controller, /^permissions: \{\}$/m);
+  assert.match(controller, /permissions:\n      contents: read\n      pull-requests: read/);
+  assert.doesNotMatch(controller, /contents: write|pull-requests: write|actions: write/);
+  assert.match(controller, /actions\/checkout@[0-9a-f]{40} # v6/);
+  assert.match(controller, /ref: \$\{\{ github\.workflow_sha \}\}/);
+  assert.match(controller, /persist-credentials: false/);
+  assert.match(controller, /EXPECTED_DISPATCH_SHA: \$\{\{ github\.sha \}\}/);
+  assert.match(controller, /EXPECTED_WORKFLOW_SHA: \$\{\{ github\.workflow_sha \}\}/);
+  assert.match(controller, /--authority github-current/);
+  assert.match(controller, /uses: actions\/setup-node@[0-9a-f]{40} # v6/);
+  assert.match(controller, /uses: actions\/upload-artifact@[0-9a-f]{40} # v6/);
+  assert.match(controller, /ready-release-qa-\$\{\{ steps\.qa\.outputs\.staged-sha/);
+  assert.doesNotMatch(controller, /path: candidate|pull_request\.head\.sha|staged_sha:|source_sha:/);
 });
 
 test('temporary QA state is cleaned even when work fails', async () => {
@@ -384,4 +395,22 @@ test('temporary QA state is cleaned even when work fails', async () => {
     /injected failure/,
   );
   await assert.rejects(access(directory), { code: 'ENOENT' });
+});
+
+test('authoritative QA always writes a sanitized failure artifact without private diagnostics', async () => {
+  await withTemporaryDirectory('lab-01-qa-failure-evidence-', async (directory) => {
+    const evidence = join(directory, 'evidence.json');
+    await assert.rejects(qaMain([
+      '--authority', 'local', '--repository', REPOSITORY,
+      '--staged-sha', 'a'.repeat(40), '--source-sha', 'b'.repeat(40),
+      '--evidence', evidence,
+    ]), /READY_QA_FAILED/);
+    assert.deepEqual(JSON.parse(await readFile(evidence, 'utf8')), {
+      schemaVersion: 2,
+      repository: REPOSITORY,
+      operation: 'ready-release-qa',
+      status: 'failed',
+      error: { code: 'READY_QA_FAILED' },
+    });
+  });
 });

@@ -1,4 +1,4 @@
-name: Ready release QA
+name: Ready release QA signal
 
 on:
   pull_request:
@@ -6,80 +6,15 @@ on:
       - releases/v1.0
     types:
       - ready_for_review
-  workflow_dispatch:
 
-permissions:
-  contents: read
-  pull-requests: read
-
-concurrency:
-  group: ready-release-qa-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
+permissions: {}
 
 jobs:
-  exact-version-qa:
-    if: >-
-      github.repository == 'fablebookjs/lab-01' &&
-      (github.event_name == 'workflow_dispatch' ||
-        (github.event.pull_request.draft == false &&
-         github.event.pull_request.state == 'open' &&
-         github.event.pull_request.head.repo.full_name == 'fablebookjs/lab-01' &&
-         github.event.pull_request.head.ref == 'staged/v1.0' &&
-         github.event.pull_request.base.repo.full_name == 'fablebookjs/lab-01' &&
-         github.event.pull_request.base.ref == 'releases/v1.0'))
+  signal:
+    if: github.repository == 'fablebookjs/lab-01'
     runs-on: ubuntu-24.04
-    env:
-      EXPECTED_REPOSITORY: fablebookjs/lab-01
     steps:
-      - name: Check out trusted release-line QA controller
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          fetch-depth: 0
-          fetch-tags: false
-          persist-credentials: false
-          ref: releases/v1.0
-          path: trusted
-
-      - name: Install pinned Node without package-manager cache
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: 24.18.0
-          package-manager-cache: false
-
-      - name: Bootstrap closed npm and trusted QA tooling outside the project
+      - name: Emit a fixed read-only Ready QA wake-up
         run: >-
-          node trusted/scripts/bootstrap-npm-cli.mjs
-          --repository-root "$GITHUB_WORKSPACE/trusted"
-          --path-file "$GITHUB_PATH"
-          --project-tools
-
-      - name: Check out exact staged candidate as data
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-          persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || 'staged/v1.0' }}
-          path: candidate
-
-      - name: Test exact candidate with trusted controller through loopback Verdaccio
-        working-directory: candidate
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          LAB_01_TRUSTED_TOOL_ROOT: ${{ github.workspace }}/trusted
-        run: >-
-          node ../trusted/scripts/qa-ready-release.mjs
-          --authority github-current
-          --repository "$EXPECTED_REPOSITORY"
-          --event-name "$GITHUB_EVENT_NAME"
-          --event-path "$GITHUB_EVENT_PATH"
-          --evidence "$RUNNER_TEMP/ready-release-qa.json"
-
-      - name: Retain sanitized exact-snapshot evidence
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: ready-release-qa-${{ github.event.pull_request.head.sha || github.sha }}
-          path: ${{ runner.temp }}/ready-release-qa.json
-          if-no-files-found: warn
-          retention-days: 30
+          test "$GITHUB_REPOSITORY" = "fablebookjs/lab-01" &&
+          test "$GITHUB_EVENT_NAME" = "pull_request"

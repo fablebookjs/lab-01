@@ -1,10 +1,12 @@
 import { execFileSync, spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
 import { observeMaintainerPostMerge, reconciliationMessage } from './finalize-release.mjs';
 import {
   closedGitEnvironment,
+  assertSafeGitConfiguration,
   deriveTrustedSnapshotAuthority,
   git as closedGit,
   parseSnapshotMessage,
@@ -17,20 +19,77 @@ const BASELINE_TAG = 'v1.0.0';
 const RELEASE_VERSION = '1.0.1';
 const NEXT_RELEASE_VERSION = '1.0.2';
 const INTENT_VERSION = '1';
-const READY_QA_WORKFLOW = 'ready-release-qa.yml';
+const DEFAULT_BRANCH = 'main';
+const READY_QA_WORKFLOW = 'ready-release-qa-controller.yml';
+const MAINTENANCE_SIGNAL = 'Release maintenance signal';
+const REGENERATION_SIGNAL = 'Release regeneration signal';
 const SNAPSHOT_REF = 'release-snapshots/v1.0.1';
 const HISTORY_PAGE_SIZE = 100;
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
 
 const git = (...args) =>
-  execFileSync('git', args, {
+  execFileSync('git', args[0] === '--no-replace-objects' ? args : ['--no-replace-objects', ...args], {
     encoding: 'utf8',
+    env: closedGitEnvironment(),
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 
 const fail = (message) => {
   throw new Error(message);
 };
+
+function validActor(actor) {
+  return Number.isInteger(actor?.id) && actor.id > 0 && /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(actor.login ?? '');
+}
+
+export function validateMaintainerWakeup({ eventName, event }) {
+  if (event?.repository?.full_name !== REPOSITORY || !Number.isInteger(event.repository.id) || event.repository.id < 1) {
+    fail('maintainer wake-up repository identity is invalid');
+  }
+  if (!validActor(event.sender)) fail('maintainer wake-up sender identity is invalid');
+  if (eventName === 'workflow_dispatch') {
+    if (event.inputs && Object.keys(event.inputs).length !== 0) fail('manual maintainer wake-up cannot supply state');
+    return { event: eventName, actor: event.sender.login };
+  }
+  if (eventName !== 'workflow_run' || event.action !== 'completed') {
+    fail('maintainer event is not an allowed wake-up');
+  }
+  const run = event.workflow_run;
+  const releasePush = run?.name === MAINTENANCE_SIGNAL && run.event === 'push' && run.head_branch === RELEASE_LINE;
+  const releaseClose = run?.name === REGENERATION_SIGNAL && run.event === 'pull_request_target' &&
+    [RELEASE_LINE, STAGED_LINE].includes(run.head_branch);
+  if (
+    !Number.isInteger(run?.id) || run.id < 1 ||
+    (!releasePush && !releaseClose) ||
+    run.status !== 'completed' ||
+    run.conclusion !== 'success' ||
+    run.repository?.full_name !== REPOSITORY ||
+    run.head_repository?.full_name !== REPOSITORY ||
+    !validActor(run.actor) ||
+    !validActor(run.triggering_actor)
+  ) {
+    fail('release maintenance signal wake-up identity is invalid');
+  }
+  return { event: eventName, actor: run.triggering_actor.login, runId: run.id };
+}
+
+export function assertTrustedMaintainerMain({
+  environment = process.env,
+  localSha = git('rev-parse', 'HEAD'),
+  remoteMainSha = refSha(DEFAULT_BRANCH),
+} = {}) {
+  if (
+    environment.GITHUB_REPOSITORY !== REPOSITORY ||
+    environment.GITHUB_REF !== `refs/heads/${DEFAULT_BRANCH}` ||
+    !SHA_PATTERN.test(localSha) ||
+    localSha !== remoteMainSha ||
+    environment.EXPECTED_DISPATCH_SHA !== remoteMainSha ||
+    environment.EXPECTED_WORKFLOW_SHA !== remoteMainSha
+  ) {
+    fail('trusted maintainer main identity drifted');
+  }
+  return remoteMainSha;
+}
 
 export function parseIntentMessage(message) {
   const lines = message.trimEnd().split('\n');
@@ -99,11 +158,11 @@ ${commits}
 
 ## Current lifecycle state
 
-Automatic release-PR maintenance is live. A push to \`${RELEASE_LINE}\` refreshes this same PR from the exact new release-line head while preserving its number, base, head, and draft-or-ready review state.
+Historical installed automation demonstrated release-proposal refresh, Ready QA, and close-and-regenerate. Those runs do not prove the replacement architecture in this offline changeset. Here, release and PR workflows are fixed read-only/no-checkout signals; default-main controllers re-observe every durable ref and PR fact before acting. The trusted-main maintainer dispatches \`ready-release-qa-controller.yml\` only at \`main\`, while npm trusted publishing continues to use the exact stable workflow filename \`publish-npm.yml\`.
 
-Ready-state exact-version QA is live. Marking the current proposal ready runs QA for that exact head. When a ready proposal refreshes, release-PR maintenance explicitly dispatches QA for the new staged head because GitHub leaves token-authored synchronize runs approval-required. The first ready proof is [run 29413168684](https://github.com/fablebookjs/lab-01/actions/runs/29413168684), and the first automatically refreshed-head proof is [run 29414043206](https://github.com/fablebookjs/lab-01/actions/runs/29414043206). Close-and-regenerate is live: [run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336) closed historical PR #1, created [draft PR #12](https://github.com/fablebookjs/lab-01/pull/12), and converged on that same replacement when rerun. The manual operator-only exact \`1.0.0\` bootstrap, trusted-main \`V\`/direct-OIDC publisher, and finalizer/H/J handoff exist only in this offline changeset: the bootstrap has not published, and the publisher and finalizer are not installed or live. Public baseline packages, npm trusted-publisher settings, the GitHub environment, and current-head QA remain external gates.
+The manual operator-only exact \`1.0.0\` bootstrap exists but has not published. The trusted-main maintainer and Ready-QA signal/controller split, \`V\` preparation, direct-OIDC publisher, finalizer, and H/J handoff are implemented offline but are not installed or live. No authoritative QA run, public package, finalization, or new workflow state is claimed; baseline packages, both npm trusted-publisher settings, the GitHub environment, and a real post-installation QA run remain external gates.
 
-This maintainer never publishes, reconciles the release line, tags, or creates a GitHub Release. It validates the open \`1.0.1\` proposal, sealed merge \`M\`, the exact deterministic \`V\` snapshot, concrete \`H\` and deterministic \`J\` through the trusted finalizer observer, and an exact draft \`1.0.2\` proposal without crossing ownership boundaries. Caller-supplied H/J facts are rejected; two complete ownership snapshots rederive and reclassify the durable graph. The finalizer workflow is not installed or live, so the issue #19 operator gate remains closed while the external gates are unmet.
+This maintainer never publishes, reconciles the release line, tags, or creates a GitHub Release. It validates the open \`1.0.1\` proposal, sealed merge \`M\`, exact deterministic \`V\`, concrete \`H\`, deterministic \`J\`, and an exact draft \`1.0.2\` proposal from trusted-main code. Caller-supplied H/J facts are rejected; two complete ownership snapshots rederive and reclassify the durable graph. The issue #19 operator gate remains closed.
 
 See [docs/release-process.md](https://github.com/${REPOSITORY}/blob/${RELEASE_LINE}/docs/release-process.md) for the current contract and safety boundary.`;
 }
@@ -179,13 +238,30 @@ function createIntent(source) {
   return execFileSync('git', ['commit-tree', `${source}^{tree}`, '-p', source], {
     encoding: 'utf8',
     input: message,
-    env: {
-      ...process.env,
+    env: closedGitEnvironment({
       GIT_AUTHOR_NAME: 'github-actions[bot]',
       GIT_AUTHOR_EMAIL: '41898282+github-actions[bot]@users.noreply.github.com',
       GIT_COMMITTER_NAME: 'github-actions[bot]',
       GIT_COMMITTER_EMAIL: '41898282+github-actions[bot]@users.noreply.github.com',
-    },
+    }),
+  }).trim();
+}
+
+function pushStagedIntent({ previousIntent, intent }) {
+  const authorization = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${process.env.GITHUB_TOKEN}`).toString('base64')}`;
+  return execFileSync('git', [
+    '--no-replace-objects', 'push', '--no-follow-tags',
+    `--force-with-lease=refs/heads/${STAGED_LINE}:${previousIntent}`,
+    'origin', `${intent}:refs/heads/${STAGED_LINE}`,
+  ], {
+    encoding: 'utf8',
+    env: closedGitEnvironment({
+      GIT_CONFIG_COUNT: '3',
+      GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '',
+      GIT_CONFIG_KEY_1: 'push.followTags', GIT_CONFIG_VALUE_1: 'false',
+      GIT_CONFIG_KEY_2: 'http.https://github.com/.extraheader', GIT_CONFIG_VALUE_2: authorization,
+    }),
+    stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 }
 
@@ -533,7 +609,7 @@ export async function readCompletePullHistory({ request, maxPages = 20, state = 
   return second;
 }
 
-export async function dispatchReadyQaIfNeeded({ pull, intent, request }) {
+export async function dispatchReadyQaIfNeeded({ pull, intent, request, rebind = async () => {} }) {
   assertMatchingReleasePull(pull);
   if (!SHA_PATTERN.test(intent ?? '')) fail('ready QA dispatch has an invalid intent SHA');
   if (pull.draft) return { action: 'not-dispatched-draft' };
@@ -542,10 +618,11 @@ export async function dispatchReadyQaIfNeeded({ pull, intent, request }) {
   }
   if (typeof request !== 'function') fail('ready QA dispatch requires a request function');
 
+  await rebind();
   await request(`/repos/${REPOSITORY}/actions/workflows/${READY_QA_WORKFLOW}/dispatches`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ref: STAGED_LINE }),
+    body: JSON.stringify({ ref: DEFAULT_BRANCH }),
   });
   return { action: 'dispatched-ready-qa', intent };
 }
@@ -857,6 +934,13 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
     fail(`refusing to write outside ${REPOSITORY}`);
   }
   if (!process.env.GITHUB_TOKEN) fail('GITHUB_TOKEN is required');
+  assertSafeGitConfiguration(process.cwd());
+  const wakeup = validateMaintainerWakeup({
+    eventName: process.env.GITHUB_EVENT_NAME,
+    event: JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')),
+  });
+  const rebind = async () => assertTrustedMaintainerMain();
+  await rebind();
 
   const { releaseHeadSha: releaseSource, stagedSha: previousIntent } = refreshObservedRefs();
 
@@ -871,8 +955,8 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
     const { decision, observation } = second;
     return emitSummary({
       repository: REPOSITORY,
-      event: process.env.GITHUB_EVENT_NAME ?? 'local',
-      actor: process.env.GITHUB_ACTOR ?? 'local',
+      event: wakeup.event,
+      actor: wakeup.actor,
       action: decision.owner,
       ownershipState: decision.state,
       releaseSource: observation.releaseHeadSha,
@@ -896,8 +980,8 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
     const { decision, observation } = second;
     return emitSummary({
       repository: REPOSITORY,
-      event: process.env.GITHUB_EVENT_NAME ?? 'local',
-      actor: process.env.GITHUB_ACTOR ?? 'local',
+      event: wakeup.event,
+      actor: wakeup.actor,
       action: decision.owner,
       ownershipState: decision.state,
       releaseSource: observation.releaseHeadSha,
@@ -919,6 +1003,7 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
     intent = createIntent(releaseSource);
     validateIntent(commitShape(intent), { source: releaseSource });
 
+    await rebind();
     if (refSha(RELEASE_LINE) !== releaseSource) {
       fail('release line advanced before the guarded staged write; a later wake-up must win');
     }
@@ -926,12 +1011,7 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
       fail('staged ref advanced before the guarded staged write; refusing to overwrite it');
     }
 
-    git(
-      'push',
-      `--force-with-lease=refs/heads/${STAGED_LINE}:${previousIntent}`,
-      'origin',
-      `${intent}:refs/heads/${STAGED_LINE}`,
-    );
+    pushStagedIntent({ previousIntent, intent });
 
     if (refSha(RELEASE_LINE) !== releaseSource || refSha(STAGED_LINE) !== intent) {
       fail('remote refs did not match the guarded staged update');
@@ -947,6 +1027,7 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
     const currentPull = await waitForPullHead(pull.number, intent);
 
     const body = buildPullRequestBody({ source: releaseSource, intent, includedCommits: commits });
+    await rebind();
     await github(`/repos/${REPOSITORY}/pulls/${pull.number}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -956,13 +1037,14 @@ export async function main({ dryRun = process.argv.includes('--dry-run') } = {})
       pull: currentPull,
       intent,
       request: github,
+      rebind,
     });
   }
 
   const summary = {
     repository: REPOSITORY,
-    event: process.env.GITHUB_EVENT_NAME ?? 'local',
-    actor: process.env.GITHUB_ACTOR ?? 'local',
+    event: wakeup.event,
+    actor: wakeup.actor,
     pullRequest: pull.number,
     action: alreadyCurrent
       ? dryRun
