@@ -239,14 +239,28 @@ mutation occurred.
 installed before publisher child or temporary state exists. During the
 irreversible npm window the original signal is forwarded to the npm process
 group; a bounded grace period is followed by group `SIGKILL` only when the
-child ignores the stop. The publisher awaits child settlement, performs a
-bounded read-only public-registry read-back for both named packages, records
+group still has a member. Leader close is recorded separately and never counts
+as group settlement: the publisher probes the retained detached process-group
+identity through the grace and escalation boundaries, including when an
+ignoring descendant outlives a cooperative or already-exited leader.
+
+Every registry observation before, during, and after publication is bounded
+and registered with the interruption lifecycle. A signal aborts/races any
+ordinary in-flight observation so it cannot hold the finalizer open. The
+publisher then starts fresh bounded read-only public-registry attempts for both
+named packages and records
 each as exact `matching`, `absent`, `mismatching`, or `unknown`, re-observes the
 line and durable `V` locator, removes all temporary pack/config/home/cache
 state, and writes normal schema-2 evidence. Interruption evidence always marks
 restart as required so a later dispatch re-observes npm and converges through
 registry read-back. Only after evidence and cleanup does the CLI restore the
 original signal exit semantics.
+
+When the release-line advertisement changes during publication, finalization
+retains the exact observed SHA, fetches that object with the same closed,
+no-tags Git boundary, and only then classifies its relationship to `M` and `V`.
+A fetch or ancestry failure preserves the observed SHA with relation `unknown`,
+a fixed sanitized code, and a restart-required release-state observation.
 
 The accepted issue #14 state contract requires publication to complete before
 normal reconciliation or conflict recovery begins. Consequently this slice

@@ -26,6 +26,10 @@ const markerPath = process.env.LAB_SIGNAL_MARKER;
 const descendantPath = process.env.LAB_SIGNAL_DESCENDANT;
 const repositoryRoot = join(root, 'repository');
 const temporaryBase = join(root, 'publisher-temporary');
+const remoteRoot = join(root, 'remote.git');
+const metaPath = join(root, 'release-meta.json');
+const lateShaPath = join(root, 'late-sha');
+const hang = process.env.LAB_SIGNAL_HANG ?? '';
 
 function git(cwd, args, options = {}) {
   return execFileSync('git', ['--no-replace-objects', ...args], {
@@ -63,6 +67,12 @@ const identities = packageEvidence(packed);
 const message = buildSnapshotMessage({ mergeSha, stagedSha, sourceSha, tree: expected.tree, contentSha256: expected.contentSha256, packages: identities });
 const snapshotSha = git(repositoryRoot, ['commit-tree', expected.tree, '-p', mergeSha], { input: message });
 await rm(preparation, { recursive: true, force: true });
+git(repositoryRoot, ['update-ref', `refs/heads/${RELEASE_LINE}`, mergeSha]);
+git(repositoryRoot, ['update-ref', SNAPSHOT_REF, snapshotSha]);
+git(repositoryRoot, ['update-ref', 'refs/heads/main', sourceSha]);
+await rm(remoteRoot, { recursive: true, force: true });
+git(root, ['clone', '--quiet', '--bare', repositoryRoot, remoteRoot]);
+await writeFile(metaPath, `${JSON.stringify({ mergeSha, snapshotSha })}\n`);
 
 let state = {};
 try { state = JSON.parse(await readFile(statePath, 'utf8')); } catch { /* First dispatch starts absent. */ }
@@ -75,25 +85,54 @@ if (choice === 'addon' && !state[PACKAGE_SPECS[0].name]) {
 }
 await writeFile(statePath, `${JSON.stringify(state)}\n`);
 
-const refs = new Map([
-  ['refs/heads/main', sourceSha],
-  [`refs/heads/${RELEASE_LINE}`, mergeSha],
-  [SNAPSHOT_REF, snapshotSha],
-]);
+let queryCount = 0;
+async function hangQuery() {
+  await writeFile(markerPath, 'query-started\n');
+  return new Promise(() => {});
+}
 const npmAdapter = {
   async query(spec) {
+    queryCount += 1;
+    if (
+      (hang === 'initial' && queryCount === 1) ||
+      (hang === 'ambiguous' && queryCount === 3) ||
+      (hang === 'durable' && queryCount === 4)
+    ) return hangQuery();
     const observed = JSON.parse(await readFile(statePath, 'utf8'))[spec.name];
     return observed ?? { status: 'absent', name: spec.name };
   },
   async publish(artifact, env, neutralDirectory, interruption) {
     const child = new URL('./publish-signal-child.mjs', import.meta.url);
-    await interruption.run(process.execPath, [child.pathname, statePath, markerPath, descendantPath, Buffer.from(JSON.stringify(artifact)).toString('base64url'), mode], {
+    const childMode = ['ambiguous', 'durable'].includes(hang) ? 'fail-fast' : mode;
+    const childMarker = childMode === mode && mode !== 'early-leader-descendant-ignore' ? markerPath : `${markerPath}.child`;
+    await interruption.run(process.execPath, [child.pathname, statePath, childMarker, descendantPath, Buffer.from(JSON.stringify(artifact)).toString('base64url'), childMode], {
       cwd: neutralDirectory,
       env,
       errorCode: `NPM_PUBLISH_FAILED_${artifact.choice.toUpperCase()}`,
     });
+    if (mode === 'early-leader-descendant-ignore') {
+      await writeFile(markerPath, 'leader-exited\n');
+      const keepAlive = setInterval(() => {}, 1_000);
+      try { await interruption.whenInterrupted; } finally { clearInterval(keepAlive); }
+      interruption.checkpoint();
+    }
   },
 };
+
+function refAdapter(_repo, ref) {
+  try {
+    const output = git(repositoryRoot, ['ls-remote', '--refs', '--exit-code', remoteRoot, ref]);
+    const [sha, observed] = output.split(/\s+/);
+    return observed === ref ? sha : null;
+  } catch { return null; }
+}
+
+function fetchAdapter(repo, shas) {
+  let lateSha = null;
+  try { lateSha = execFileSync('cat', [lateShaPath], { encoding: 'utf8' }).trim(); } catch { /* No late line yet. */ }
+  if (process.env.LAB_SIGNAL_FETCH_FAIL === '1' && lateSha && shas.includes(lateSha)) throw new Error('raw test fetch failure');
+  git(repo, ['fetch', '--no-tags', '--no-write-fetch-head', remoteRoot, ...shas]);
+}
 
 Object.assign(process.env, {
   EXPECTED_DISPATCH_SHA: sourceSha,
@@ -105,10 +144,11 @@ await runPublisherCli({
   argv: ['--repository', REPOSITORY, '--package', choice, '--evidence', evidencePath],
   repoRoot: repositoryRoot,
   npmAdapter,
-  refAdapter: (_repo, ref) => refs.get(ref) ?? null,
-  fetchAdapter: () => {},
+  refAdapter,
+  fetchAdapter,
   temporaryBase,
   oidc: false,
   graceMs: 250,
   durableReadTimeoutMs: 500,
+  publicationReadTimeoutMs: 500,
 });
