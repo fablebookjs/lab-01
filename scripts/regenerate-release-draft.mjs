@@ -359,6 +359,37 @@ function validateStagedIntent(staged, source) {
   return stagedSource === source;
 }
 
+export function requiresLegacyClosedPullRegeneration(pulls) {
+  const latest = selectLifecyclePulls(pulls).at(-1);
+  return (
+    latest !== undefined &&
+    latest.state === 'closed' &&
+    latest.merged !== true &&
+    !latest.merged_at
+  );
+}
+
+export function completeRegenerationState({
+  releaseSource,
+  stagedIntent,
+  pulls,
+  deriveLegacyState,
+}) {
+  if (!requiresLegacyClosedPullRegeneration(pulls)) {
+    return {
+      releaseSource,
+      stagedIntent,
+      stagedCurrent: false,
+      includedCommits: [],
+      pulls,
+    };
+  }
+  if (typeof deriveLegacyState !== 'function') {
+    fail('closed-unmerged release regeneration requires exact legacy state');
+  }
+  return { releaseSource, stagedIntent, ...deriveLegacyState(), pulls };
+}
+
 function includedCommits(baseline, source) {
   const output = git('log', '--reverse', '--format=%H%x09%s', `${baseline}..${source}`);
   if (!output) return [];
@@ -436,16 +467,19 @@ async function readDurableState() {
     throw new RetryableStateError('remote refs changed while durable state was being read');
   }
 
-  const baseline = validateBaseline(releaseSource);
-  const stagedCurrent = validateStagedIntent(stagedIntent, releaseSource);
   const pulls = await listLifecyclePulls();
-  return {
+  return completeRegenerationState({
     releaseSource,
     stagedIntent,
-    stagedCurrent,
-    includedCommits: includedCommits(baseline, releaseSource),
     pulls,
-  };
+    deriveLegacyState: () => {
+      const baseline = validateBaseline(releaseSource);
+      return {
+        stagedCurrent: validateStagedIntent(stagedIntent, releaseSource),
+        includedCommits: includedCommits(baseline, releaseSource),
+      };
+    },
+  });
 }
 
 function pushWithToken(args) {
