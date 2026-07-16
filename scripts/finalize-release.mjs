@@ -352,8 +352,22 @@ async function deriveLine({ gitAdapter, readCommit, headSha, merge, snapshot, re
   if (headSha === merge.sha) return { kind: 'merge', headSha, remaining: [] };
   if (headSha === snapshot.sha) return { kind: 'version', headSha, remaining: [] };
 
+  const isExactLateHead = async (candidate, label) => {
+    if (candidate.parents.length === 1 && candidate.parents[0] === merge.sha) return true;
+    if (candidate.parents.length !== 2 || candidate.parents[0] !== merge.sha) return false;
+    const patch = await readCommit(candidate.parents[1]);
+    if (
+      patch.parents.length !== 1 ||
+      patch.parents[0] !== merge.sha ||
+      patch.tree !== candidate.tree
+    ) {
+      fail(`${label} ordinary merge is not one exact patch over M`);
+    }
+    return true;
+  };
+
   const head = await readCommit(headSha);
-  if (head.parents.length === 1 && head.parents[0] === merge.sha) {
+  if (await isExactLateHead(head, 'late head')) {
     if (await gitAdapter.isAncestor(head.sha, snapshot.sha)) fail('late head X is unexpectedly reachable from V');
     const mergeResult = await gitAdapter.mergeTree(head.sha, snapshot.sha);
     return {
@@ -367,7 +381,7 @@ async function deriveLine({ gitAdapter, readCommit, headSha, merge, snapshot, re
 
   if (head.parents.length === 2 && head.parents[1] === snapshot.sha) {
     const late = await readCommit(head.parents[0]);
-    if (late.parents.length !== 1 || late.parents[0] !== merge.sha) {
+    if (!(await isExactLateHead(late, 'normal reconciliation late head'))) {
       fail('normal reconciliation has multiple or unbound late commits');
     }
     if (await gitAdapter.isAncestor(late.sha, snapshot.sha)) fail('normal reconciliation late X is reachable from V');
