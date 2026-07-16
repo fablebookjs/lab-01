@@ -140,7 +140,9 @@ node scripts/bootstrap-npm-baseline.mjs --publish
 
 The operator must type the displayed confirmation exactly. The script then
 uses npm's interactive web login with a temporary user config and home; it
-does not accept inherited npm configuration or credential variables and
+keeps the direct publish subprocess attached to the same terminal so npm can
+complete its publish-time 2FA challenge. It does not accept inherited npm
+configuration or credential variables and
 removes its config, cache, packed artifacts, and login material on success or
 failure. It never writes the repository or the normal `~/.npmrc`.
 
