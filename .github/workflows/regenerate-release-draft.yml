@@ -9,7 +9,12 @@ permissions: {}
 
 jobs:
   signal:
-    if: github.repository == 'fablebookjs/lab-01'
+    if: >-
+      github.repository == 'fablebookjs/lab-01' &&
+      github.event.pull_request.base.repo.full_name == 'fablebookjs/lab-01' &&
+      github.event.pull_request.base.ref == 'releases/v1.0' &&
+      github.event.pull_request.head.repo.full_name == 'fablebookjs/lab-01' &&
+      github.event.pull_request.head.ref == 'staged/v1.0'
     runs-on: ubuntu-24.04
     steps:
       - name: Emit a fixed read-only close wake-up

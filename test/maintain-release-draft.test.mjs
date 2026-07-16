@@ -164,6 +164,21 @@ test('maintainer wake-ups are non-authoritative exact signal/manual shapes and e
   };
   assert.deepEqual(validateMaintainerWakeup({ eventName: 'workflow_run', event }), { event: 'workflow_run', actor: 'maintainer', runId: 99 });
   assert.deepEqual(validateMaintainerWakeup({ eventName: 'workflow_dispatch', event: { repository, sender: actor, inputs: {} } }), { event: 'workflow_dispatch', actor: 'maintainer' });
+  const unrelatedClose = structuredClone(event);
+  unrelatedClose.workflow_run.name = 'Release regeneration signal';
+  unrelatedClose.workflow_run.event = 'pull_request_target';
+  unrelatedClose.workflow_run.head_branch = 'fix+valid/_branch';
+  assert.deepEqual(validateMaintainerWakeup({ eventName: 'workflow_run', event: unrelatedClose }), {
+    event: 'workflow_run',
+    actor: 'maintainer',
+    runId: 99,
+    action: 'ignored-unrelated-signal',
+  });
+  const malformedClose = structuredClone(unrelatedClose);
+  malformedClose.workflow_run.head_branch = 'bad..branch';
+  assert.throws(() => validateMaintainerWakeup({ eventName: 'workflow_run', event: malformedClose }));
+  malformedClose.workflow_run.head_branch = '/suspicious';
+  assert.throws(() => validateMaintainerWakeup({ eventName: 'workflow_run', event: malformedClose }));
   for (const mutate of [
     (value) => { value.workflow_run.name = 'Maintain release draft'; },
     (value) => { value.workflow_run.event = 'workflow_dispatch'; },
