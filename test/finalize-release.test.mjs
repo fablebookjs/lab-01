@@ -896,6 +896,81 @@ test('pure maintainer observer derives H and deterministic normal J markers from
     verifiedMergeSha: ids.merge,
   });
 
+  const patchSha = sha('b');
+  const mergedLateSha = sha('c');
+  const mergedLate = fixture();
+  mergedLate.gitAdapter.commits.set(patchSha, {
+    sha: patchSha,
+    parents: [ids.merge],
+    tree: trees.late,
+    message: 'fix: ordinary late patch\n',
+  });
+  mergedLate.gitAdapter.commits.set(mergedLateSha, {
+    sha: mergedLateSha,
+    parents: [ids.merge, patchSha],
+    tree: trees.late,
+    message: 'Merge pull request #37\n',
+  });
+  mergedLate.gitAdapter.refs[RELEASE_REF].sha = mergedLateSha;
+  mergedLate.gitAdapter.mergeTrees.set(
+    `${mergedLateSha} ${ids.snapshot}`,
+    { clean: true, tree: trees.reconciliation },
+  );
+  assert.equal(
+    (await observeMaintainerPostMerge({ gitAdapter: mergedLate.gitAdapter })).headSha,
+    mergedLateSha,
+  );
+
+  for (const mutate of [
+    (value) => { value.gitAdapter.commits.get(patchSha).parents = [ids.source]; },
+    (value) => { value.gitAdapter.commits.get(mergedLateSha).tree = trees.otherLate; },
+  ]) {
+    const malformed = fixture();
+    malformed.gitAdapter.commits.set(
+      patchSha,
+      structuredClone(mergedLate.gitAdapter.commits.get(patchSha)),
+    );
+    malformed.gitAdapter.commits.set(
+      mergedLateSha,
+      structuredClone(mergedLate.gitAdapter.commits.get(mergedLateSha)),
+    );
+    malformed.gitAdapter.refs[RELEASE_REF].sha = mergedLateSha;
+    malformed.gitAdapter.mergeTrees.set(
+      `${mergedLateSha} ${ids.snapshot}`,
+      { clean: true, tree: trees.reconciliation },
+    );
+    mutate(malformed);
+    await assert.rejects(
+      observeMaintainerPostMerge({ gitAdapter: malformed.gitAdapter }),
+      /ordinary late merge/,
+    );
+  }
+
+  const reconciledMergedLate = fixture();
+  reconciledMergedLate.gitAdapter.commits.set(patchSha, mergedLate.gitAdapter.commits.get(patchSha));
+  reconciledMergedLate.gitAdapter.commits.set(
+    mergedLateSha,
+    mergedLate.gitAdapter.commits.get(mergedLateSha),
+  );
+  reconciledMergedLate.gitAdapter.commits.get(ids.reconciliation).parents = [
+    mergedLateSha,
+    ids.snapshot,
+  ];
+  reconciledMergedLate.gitAdapter.commits.get(ids.reconciliation).message = reconciliationMessage({
+    mergeSha: ids.merge,
+    lateSha: mergedLateSha,
+    snapshotSha: ids.snapshot,
+  });
+  reconciledMergedLate.gitAdapter.refs[RELEASE_REF].sha = ids.reconciliation;
+  reconciledMergedLate.gitAdapter.mergeTrees.set(
+    `${mergedLateSha} ${ids.snapshot}`,
+    { clean: true, tree: trees.reconciliation },
+  );
+  assert.equal(
+    (await observeMaintainerPostMerge({ gitAdapter: reconciledMergedLate.gitAdapter })).lateHeadSha,
+    mergedLateSha,
+  );
+
   const normal = fixture();
   normal.gitAdapter.refs[RELEASE_REF].sha = ids.reconciliation;
   assert.deepEqual(await observeMaintainerPostMerge({

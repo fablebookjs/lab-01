@@ -105,7 +105,9 @@ Repeated dispatches converge in this order:
 
 1. Absent or canonical core-only npm publication waits successfully.
 2. With both packages exact, M fast-forwards to V, or one clean late H becomes
-   deterministic normal J with parents `[H,V]`.
+   deterministic normal J with parents `[H,V]`. Late H may be one direct commit
+   over M or one ordinary no-ff PR merge `[M,P]` with exact single patch
+   `P.parent=M` and `P.tree=H.tree`.
 3. A lightweight `v1.0.1` tag is leased from absent to V.
 4. One exact non-draft, non-prerelease GitHub Release is created through the
    durable attempt protocol below.
