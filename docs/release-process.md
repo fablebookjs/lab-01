@@ -184,8 +184,9 @@ bootstrap, and it remains incapable of publishing `1.0.1`.
 
 A validated release-PR merge is the intended authorization input for a
 separately reviewed issue #19 finalizer. This maintainer does not publish or
-reconcile, no finalizer is installed here, and the operator gate remains closed
-while the required external state is absent.
+reconcile. The finalizer is installed, but publication and finalization remain
+unavailable until the current ready release PR is merged and exact `M` and `V`
+are observed.
 
 ## Maintainer-to-finalizer ownership handoff
 
@@ -309,8 +310,10 @@ pull-request-head code, and no workflow may mutate a Storybook resource.
 The workflow and controller files in this section are installed on default
 `main`. The `npm-publish` environment exists with no secrets or reviewers and
 an exact `main` deployment branch policy. The package-specific npm trusted
-publishers are the remaining external npm configuration gate. The public
-`1.0.0` baselines exist; no public `1.0.1` write has occurred.
+publishers are configured on both package pages for `fablebookjs/lab-01`,
+workflow filename `publish-npm.yml`, environment `npm-publish`, and `npm
+publish` only. Both packages require 2FA and disallow traditional tokens. The
+public `1.0.0` baselines exist; no public `1.0.1` write has occurred.
 
 Both publishable package manifests carry the same exact Git repository URL,
 their monorepo directory, and the minimal `src` files allowlist. They contain no
