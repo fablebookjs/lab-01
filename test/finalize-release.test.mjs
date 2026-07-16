@@ -52,6 +52,9 @@ const ids = {
   otherLate: sha('8'),
   main: sha('9'),
   oldIntent: sha('a'),
+  latePatch: sha('b'),
+  mergedLate: sha('c'),
+  mergedReconciliation: sha('d'),
   recoveryReconciliation: sha('f'),
 };
 const trees = {
@@ -172,12 +175,25 @@ class MemoryGit {
         }),
       }],
       [ids.late, { sha: ids.late, parents: [ids.merge], tree: trees.late, message: 'fix(core): deliberately late finite guard\n' }],
+      [ids.latePatch, { sha: ids.latePatch, parents: [ids.merge], tree: trees.late, message: 'fix: ordinary late patch\n' }],
+      [ids.mergedLate, {
+        sha: ids.mergedLate,
+        parents: [ids.merge, ids.latePatch],
+        tree: trees.late,
+        message: 'Merge pull request #37\n',
+      }],
       [ids.otherLate, { sha: ids.otherLate, parents: [ids.merge], tree: trees.otherLate, message: 'fix(core): concurrent late guard\n' }],
       [ids.reconciliation, {
         sha: ids.reconciliation,
         parents: [ids.late, ids.snapshot],
         tree: trees.reconciliation,
         message: reconciliationMessage({ mergeSha: ids.merge, lateSha: ids.late, snapshotSha: ids.snapshot }),
+      }],
+      [ids.mergedReconciliation, {
+        sha: ids.mergedReconciliation,
+        parents: [ids.mergedLate, ids.snapshot],
+        tree: trees.reconciliation,
+        message: reconciliationMessage({ mergeSha: ids.merge, lateSha: ids.mergedLate, snapshotSha: ids.snapshot }),
       }],
       [ids.recoveryReconciliation, {
         sha: ids.recoveryReconciliation,
@@ -188,15 +204,19 @@ class MemoryGit {
     ]);
     this.mergeTrees = new Map([
       [`${ids.late} ${ids.snapshot}`, { clean: true, tree: trees.reconciliation }],
+      [`${ids.mergedLate} ${ids.snapshot}`, { clean: true, tree: trees.reconciliation }],
       [`${ids.otherLate} ${ids.snapshot}`, { clean: true, tree: trees.reconciliation }],
       [`${ids.snapshot} ${ids.late}`, { clean: true, tree: trees.reconciliation }],
     ]);
     this.ancestors = new Set([
       `${ids.merge} ${ids.snapshot}`,
       `${ids.merge} ${ids.late}`,
+      `${ids.merge} ${ids.mergedLate}`,
       `${ids.merge} ${ids.otherLate}`,
       `${ids.late} ${ids.reconciliation}`,
       `${ids.snapshot} ${ids.reconciliation}`,
+      `${ids.mergedLate} ${ids.mergedReconciliation}`,
+      `${ids.snapshot} ${ids.mergedReconciliation}`,
       `${ids.snapshot} ${ids.recoveryReconciliation}`,
       `${ids.late} ${ids.recoveryReconciliation}`,
     ]);
@@ -573,6 +593,35 @@ test('one clean late X creates deterministic J [X,V], while a stale lease refetc
   assert.equal(staleEvidence.action.result, 'stale-ref-rejected-and-refetched');
   assert.equal(stale.gitAdapter.refs[RELEASE_REF].sha, ids.otherLate);
   assert.equal(stale.gitAdapter.durableWrites.length, 1);
+});
+
+test('one ordinary merged late H creates and validates deterministic J [H,V]', async () => {
+  const value = fixture();
+  value.gitAdapter.refs[RELEASE_REF].sha = ids.mergedLate;
+  value.gitAdapter.nextCommitShas.push(ids.mergedReconciliation);
+  const evidence = await runFinalizerInvocation({ adapters: value, context: value.context });
+  assert.equal(evidence.action.type, 'create-reconciliation');
+  assert.equal(value.gitAdapter.refs[RELEASE_REF].sha, ids.mergedReconciliation);
+  assert.deepEqual(value.gitAdapter.commits.get(ids.mergedReconciliation).parents, [ids.mergedLate, ids.snapshot]);
+
+  const reconciled = await observe(value);
+  assert.equal(reconciled.line.kind, 'normal-j');
+  assert.equal(reconciled.line.late.sha, ids.mergedLate);
+  assert.deepEqual(reconciled.line.remaining, [{ sha: ids.mergedLate, subject: 'Merge pull request #37' }]);
+});
+
+test('ordinary merged late H rejects an unbound patch parent or mismatched patch tree', async () => {
+  const wrongParent = fixture();
+  wrongParent.gitAdapter.refs[RELEASE_REF].sha = ids.mergedLate;
+  wrongParent.gitAdapter.commits.get(ids.latePatch).parents = [ids.source];
+  await assert.rejects(observe(wrongParent), /ordinary merge is not one exact patch over M/);
+
+  const wrongTreeInJ = fixture();
+  wrongTreeInJ.gitAdapter.refs[RELEASE_REF].sha = ids.mergedReconciliation;
+  wrongTreeInJ.gitAdapter.commits.get(ids.latePatch).tree = trees.otherLate;
+  await assert.rejects(observe(wrongTreeInJ), /ordinary merge is not one exact patch over M/);
+  assert.deepEqual(allWrites(wrongParent), []);
+  assert.deepEqual(allWrites(wrongTreeInJ), []);
 });
 
 test('real conflicts, reversed J, wrong tree, and multiple late segments fail closed before a write', async () => {
