@@ -66,9 +66,9 @@ expected-old guarded empty intent, and created [draft PR #12](https://github.com
 Attempt 2 of the same run returned `replacement-exists`; exactly one matching
 open release PR remained.
 
-The trusted-main signal/controller replacement described here is offline only
-and has not produced a live run. The historical run is not evidence for the new
-architecture.
+The trusted-main signal/controller replacement was installed on default `main`
+by PR #29. It has not yet produced a successful current staged lifecycle run;
+the historical run is not evidence for the new architecture.
 
 ## Preserved post-installation no-op failure
 
@@ -88,16 +88,15 @@ signal from any same-repository non-`staged/v1.0` branch as the successful
 state, GitHub API, ref, PR, or QA action. Malformed identity and contradictory
 lifecycle state still fail closed. The workflow-level branch filter only avoids
 unnecessary runner use; the controller-level no-op is the safety boundary.
-This local correction has not yet been rerun on GitHub, so it makes no live
-success claim.
+PR #30 installed that correction. Its unrelated close produced skipped signal
+[run 29482691400](https://github.com/fablebookjs/lab-01/actions/runs/29482691400)
+and skipped controller [run 29482694854](https://github.com/fablebookjs/lab-01/actions/runs/29482694854),
+with release/staged/tag/PR #12/npm state unchanged.
 
-The new issue #19 surfaces described below are present only in this offline
-integration. The manual operator-only exact `1.0.0` bootstrap exists but has
-not published. The trusted-main maintainer and Ready-QA signal/controller
-splits, `V` preparation, direct-OIDC publisher, finalizer, and maintainer H/J
-handoff also exist locally but are not installed or live. No authoritative run
-of those controllers, public package, finalization, or new live-workflow state is claimed
-by this changeset.
+The issue #19 trusted-main surfaces described below are installed on default
+`main`; this branch carries their accepted release-line source. The manual
+operator-only exact `1.0.0` bootstrap exists but has not published. No current
+staged QA success, public package, snapshot, or finalization is claimed.
 
 ## One-time public baseline bootstrap
 
@@ -279,20 +278,22 @@ evidence named for the exact staged SHA. A real successful post-installation run
 remains required before any live QA claim.
 
 The old close-and-regenerate workflow is historically proven by [run 29414470336](https://github.com/fablebookjs/lab-01/actions/runs/29414470336), which
-created the clean draft replacement and converged on rerun. The offline
-read-only signal/default-main controller replacement is not installed or live.
+created the clean draft replacement and converged on rerun. The replacement
+read-only signal/default-main controller is installed; PR #30 proved unrelated
+closes skip cleanly, while an exact staged close remains unexercised.
 
 Branch reconciliation, tagging `v1.0.1`, and creating a GitHub Release remain
-outside the installed/live state. The offline finalizer implements the bounded
-controller but has not run. The draft maintainer does not execute
+unexecuted. The installed finalizer implements the bounded controller but has
+not run. The draft maintainer does not execute
 pull-request-head code, and no workflow may mutate a Storybook resource.
 
-## Offline trusted-publishing preparation
+## Trusted-publishing preparation
 
-The workflow and controller files in this section are locally verified
-preparation only. They are not installed on default `main`, their trusted
-publisher/environment configuration is absent, and they have performed no
-public npm or GitHub write.
+The workflow and controller files in this section are installed on default
+`main`. The `npm-publish` environment exists with no secrets or reviewers and
+an exact `main` deployment branch policy. The package-specific npm trusted
+publishers remain absent until the baseline package pages exist, and no public
+npm write has occurred.
 
 Both publishable package manifests carry the same exact Git repository URL,
 their monorepo directory, and the minimal `src` files allowlist. They contain no
@@ -428,8 +429,8 @@ normal reconciliation or conflict recovery begins. Consequently this slice
 never reconciles the release line while either package is absent and never
 creates `v1.0.1`, a GitHub Release, or a `1.0.2` proposal.
 
-The issue #19 public-package finalizer and maintainer H/J handoff are implemented
-in this offline integration but are not installed or live. The maintainer
+The issue #19 public-package finalizer and maintainer H/J handoff are installed
+on default `main` but have not run. The maintainer
 validates the open `1.0.1` proposal, exact `M`, deterministic `V`, concrete `H`,
 deterministic `J`, and the exact draft `1.0.2` proposal, then yields without
 publication, reconciliation, tag, Release, or Storybook writes. The draft
